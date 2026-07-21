@@ -1,0 +1,57 @@
+{
+  "name": "cardinal-frame",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server/server.mjs",
+    "dev:server": "node --watch src/server/server.mjs",
+    "dev:client": "cd client && npm run dev",
+    "build:client": "cd client && npm run build",
+    "dev": "node src/server/server.mjs & cd client && npm run dev",
+    "cli": "node src/cli/cardinal.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "test:coverage": "vitest run --coverage"
+  },
+  "bin": {
+    "cardinal": "src/cli/cardinal.mjs"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.0",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "@xenova/transformers": "^2.17.2",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.10.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "cron-parser": "^4.9.0",
+    "dotenv": "^3.0.0",
+    "express": "^4.18.0",
+    "express-rate-limit": "^8.5.2",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^1.17.0",
+    "morgan": "^1.10.1",
+    "multer": "^1.4.5-lts.2",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "react-force-graph-2d": "^1.29.1",
+    "react-router-dom": "^7.16.0",
+    "tailwindcss": "^4.3.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.14",
+    "winston": "^3.13.0",
+    "ws": "^8.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/ws": "^8.18.1",
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.10"
+  }
+}

@@ -1,0 +1,261 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
+
+/* ─── Cardinal Frame Cyberpunk Theme ─────────────────────────────── */
+
+/* ─── Design System Variables ──────────────────────────────────── */
+:root {
+  --bg-void: #050510;
+  --bg-surface: #0a0a1a;
+  --bg-card: #0f0f23;
+  --bg-elevated: #16163a;
+  --bg-hover: #1a1a3e;
+
+  --neon-green: #00FF88;
+  --neon-magenta: #FF00FF;
+  --neon-cyan: #00FFFF;
+  --neon-purple: #b026ff;
+  --neon-pink: #ff2d95;
+  --neon-orange: #ff6600;
+  --neon-red: #ff0040;
+  --neon-yellow: #eab308;
+  --neon-blue: #3b82f6;
+  --neon-teal: #14b8a6;
+
+  --border: #2A2A3A;
+  --border-glow: #00f0ff;
+  --muted: #1C1C2E;
+  --destructive: #FF3366;
+
+  --font-hud: 'Share Tech Mono', monospace;
+  --font-code: 'Fira Code', monospace;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  --radius: 0px; /* Chamfered — no border-radius */
+  --radius-soft: 4px; /* Slight soft corners for inputs */
+
+  --scanline-opacity: 0.04;
+  --glow-duration: 0.3s;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg-surface); }
+::-webkit-scrollbar-thumb { background: var(--neon-cyan); border-radius: 0; opacity: 0.3; }
+::-webkit-scrollbar-thumb:hover { background: var(--neon-cyan); opacity: 0.5; }
+
+/* Selection color */
+::selection { background: rgba(0, 255, 136, 0.2); color: #fff; }
+
+/* ─── Keyframes ──────────────────────────────────────────────────── */
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(40px) scale(0.95); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@keyframes neonPulse {
+  0%, 100% { opacity: 1; text-shadow: 0 0 8px currentColor; }
+  50% { opacity: 0.7; text-shadow: 0 0 16px currentColor, 0 0 32px currentColor; }
+}
+
+@keyframes glitchClip {
+  0% { clip-path: inset(40% 0 61% 0); transform: translate(-2px, 0); }
+  20% { clip-path: inset(92% 0 1% 0); transform: translate(2px, 0); }
+  40% { clip-path: inset(43% 0 1% 0); transform: translate(-1px, 0); }
+  60% { clip-path: inset(25% 0 58% 0); transform: translate(1px, 0); }
+  80% { clip-path: inset(54% 0 7% 0); transform: translate(-2px, 0); }
+  100% { clip-path: inset(58% 0 43% 0); transform: translate(0); }
+}
+
+@keyframes dataPulse {
+  0% { box-shadow: 0 0 0px transparent; }
+  50% { box-shadow: 0 0 12px rgba(0, 255, 136, 0.3); }
+  100% { box-shadow: 0 0 0px transparent; }
+}
+
+@keyframes scanlineMove {
+  0% { background-position: 0 0; }
+  100% { background-position: 0 4px; }
+}
+
+@keyframes crtFlicker {
+  0% { opacity: 1; }
+  5% { opacity: 0.98; }
+  10% { opacity: 1; }
+  50% { opacity: 0.97; }
+  55% { opacity: 1; }
+  100% { opacity: 1; }
+}
+
+@keyframes borderGlow {
+  0%, 100% { border-color: rgba(0, 255, 136, 0.15); }
+  50% { border-color: rgba(0, 255, 136, 0.4); }
+}
+
+@keyframes hudBracketPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ─── Utility classes ────────────────────────────────────────────── */
+
+.neon-pulse { animation: neonPulse 2s ease-in-out infinite; }
+.data-pulse { animation: dataPulse 0.6s ease-out; }
+.glitch-text { animation: glitchClip 3s ease-in-out infinite; }
+.crt-flicker { animation: crtFlicker 4s ease-in-out infinite; }
+.border-glow { animation: borderGlow 3s ease-in-out infinite; }
+.slide-up { animation: slideUp 0.3s ease-out; }
+.fade-in { animation: fadeIn 0.4s ease-out; }
+
+/* Font utilities */
+.font-hud { font-family: var(--font-hud); }
+.font-code { font-family: var(--font-code); }
+
+/* Chamfered corners — cyberpunk angular shapes */
+.chamfer-sm {
+  clip-path: polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px);
+}
+.chamfer-md {
+  clip-path: polygon(10px 0, calc(100% - 10px) 0, 100% 10px, 100% calc(100% - 10px), calc(100% - 10px) 100%, 10px 100%, 0 calc(100% - 10px), 0 10px);
+}
+.chamfer-lg {
+  clip-path: polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 16px 100%, 0 calc(100% - 16px), 0 16px);
+}
+
+/* HUD corner brackets — decorative corner marks */
+.hud-brackets {
+  position: relative;
+}
+.hud-brackets::before,
+.hud-brackets::after {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-color: var(--neon-cyan);
+  animation: hudBracketPulse 3s ease-in-out infinite;
+  pointer-events: none;
+}
+.hud-brackets::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1px solid;
+  border-left: 1px solid;
+}
+.hud-brackets::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1px solid;
+  border-right: 1px solid;
+}
+
+/* Neon card — glassmorphism with cyberpunk accents */
+.neon-card {
+  background: linear-gradient(135deg, rgba(10,10,20,0.95) 0%, rgba(15,5,25,0.9) 100%);
+  border: 1px solid rgba(0, 255, 136, 0.12);
+  box-shadow: inset 0 1px 0 rgba(0, 255, 136, 0.08), 0 0 20px rgba(0, 255, 136, 0.04);
+  transition: all 0.3s ease;
+}
+.neon-card:hover {
+  border-color: rgba(0, 255, 136, 0.35);
+  box-shadow: inset 0 1px 0 rgba(0, 255, 136, 0.2), 0 0 30px rgba(0, 255, 136, 0.1), 0 0 60px rgba(0, 255, 136, 0.04);
+}
+
+/* Neon button */
+.neon-btn {
+  background: rgba(0, 255, 136, 0.08);
+  border: 1px solid rgba(0, 255, 136, 0.25);
+  color: var(--neon-green);
+  transition: all 0.2s ease;
+  font-family: var(--font-hud);
+}
+.neon-btn:hover {
+  background: rgba(0, 255, 136, 0.15);
+  border-color: rgba(0, 255, 136, 0.5);
+  box-shadow: 0 0 15px rgba(0, 255, 136, 0.15), 0 0 30px rgba(0, 255, 136, 0.05);
+  transform: translateY(-1px);
+}
+.neon-btn:active {
+  transform: translateY(0) scale(0.98);
+}
+
+/* Neon input */
+.neon-input {
+  background: rgba(5, 5, 16, 0.9);
+  border: 1px solid rgba(0, 240, 255, 0.15);
+  color: #e0e0e0;
+  font-family: var(--font-code);
+  font-size: 12px;
+  outline: none;
+  transition: all 0.2s ease;
+}
+.neon-input:focus {
+  border-color: rgba(0, 255, 136, 0.4);
+  box-shadow: 0 0 0 1px rgba(0, 255, 136, 0.3), 0 0 12px rgba(0, 255, 136, 0.1);
+}
+
+/* Scanline overlay */
+.scanline-overlay {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 255, 136, 0.012) 2px,
+    rgba(0, 255, 136, 0.012) 4px
+  );
+  animation: scanlineMove 0.1s linear infinite;
+  z-index: 1;
+}
+
+/* Hex grid background */
+.hex-grid-bg {
+  background-image:
+    linear-gradient(30deg, rgba(0,255,136,0.02) 12%, transparent 12.5%, transparent 87%, rgba(0,255,136,0.02) 87.5%),
+    linear-gradient(150deg, rgba(0,255,136,0.02) 12%, transparent 12.5%, transparent 87%, rgba(0,255,136,0.02) 87.5%),
+    linear-gradient(30deg, rgba(0,255,136,0.02) 12%, transparent 12.5%, transparent 87%, rgba(0,255,136,0.02) 87.5%),
+    linear-gradient(150deg, rgba(0,255,136,0.02) 12%, transparent 12.5%, transparent 87%, rgba(0,255,136,0.02) 87.5%),
+    linear-gradient(60deg, rgba(176,38,255,0.015) 25%, transparent 25.5%, transparent 75%, rgba(176,38,255,0.015) 75%),
+    linear-gradient(60deg, rgba(176,38,255,0.015) 25%, transparent 25.5%, transparent 75%, rgba(176,38,255,0.015) 75%);
+  background-size: 80px 140px;
+  background-position: 0 0, 0 0, 40px 70px, 40px 70px, 0 0, 40px 70px;
+}
+
+/* Focus visible for keyboard navigation */
+:focus-visible {
+  outline: 1px solid rgba(0, 255, 136, 0.5);
+  outline-offset: 1px;
+}
+
+/* Neon input focus */
+input:focus, select:focus, textarea:focus {
+  box-shadow: 0 0 0 1px rgba(0,255,136,0.3), 0 0 8px rgba(0,255,136,0.1) !important;
+}
+
+/* HUD divider */
+.hud-divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(0,255,136,0.15), transparent);
+  border: none;
+}
+
+/* Status dot */
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 0;
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}

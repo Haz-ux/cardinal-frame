@@ -1,0 +1,13 @@
+services:
+  cardinal-frame:
+    build: .
+    container_name: cardinal-frame
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - DATA_DIR=/app/data
+      - NODE_ENV=production

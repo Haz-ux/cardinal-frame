@@ -1,0 +1,30 @@
+node_modules/
+dist/
+.vite/
+.env
+.env.*
+.DS_Store
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build artifacts
+client/dist/
+
+# Logs
+*.log
+
+# Test artifacts
+coverage/
+test-output/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+gemini_api_key.txt

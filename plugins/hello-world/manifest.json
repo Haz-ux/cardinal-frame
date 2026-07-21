@@ -1,0 +1,6 @@
+{
+  "name": "hello-world",
+  "version": "1.0.0",
+  "description": "Sample Cardinal Frame plugin that logs task events",
+  "hooks": ["onTaskCompleted", "onTaskFailed"]
+}
