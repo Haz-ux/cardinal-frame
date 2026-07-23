@@ -31,6 +31,12 @@ import graphRoutes from './routes/graph.mjs';
 import taskRoutes from './routes/tasks.mjs';
 import metaRoutes from './routes/meta.mjs';
 import { runSandboxed, runSandboxedHybrid } from './routes/sandbox.mjs';
+import usersRoutes from './routes/users.mjs';
+import stateRoutes from './routes/state.mjs';
+import costsRoutes, { getModelCost } from './routes/costs.mjs';
+import systemRoutes from './routes/system.mjs';
+import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload, detectOllama } from './routes/llm-helpers.mjs';
+import settingsRoutes, { xorCipher, xorDecipher, getDevSetting, getDevSettings } from './routes/settings.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain, executeToolChain, resolveStepInput, buildChainIntentPrompt } from './chains.mjs';
 import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from './evolution.mjs';
@@ -1236,104 +1242,11 @@ app.use('/api', dashboardRoutes(ctx));
 app.use('/api', graphRoutes(ctx));
 app.use('/api', taskRoutes(ctx));
 app.use('/api', metaRoutes(ctx));
-
-// ─── User Management (admin only) ──────────────────────────────────
-app.get('/api/users', authMiddleware, requireRole('admin'), apiLimiter, (_req, res) => {
-  res.json(stmts.users.getAll.all());
-});
-
-app.patch('/api/users/:id/role', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
- const { role } = req.body;
- if (!['admin', 'user', 'viewer'].includes(role)) return res.status(400).json({ error: 'Invalid role. Use: admin, user, viewer' });
- stmts.users.updateRole.run(role, req.params.id);
- res.json({ id: req.params.id, role });
-});
-
-// ─── State Files (MEMORY.md, PERSONA.md, etc.) ──────────────────
-const STATE_FILES_DIR = path.resolve(process.cwd(), 'state');
-const STATE_FILES = ['MEMORY.md', 'PERSONA.md', 'CLAUDE.md', 'AGENTS.md'];
-app.get('/api/state', authMiddleware, async (_req, res) => {
- try {
-  const fs = await import('fs');
-  await fs.promises.mkdir(STATE_FILES_DIR, { recursive: true });
-  const files = [];
-  for (const name of STATE_FILES) {
-   const fp = path.join(STATE_FILES_DIR, name);
-   try {
-    const content = await fs.promises.readFile(fp, 'utf8');
-    const stat = await fs.promises.stat(fp);
-    files.push({ name, content, size: stat.size, modified: stat.mtime.toISOString() });
-   } catch { files.push({ name, content: '', size: 0, modified: null }); }
-  }
-  res.json(files);
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/state/:name', authMiddleware, async (req, res) => {
- try {
-  const fs = await import('fs');
-  const name = req.params.name;
-  if (!STATE_FILES.includes(name)) return res.status(400).json({ error: 'Invalid state file' });
-  const fp = path.join(STATE_FILES_DIR, name);
-  try { const content = await fs.promises.readFile(fp, 'utf8'); res.json({ name, content }); }
-  catch { res.json({ name, content: '' }); }
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/state/:name', authMiddleware, requireRole('admin'), async (req, res) => {
- try {
-  const fs = await import('fs');
-  const name = req.params.name;
-  if (!STATE_FILES.includes(name)) return res.status(400).json({ error: 'Invalid state file' });
-  const { content } = req.body;
-  if (typeof content !== 'string') return res.status(400).json({ error: 'Content must be a string' });
-  await fs.promises.mkdir(STATE_FILES_DIR, { recursive: true });
-  await fs.promises.writeFile(path.join(STATE_FILES_DIR, name), content, 'utf8');
-  res.json({ name, content, size: content.length });
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ─── User Profile (compiled preferences) ─────────────────────────
-app.get('/api/profile', authMiddleware, (req, res) => {
- try {
-  const user = stmts.users.getByUsername.get(req.user.username);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  // Parse preferences from user metadata
-  const prefs = [];
-  try { const meta = JSON.parse(user.metadata || '{}'); for (const [k,v] of Object.entries(meta)) { prefs.push({ key: k, value: v, locked: false }); } } catch {}
-  // Add role-based preferences
-  prefs.unshift({ key: 'role', value: user.role, locked: true });
-  prefs.unshift({ key: 'username', value: user.username, locked: true });
-  res.json({ username: user.username, role: user.role, preferences: prefs, created: user.created_at });
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.patch('/api/profile/:key', authMiddleware, (req, res) => {
- try {
-  const user = stmts.users.getByUsername.get(req.user.username);
-  const meta = JSON.parse(user.metadata || '{}');
-  const { value, action } = req.body; // action: 'set', 'lock', 'dismiss'
-  if (action === 'dismiss') { delete meta[req.params.key]; }
-  else { meta[req.params.key] = value; }
-  db.prepare('UPDATE users SET metadata = ? WHERE id = ?').run(JSON.stringify(meta), user.id);
-  res.json({ key: req.params.key, value: action === 'dismiss' ? null : value });
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ─── FTS Context Explorer (injected context segments) ────────────
-app.get('/api/context/injections', authMiddleware, (req, res) => {
- try {
-  // Return recent context injections (simulated from message history)
-  const convId = req.query.conversation_id;
-  if (!convId) return res.json([]);
-  const messages = db.prepare('SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 20').all(convId);
-  const injections = messages.map(m => ({
-   id: m.id,
-   type: m.role === 'user' ? 'user_input' : 'model_output',
-   summary: (m.content || '').slice(0, 120) + ((m.content || '').length > 120 ? '…' : ''),
-   timestamp: m.created_at,
-   tokens: Math.ceil((m.content || '').length / 4),
-  }));
-  res.json(injections);
- } catch (e) { res.json([]); }
-});
+app.use('/api', usersRoutes(ctx));
+app.use('/api', stateRoutes(ctx));
+app.use('/api', costsRoutes(ctx));
+app.use('/api', systemRoutes(ctx));
+app.use('/api', settingsRoutes(ctx));
 
 // ─── Code Execution Sandbox ──────────────────────────────────────
 app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
@@ -1355,33 +1268,7 @@ app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLi
  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Token Cost Tracking ──────────────────────────────────────────
-const MODEL_PRICING = { // per 1M tokens [input, output]
- 'gpt-4o': [2.50, 10.00], 'gpt-4o-mini': [0.15, 0.60], 'gpt-4-turbo': [10.00, 30.00],
- 'claude-3.5-sonnet': [3.00, 15.00], 'claude-3-opus': [15.00, 75.00], 'claude-3-haiku': [0.25, 1.25],
- 'llama-3.1-70b': [0.60, 0.80], 'llama-3.1-8b': [0.05, 0.07], 'mixtral-8x7b': [0.27, 0.27],
- 'deepseek-chat': [0.14, 0.28], 'deepseek-reasoner': [0.55, 2.19],
- 'grok-2': [2.00, 10.00], 'gemini-pro': [0.50, 1.50], 'gemini-flash': [0.075, 0.30],
-};
-function getModelCost(modelId, promptTokens, completionTokens) {
- for (const [key, pricing] of Object.entries(MODEL_PRICING)) {
-  if (modelId.includes(key)) return (promptTokens/1e6*pricing[0]) + (completionTokens/1e6*pricing[1]);
- }
- if (modelId.includes('local') || modelId.includes('ollama')) return 0;
- return (promptTokens/1e6*1) + (completionTokens/1e6*3);
-}
-
-app.get('/api/costs', authMiddleware, (req, res) => {
- try {
-  const { conversation_id, period = '-24 hours' } = req.query;
-  if (conversation_id) { res.json(stmts.tokenUsage.getByConv.all(conversation_id)); }
-  else { res.json(stmts.tokenUsage.getSummary.all(period)); }
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/costs/recent', authMiddleware, (_req, res) => {
- try { res.json(stmts.tokenUsage.getRecent.all()); }
- catch (e) { res.status(500).json({ error: e.message }); }
-});
+// ─── Token Cost Tracking (moved to routes/costs.mjs) ──────────────
 
 // ─── Token Window Compression Engine ──────────────────────────────
 app.post('/api/chat/compress-context', authMiddleware, apiLimiter, async (req, res) => {
@@ -1429,133 +1316,28 @@ app.post('/api/chat/compress-context', authMiddleware, apiLimiter, async (req, r
  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Device-State Ingestion ────────────────────────────────────────
+// ─── Device-State Ingestion (moved to routes/system.mjs) ────────
 let deviceStateCache = { battery_pct: null, battery_charging: null, network_type: 'unknown', thermal_throttling: false, gpu_util: 0, npu_util: 0, ram_pct: 0, cpu_temp: 0, swap_pct: 0 };
 async function collectDeviceState() {
  try {
   const { execSync: exec2 } = await import('child_process');
-  // Battery
   try { const b = exec2('cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo ""').toString().trim(); if (b) deviceStateCache.battery_pct = parseInt(b); const bs = exec2('cat /sys/class/power_supply/battery/status 2>/dev/null || cat /sys/class/power_supply/AC/online 2>/dev/null || echo ""').toString().trim(); deviceStateCache.battery_charging = bs.includes('Charging') || bs === '1'; } catch {}
-  // Network
   try { const iface = exec2("ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1").toString().trim(); if (iface) { const s = exec2(`cat /sys/class/net/${iface}/operstate 2>/dev/null || echo ""`).toString().trim(); deviceStateCache.network_type = s === 'up' ? (iface.startsWith('wlan') ? 'wifi' : 'ethernet') : 'disconnected'; } } catch {}
-  // Thermal
   try { const t = exec2('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0').toString().trim(); const tc = parseInt(t) / 1000; deviceStateCache.cpu_temp = tc; deviceStateCache.thermal_throttling = tc > 80; } catch {}
-  // RAM + Swap
   try { const f = exec2('free -m 2>/dev/null').toString(); const ml = f.split('\n').find(l => l.startsWith('Mem:')); if (ml) { const p = ml.split(/\s+/); deviceStateCache.ram_pct = Math.round(parseInt(p[2])/parseInt(p[1])*100); } const sl = f.split('\n').find(l => l.startsWith('Swap:')); if (sl) { const p = sl.split(/\s+/); deviceStateCache.swap_pct = p[2] !== '0' ? Math.round(parseInt(p[2])/parseInt(p[1])*100) : 0; } } catch {}
-  // Jetson tegrastats
   try { const t = exec2('timeout 1 tegrastats --start 2>/dev/null || echo ""', { timeout: 2000 }).toString().trim(); if (t) { const rm = t.match(/RAM\s+(\d+)\/(\d+)/); if (rm) deviceStateCache.ram_pct = Math.round(parseInt(rm[1])/parseInt(rm[2])*100); const gm = t.match(/GR3D\s+(\d+)%/); if (gm) deviceStateCache.gpu_util = parseInt(gm[1]); } } catch {}
  } catch {}
 }
 setInterval(collectDeviceState, 10000);
 collectDeviceState();
 
-app.get('/api/device-state', (_req, res) => { res.json(deviceStateCache); });
+// ─── File Watcher Service (moved to routes/system.mjs) ──────────
 
-// ─── File Watcher Service ──────────────────────────────────────────
-const activeWatchers = new Map();
-function startFileWatcher(watcher) {
- if (activeWatchers.has(watcher.id)) return;
- try {
-  if (!existsSync(watcher.path)) return;
-  const w = watch(watcher.path, { recursive: !!watcher.recursive }, (eventType, filename) => {
-   const event = { type: 'file_event', path: watcher.path, filename, eventType, watcher_id: watcher.id, ts: Date.now() };
-   wss.clients.forEach(c => { if (c.readyState === 1) c.send(JSON.stringify(event)); });
-   stmts.fileWatchers.updateEnabled.run(watcher.enabled, new Date().toISOString(), watcher.id);
-   audit('file_event', 'watcher', watcher.id, null, { path: watcher.path, filename, eventType });
-  });
-  activeWatchers.set(watcher.id, w);
- } catch (e) { logger.error(`Watcher ${watcher.id} failed:`, e.message); }
-}
-setTimeout(() => { try { stmts.fileWatchers.getAll.all().filter(w => w.enabled).forEach(startFileWatcher); } catch {} }, 2000);
+// ─── Health & Dashboard (moved to routes/system.mjs) ────────────
 
-app.get('/api/watchers', authMiddleware, (_req, res) => { try { res.json(stmts.fileWatchers.getAll.all()); } catch (e) { res.status(500).json({ error: e.message }); } });
-app.post('/api/watchers', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
- try {
-  const { path: watchPath, recursive = false, trigger_skill = null, enabled = true } = req.body;
-  if (!watchPath) return res.status(400).json({ error: 'path required' });
-  const fs = await import('fs');
-  if (!fs.existsSync(watchPath)) return res.status(400).json({ error: 'Path does not exist' });
-  const id = randomUUID();
-  stmts.fileWatchers.insert.run(id, watchPath, recursive ? 1 : 0, trigger_skill, enabled ? 1 : 0);
-  const w = { id, path: watchPath, recursive: !!recursive, trigger_skill, enabled: !!enabled };
-  if (enabled) startFileWatcher(w);
-  res.status(201).json(w);
- } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.delete('/api/watchers/:id', authMiddleware, requireRole('admin'), (req, res) => {
- try { const i = activeWatchers.get(req.params.id); if (i) { i.close(); activeWatchers.delete(req.params.id); } stmts.fileWatchers.delete.run(req.params.id); res.json({ deleted: true }); }
- catch (e) { res.status(500).json({ error: e.message }); }
-});
+// ─── Detailed Health (moved to routes/system.mjs) ───────────────
 
-// ─── Health & Dashboard ────────────────────────────────────────────
-app.get('/api/health', (_req, res) => {
-  const dbStats = db.pragma('journal_mode')[0];
-  const tableCount = db.prepare("SELECT count(*) as c FROM sqlite_master WHERE type='table'").get().c;
-  const dbSize = db.prepare("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()").get().size;
-
-  res.json({
-    status: 'ok',
-    mode: 'AI-Powered',
-    db: {
-      type: 'SQLite',
-      journal_mode: dbStats,
-      tables: tableCount,
-      size_mb: Math.round((dbSize / 1024 / 1024) * 100) / 100,
-    },
-    ws: {
-      connected_clients: wss.clients.size,
-    },
-    uptime: Math.round(process.uptime()),
-    memory: {
-      rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-      heap_total_mb: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-    },
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ─── Detailed Health (memory monitoring) ──────────────────────────────
-app.get('/api/health/detailed', authMiddleware, requireRole('admin'), (_req, res) => {
-  const mem = process.memoryUsage();
-  const dbSize = db.prepare("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()").get().size;
-  res.json({
-    status: 'ok',
-    uptime_seconds: Math.round(process.uptime()),
-    process: {
-      pid: process.pid,
-      platform: process.platform,
-      node_version: process.version,
-    },
-    memory: {
-      rss_mb: Math.round(mem.rss / 1024 / 1024 * 100) / 100,
-      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
-      heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
-      external_mb: Math.round(mem.external / 1024 / 1024 * 100) / 100,
-      array_buffers_mb: Math.round(mem.arrayBuffers / 1024 / 1024 * 100) / 100,
-      heap_limit_mb: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
-      heap_usage_pct: Math.round((mem.heapUsed / mem.heapTotal) * 100 * 100) / 100,
-    },
-    db: {
-      type: 'SQLite',
-      journal_mode: db.pragma('journal_mode')[0],
-      tables: db.prepare("SELECT count(*) as c FROM sqlite_master WHERE type='table'").get().c,
-      size_mb: Math.round((dbSize / 1024 / 1024) * 100) / 100,
-      read_count: db.prepare("PRAGMA stats").get()?.read || 0,
-      write_count: db.prepare("PRAGMA stats").get()?.write || 0,
-    },
-    ws: {
-      connected_clients: wss.clients.size,
-    },
-    event_loop: {
-      max_heap_mb: Math.round(require('v8').getHeapStatistics().total_physical_size / 1024 / 1024 * 100) / 100,
-      used_heap_mb: Math.round(require('v8').getHeapStatistics().used_heap_size / 1024 / 1024 * 100) / 100,
-    },
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ─── Request Logger Middleware ──────────────────────────────────────
+// ─── Request Logger Middleware ──────────────────────────────────
 const LOG_LEVEL = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const currentLogLevel = LOG_LEVELS[LOG_LEVEL] ?? 2;
@@ -2267,13 +2049,13 @@ async function executeSkill(skill, input = {}) {
       const code = handlerStr.slice('hybrid:'.length).trim();
       const llmCall = (messages, model) => callAgentLLM(messages, model || skill.model || undefined);
       const secrets = collectSkillSecrets(skill);
-      const sandboxTimeoutMs = parseInt(getDevSetting('sandboxTimeout', '30'), 10) * 1000;
+      const sandboxTimeoutMs = parseInt(getDevSetting(db, 'sandboxTimeout', '30'), 10) * 1000;
       const { result: sandboxResult } = await runSandboxedHybrid({ code, input, llmCall, secrets, timeoutMs: sandboxTimeoutMs });
       result = { ok: true, type: 'hybrid', output: sandboxResult, duration_ms: Date.now() - startTime };
     } else {
       // Script skill — pure JS function (sandboxed via vm.runInNewContext)
       const secrets = collectSkillSecrets(skill);
-      const sandboxTimeoutMs = parseInt(getDevSetting('sandboxTimeout', '30'), 10) * 1000;
+      const sandboxTimeoutMs = parseInt(getDevSetting(db, 'sandboxTimeout', '30'), 10) * 1000;
       const { result: sandboxResult } = await runSandboxed({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
       result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime };
     }
@@ -4434,124 +4216,9 @@ app.post('/api/aimi/chat', authMiddleware, apiLimiter, async (req, res) => {
 
 // ─── LLM Provider & Model Auto-Detection ────────────────────────────
 // Provider types and their known base URLs
-const PROVIDER_TYPES = {
- openai: { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', modelsUrl: '/models', chatFormat: 'openai' },
- google: { name: 'Google AI', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', modelsUrl: '/models', chatFormat: 'google' },
- nvidia: { name: 'NVIDIA NIM', baseUrl: 'https://integrate.api.nvidia.com/v1', modelsUrl: '/models', chatFormat: 'openai' },
- anthropic: { name: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', modelsUrl: null, chatFormat: 'anthropic', hardcodedModels: ['claude-sonnet-4-20250514','claude-opus-4-20250514','claude-3.5-sonnet-20241022','claude-3.5-haiku-20241022','claude-3-opus-20240229','claude-3-haiku-20240307'] },
- openrouter: { name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', modelsUrl: '/models', chatFormat: 'openai' },
- groq: { name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', modelsUrl: '/models', chatFormat: 'openai' },
- together: { name: 'Together AI', baseUrl: 'https://api.together.xyz/v1', modelsUrl: '/models', chatFormat: 'openai' },
- deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', modelsUrl: '/models', chatFormat: 'openai' },
- mistral: { name: 'Mistral', baseUrl: 'https://api.mistral.ai/v1', modelsUrl: '/models', chatFormat: 'openai' },
- cerebras: { name: 'Cerebras', baseUrl: 'https://api.cerebras.ai/v1', modelsUrl: '/models', chatFormat: 'openai' },
- sambanova: { name: 'SambaNova', baseUrl: 'https://api.sambanova.ai/v1', modelsUrl: '/models', chatFormat: 'openai' },
- perplexity: { name: 'Perplexity', baseUrl: 'https://api.perplexity.ai', modelsUrl: '/models', chatFormat: 'openai' },
- xai: { name: 'xAI (Grok)', baseUrl: 'https://api.x.ai/v1', modelsUrl: '/models', chatFormat: 'openai' },
- cohere: { name: 'Cohere', baseUrl: 'https://api.cohere.com/v2', modelsUrl: '/models', chatFormat: 'openai' },
- ollama: { name: 'Ollama (Local)', baseUrl: 'http://localhost:11434', modelsUrl: '/api/tags', noKey: true, chatFormat: 'ollama' },
-};
+// ─── LLM Helpers (moved to routes/llm-helpers.mjs) ──────────────
 
-// ─── Provider Auth Helper ──────────────────────────────────────────
-// Google AI requires ?key= query param; Anthropic uses x-api-key header;
-// all others use Authorization: Bearer. This helper builds correct
-// headers and URL for any provider type.
-function buildProviderAuth(provider, url) {
- const type = provider.type;
- const key = provider.api_key;
- if (type === 'ollama') {
- return { headers: { 'Content-Type': 'application/json' }, url };
- }
- if (type === 'google') {
- // Google AI: key goes in query param, NOT in Authorization header
- const sep = url.includes('?') ? '&' : '?';
- return { headers: { 'Content-Type': 'application/json' }, url: `${url}${sep}key=${encodeURIComponent(key)}` };
- }
- const headers = { 'Content-Type': 'application/json' };
- if (type === 'anthropic') {
- headers['x-api-key'] = key;
- headers['anthropic-version'] = '2023-06-01';
- } else {
- headers['Authorization'] = `Bearer ${key}`;
- }
- if (type === 'openrouter') {
- headers['HTTP-Referer'] = 'https://cardinal-frame.local';
- }
- return { headers, url };
-}
-
-// ─── Chat URL Builder ──────────────────────────────────────────────
-// Different providers use different endpoint paths for chat.
-// OpenAI-compatible: /chat/completions
-// Google AI: /models/{model}:generateContent (or :streamGenerateContent)
-// Anthropic: /messages
-// Ollama: /api/chat
-function buildChatUrl(baseUrl, providerType, modelId, stream = false) {
- if (providerType === 'ollama') return `${baseUrl}/api/chat`;
- if (providerType === 'google') {
- const action = stream ? 'streamGenerateContent' : 'generateContent';
- // Google URL: /v1beta/models/{model}:action
- const modelPath = modelId.startsWith('models/') ? modelId : `models/${modelId}`;
- return `${baseUrl}/${modelPath}:${action}`;
- }
- if (providerType === 'anthropic') return `${baseUrl}/messages`;
- return `${baseUrl}/chat/completions`; // OpenAI-compatible (default)
-}
-
-// ─── Payload Builder ───────────────────────────────────────────────
-// Converts standard {model, messages, stream} payload to provider-native format.
-function buildChatPayload(providerType, modelId, messages, stream = false) {
- if (providerType === 'ollama') {
- return { model: modelId, messages: messages.map(m => ({ role: m.role, content: m.content })), stream };
- }
- if (providerType === 'google') {
- // Google AI generateContent format
- const contents = messages.map(m => ({
- role: m.role === 'assistant' ? 'model' : 'user',
- parts: [{ text: m.content }]
- }));
- return { contents, generationConfig: {}, ...(stream ? {} : {}) };
- }
- if (providerType === 'anthropic') {
- // Anthropic /messages format
- const systemMsg = messages.find(m => m.role === 'system');
- const chatMsgs = messages.filter(m => m.role !== 'system').map(m => ({
- role: m.role === 'assistant' ? 'assistant' : 'user',
- content: m.content
- }));
- return {
- model: modelId,
- messages: chatMsgs,
- ...(systemMsg ? { system: systemMsg.content } : {}),
- max_tokens: 4096,
- stream,
- };
- }
- // OpenAI-compatible (default)
- return {
- model: modelId,
- messages: messages.map(m => ({ role: m.role, content: m.content })),
- max_tokens: 4096,
- stream,
- };
-}
-
-// ─── Ollama Plug & Play Auto-Detection ──────────────────────────────
-async function detectOllama() {
-  try {
-    const r = await fetch('http://localhost:11434/api/version', { signal: AbortSignal.timeout(3000) });
-    if (!r.ok) return { connected: false };
-    const version = await r.json();
-    const modelsR = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(5000) });
-    const modelsData = await modelsR.json();
-    const models = (modelsData.models || []).map(m => m.name || m.model || m);
-    return { connected: true, version: version.version, modelCount: models.length, models };
-  } catch {
-    return { connected: false };
-  }
-}
-
-// Auto-detect Ollama on startup
+// ─── Ollama Auto-Detection (moved to routes/llm-helpers.mjs) ────
 let ollamaCache = { connected: false, lastCheck: 0 };
 detectOllama().then(status => {
   ollamaCache = { ...status, lastCheck: Date.now() };
@@ -4836,197 +4503,7 @@ app.post('/api/llm/seed', authMiddleware, requireRole('admin'), apiLimiter, (_re
  res.json({ seeded: created, total: seeds.length });
 });
 
-// ─── Settings / Env Vars ────────────────────────────────────────────
-const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET || 'cf-default-secret-v1';
-function xorCipher(text) {
-  const buf = Buffer.from(text, 'utf8');
-  const key = Buffer.from(ENCRYPT_SECRET, 'utf8');
-  for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-  return buf.toString('base64');
-}
-function xorDecipher(b64) {
-  try {
-    const buf = Buffer.from(b64, 'base64');
-    const key = Buffer.from(ENCRYPT_SECRET, 'utf8');
-    for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-    return buf.toString('utf8');
-  } catch { return b64; }
-}
-
-// GET /api/settings/env — list all env vars (mask encrypted values)
-app.get('/api/settings/env', authMiddleware, requireRole('admin'), (_req, res) => {
-  try {
-    const rows = db.prepare('SELECT key, value, encrypted, category, created_at, updated_at FROM env_vars ORDER BY category, key').all();
-    const masked = rows.map(r => ({
-      ...r,
-      value: r.encrypted ? xorDecipher(r.value) : r.value,
-      encrypted: Boolean(r.encrypted),
-    }));
-    res.json(masked);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/settings/env — upsert an env var
-app.post('/api/settings/env', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
-  try {
-    const { key, value, encrypted = 0, category = 'general' } = req.body;
-    if (!key || value === undefined) return res.status(400).json({ error: 'key and value required' });
-    const storedVal = encrypted ? xorCipher(String(value)) : String(value);
-    db.prepare(`INSERT INTO env_vars (key, value, encrypted, category, created_at, updated_at)
-      VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, category=excluded.category, updated_at=datetime('now')`)
-      .run(key, storedVal, encrypted ? 1 : 0, category);
-    // Also set in process.env for immediate use
-    process.env[key] = String(value);
-    res.json({ success: true, key });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// DELETE /api/settings/env/:key
-app.delete('/api/settings/env/:key', authMiddleware, requireRole('admin'), (req, res) => {
-  try {
-    const { key } = req.params;
-    const info = db.prepare('DELETE FROM env_vars WHERE key = ?').run(key);
-    if (info.changes === 0) return res.status(404).json({ error: 'Not found' });
-    delete process.env[key];
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/settings/env/:key/test — test an API key
-app.post('/api/settings/env/:key/test', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
-  try {
-    const { key } = req.params;
-    const row = db.prepare('SELECT value, encrypted, category FROM env_vars WHERE key = ?').get(key);
-    if (!row) return res.status(404).json({ success: false, message: 'Variable not found' });
-    const val = row.encrypted ? xorDecipher(row.value) : row.value;
-    // Test based on key name / category
-    if (key.toLowerCase().includes('openai') || row.category === 'llm') {
-      try {
-        const r = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${val}` }, signal: AbortSignal.timeout(8000) });
-        if (r.ok) return res.json({ success: true, message: 'OpenAI API key valid' });
-        return res.json({ success: false, message: `API returned ${r.status}` });
-      } catch (e) { return res.json({ success: false, message: e.message }); }
-    }
-    // Generic test: just verify it's non-empty
-    if (val && val.length > 5) return res.json({ success: true, message: 'Value looks valid (non-trivial length)' });
-    return res.json({ success: false, message: 'Value too short to be a valid key' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ─── Dev Settings (port, log level, debug, etc.) ───────────────────
-// GET /api/settings/dev — all dev settings
-app.get('/api/settings/dev', authMiddleware, requireRole('admin'), (_req, res) => {
-  try {
-    const rows = db.prepare('SELECT key, value, updated_at FROM dev_settings ORDER BY key').all();
-    const settings = {};
-    for (const r of rows) settings[r.key] = r.value;
-    // Defaults
-    const result = {
-      port: settings.port || String(process.env.PORT || '8080'),
-      logLevel: settings.logLevel || process.env.LOG_LEVEL || 'info',
-      debugMode: settings.debugMode === 'true',
-      sandboxTimeout: settings.sandboxTimeout || '30',
-      maxConcurrentAgents: settings.maxConcurrentAgents || '5',
-      wsHeartbeatMs: settings.wsHeartbeatMs || '30000',
-      embeddingModel: settings.embeddingModel || 'Xenova/all-MiniLM-L6-v2',
-      ...settings,
-    };
-    res.json(result);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// PUT /api/settings/dev — update dev settings (batch)
-app.put('/api/settings/dev', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
-  try {
-    const updates = req.body;
-    if (!updates || typeof updates !== 'object') return res.status(400).json({ error: 'Object required' });
-
-    // Validate port if provided
-    if (updates.port !== undefined) {
-      const port = parseInt(updates.port, 10);
-      if (isNaN(port) || port < 1 || port > 65535) return res.status(400).json({ error: 'Port must be 1-65535' });
-      updates.port = String(port);
-    }
-
-    // Validate log level
-    if (updates.logLevel && !['error', 'warn', 'info', 'debug'].includes(updates.logLevel)) {
-      return res.status(400).json({ error: 'Log level must be: error, warn, info, or debug' });
-    }
-
-    // Validate numerics
-    if (updates.sandboxTimeout !== undefined) {
-      const t = parseInt(updates.sandboxTimeout, 10);
-      if (isNaN(t) || t < 1 || t > 300) return res.status(400).json({ error: 'Sandbox timeout must be 1-300s' });
-      updates.sandboxTimeout = String(t);
-    }
-    if (updates.maxConcurrentAgents !== undefined) {
-      const n = parseInt(updates.maxConcurrentAgents, 10);
-      if (isNaN(n) || n < 1 || n > 100) return res.status(400).json({ error: 'Max concurrent agents must be 1-100' });
-      updates.maxConcurrentAgents = String(n);
-    }
-
-    const upsert = db.prepare(`INSERT INTO dev_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')`);
-
-    const updated = [];
-    for (const [key, value] of Object.entries(updates)) {
-      upsert.run(key, String(value));
-      updated.push(key);
-    }
-
-    // Apply at runtime
-    if (updates.debugMode !== undefined) {
-      process.env.LOG_LEVEL = updates.debugMode === 'true' ? 'debug' : (updates.logLevel || process.env.LOG_LEVEL || 'info');
-    }
-    if (updates.logLevel) process.env.LOG_LEVEL = updates.logLevel;
-    if (updates.embeddingModel) process.env.CF_EMBEDDING_MODEL = updates.embeddingModel;
-
-    res.json({ success: true, updated, note: updates.port ? 'Restart server to apply new port' : undefined });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/settings/dev/restart — graceful restart (applies new port + settings)
-app.post('/api/settings/dev/restart', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
-  res.json({ success: true, message: 'Server restarting...' });
-  // Flush logs, close WS, then exit — Docker/process manager will respawn
-  setTimeout(() => {
-    logger.info('Restart requested via dev settings — initiating graceful shutdown...');
-    fireHook('onServerStop', { signal: 'restart', port: PORT });
-    wss.clients.forEach(c => c.close(1001, 'Server restarting'));
-    server.close(() => {
-      try { db.close(); } catch {}
-      process.exit(0);
-    });
-    // Force exit after 3s
-    setTimeout(() => process.exit(0), 3000);
-  }, 500);
-});
-
-// ─── Dev Settings Helper (read saved settings from DB) ─────────────
-function getDevSetting(key, fallback) {
-  try {
-    const row = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get(key);
-    return row ? row.value : fallback;
-  } catch { return fallback; }
-}
-
-function getDevSettings() {
-  const defaults = {
-    port: String(process.env.PORT || '8080'),
-    logLevel: process.env.LOG_LEVEL || 'info',
-    debugMode: 'false',
-    sandboxTimeout: '30',
-    maxConcurrentAgents: '5',
-    wsHeartbeatMs: '30000',
-    embeddingModel: 'Xenova/all-MiniLM-L6-v2',
-  };
-  try {
-    const rows = db.prepare('SELECT key, value FROM dev_settings').all();
-    for (const r of rows) defaults[r.key] = r.value;
-  } catch {}
-  return defaults;
-}
+// ─── Settings / Env Vars + Dev Settings (moved to routes/settings.mjs) ──
 
 // Load stored env vars into process.env on startup
 try {
