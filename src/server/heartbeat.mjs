@@ -123,6 +123,14 @@ export class HeartbeatDaemon {
       providers: { total: 0, enabled: 0 },
       schedules: { total: 0, enabled: 0 },
       messages: { pending: 0 },
+      memory: {
+        rss_mb: 0,
+        heap_used_mb: 0,
+        heap_total_mb: 0,
+        heap_usage_pct: 0,
+        alert_threshold_pct: 85,
+      },
+      uptime_seconds: 0,
     };
 
     try {
@@ -166,6 +174,26 @@ export class HeartbeatDaemon {
       // Messages
       const msgs = this.stmts.commsMessages.getPending.all();
       state.messages.pending = msgs.length;
+
+      // Memory monitoring
+      const mem = process.memoryUsage();
+      const heapUsed = mem.heapUsed;
+      const heapTotal = mem.heapTotal;
+      state.memory.rss_mb = Math.round(mem.rss / 1024 / 1024 * 100) / 100;
+      state.memory.heap_used_mb = Math.round(heapUsed / 1024 / 1024 * 100) / 100;
+      state.memory.heap_total_mb = Math.round(heapTotal / 1024 / 1024 * 100) / 100;
+      state.memory.heap_usage_pct = heapTotal > 0 ? Math.round((heapUsed / heapTotal) * 100 * 100) / 100 : 0;
+      state.uptime_seconds = Math.round(process.uptime());
+
+      // Memory alert
+      if (state.memory.heap_usage_pct > state.memory.alert_threshold_pct) {
+        this.broadcast('heartbeat:alert', {
+          rule: 'memory_high',
+          message: `Heap usage at ${state.memory.heap_usage_pct}% (${state.memory.heap_used_mb}MB / ${state.memory.heap_total_mb}MB)`,
+          state,
+        });
+        this.logger.warn(`[heartbeat] Memory alert: heap at ${state.memory.heap_usage_pct}% (${state.memory.heap_used_mb}MB / ${state.memory.heap_total_mb}MB)`);
+      }
     } catch (e) {
       this.logger.error('[heartbeat] State collection error:', e.message);
     }

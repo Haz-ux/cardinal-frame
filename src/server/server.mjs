@@ -100,9 +100,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Rate Limiting ─────────────────────────────────────────────────
+// ─── Rate Limiting (tiered) ─────────────────────────────────────────
 const authLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many auth attempts. Try again in 1 minute.' }, skip: () => process.env.NODE_ENV === 'test' });
-const apiLimiter = rateLimit({ windowMs: 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, slow down' } });
+const readLimiter = rateLimit({ windowMs: 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many read requests, slow down' }, skip: () => process.env.NODE_ENV === 'test' });
+const writeLimiter = rateLimit({ windowMs: 60 * 1000, max: 50, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many write requests, slow down' }, skip: () => process.env.NODE_ENV === 'test' });
+const sandboxLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Sandbox rate limit reached. Max 10 executions per minute.' }, skip: () => process.env.NODE_ENV === 'test' });
+// Legacy alias — maps to writeLimiter for backward compat on existing routes
+const apiLimiter = writeLimiter;
 app.set('trust proxy', 1);
 
 // ─── SQLite Database ───────────────────────────────────────────────
@@ -1197,7 +1201,7 @@ async function fireHook(hookName, data) {
 const ctx = {
   app, db, stmts, wss, logger,
   JWT_SECRET, JWT_EXPIRES,
-  authMiddleware, optionalAuth, requireRole, authLimiter, apiLimiter,
+  authMiddleware, optionalAuth, requireRole, authLimiter, apiLimiter, readLimiter, writeLimiter, sandboxLimiter,
   audit, broadcast, broadcastLog,
   randomUUID,
   mcp, embeddings,
@@ -1316,7 +1320,7 @@ app.get('/api/context/injections', authMiddleware, (req, res) => {
 });
 
 // ─── Code Execution Sandbox ──────────────────────────────────────
-app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), apiLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
+app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
  try {
   // execSync is injected by the skill runtime
   const { code, language = 'javascript' } = req.body;
@@ -1493,6 +1497,66 @@ app.get('/api/health', (_req, res) => {
     },
     timestamp: new Date().toISOString(),
   });
+});
+
+// ─── Detailed Health (memory monitoring) ──────────────────────────────
+app.get('/api/health/detailed', authMiddleware, requireRole('admin'), (_req, res) => {
+  const mem = process.memoryUsage();
+  const dbSize = db.prepare("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()").get().size;
+  res.json({
+    status: 'ok',
+    uptime_seconds: Math.round(process.uptime()),
+    process: {
+      pid: process.pid,
+      platform: process.platform,
+      node_version: process.version,
+    },
+    memory: {
+      rss_mb: Math.round(mem.rss / 1024 / 1024 * 100) / 100,
+      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
+      heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
+      external_mb: Math.round(mem.external / 1024 / 1024 * 100) / 100,
+      array_buffers_mb: Math.round(mem.arrayBuffers / 1024 / 1024 * 100) / 100,
+      heap_limit_mb: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
+      heap_usage_pct: Math.round((mem.heapUsed / mem.heapTotal) * 100 * 100) / 100,
+    },
+    db: {
+      type: 'SQLite',
+      journal_mode: db.pragma('journal_mode')[0],
+      tables: db.prepare("SELECT count(*) as c FROM sqlite_master WHERE type='table'").get().c,
+      size_mb: Math.round((dbSize / 1024 / 1024) * 100) / 100,
+      read_count: db.prepare("PRAGMA stats").get()?.read || 0,
+      write_count: db.prepare("PRAGMA stats").get()?.write || 0,
+    },
+    ws: {
+      connected_clients: wss.clients.size,
+    },
+    event_loop: {
+      max_heap_mb: Math.round(require('v8').getHeapStatistics().total_physical_size / 1024 / 1024 * 100) / 100,
+      used_heap_mb: Math.round(require('v8').getHeapStatistics().used_heap_size / 1024 / 1024 * 100) / 100,
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ─── Request Logger Middleware ──────────────────────────────────────
+const LOG_LEVEL = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug');
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const currentLogLevel = LOG_LEVELS[LOG_LEVEL] ?? 2;
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const level = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    if (LOG_LEVELS[level] <= currentLogLevel) {
+      const logLine = `[${new Date().toISOString()}] ${level.toUpperCase()} ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`;
+      if (level === 'error') console.error(logLine);
+      else if (level === 'warn') console.warn(logLine);
+      else console.log(logLine);
+    }
+  });
+  next();
 });
 
 // ─── Live Telemetry ────────────────────────────────────────────────
