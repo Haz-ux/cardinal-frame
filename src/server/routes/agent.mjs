@@ -34,6 +34,13 @@ const ALLOWED_READ_EXT = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.json', '.md', 
 const MAX_AGENT_STEPS = 20;
 const AGENT_STEP_DELAY_MS = 500;
 
+// Module-level deps — populated by agentRoutes(ctx)
+// Proxy that lazily forwards to _ctx (avoids TDZ on getter properties in ctx)
+let _ctxRef = null;
+const _deps = new Proxy({}, {
+  get(_t, prop) { return _ctxRef?.[prop]; },
+});
+
 function resolveSandboxPath(scope, targetPath) {
   const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
   const resolved = path.resolve(base, targetPath || '.');
@@ -345,7 +352,7 @@ registerAgentTool(
     required: ['name'],
   },
   async (args) => {
-    const skill = stmts.skills.getByName.get(args.name);
+    const skill = _deps.stmts.skills.getByName.get(args.name);
     if (!skill) return { error: `Skill not found: ${args.name}` };
     try {
       const { result: handlerResult } = await runSandboxed({
@@ -365,10 +372,10 @@ async function executeAgentTool(toolName, args, ctx) {
   if (!tool) return { error: `Unknown tool: ${toolName}` };
   try {
     const result = await tool.execute(args || {}, ctx || {});
-    fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result, success: !result.error });
+    _deps.fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result, success: !result.error });
     return result;
   } catch (e) {
-    fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result: { error: e.message }, success: false });
+    _deps.fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result: { error: e.message }, success: false });
     return { error: e.message };
   }
 }
@@ -378,7 +385,7 @@ async function executeAgentTool(toolName, args, ctx) {
 // Broadcasts progress over WebSocket. Returns final summary.
 
 async function runAgentLoop(sessionId, options = {}) {
-  const session = stmts.agentSessions.getById.get(sessionId);
+  const session = _deps.stmts.agentSessions.getById.get(sessionId);
   if (!session) throw new Error('Session not found');
 
   const ctx = { scope: session.scope, sessionId, userId: session.user_id };
@@ -410,27 +417,27 @@ Remember:
 
   // ─── Memory recall: inject relevant memories into context ──────
   try {
-    const memResults = stmts.memories.search.all(session.task.slice(0, 50) + '*', session.user_id, 5);
+    const memResults = _deps.stmts.memories.search.all(session.task.slice(0, 50) + '*', session.user_id, 5);
     if (memResults && memResults.length > 0) {
       const memText = memResults.map(m => `- [${m.category}] ${m.content.slice(0, 200)}`).join('\n');
       messages.splice(1, 0, {
         role: 'system',
         content: `Relevant memories from past sessions:\n${memText}\n\nUse these if helpful for the current task.`,
       });
-      logger.info(`Agent loop: injected ${memResults.length} memories into context`);
+      _deps.logger.info(`Agent loop: injected ${memResults.length} memories into context`);
     }
   } catch (e) { /* FTS5 may not be ready in all envs */ }
 
   // ─── Index this session for future search ─────────────────────
   try {
-    stmts.sessionIndex.insert.run(
+    _deps.stmts.sessionIndex.insert.run(
       randomUUID(), 'agent', sessionId, session.user_id,
       session.task.slice(0, 100), session.task
     );
   } catch (e) { /* may already exist on resume */ }
 
   // Load any existing actions into context (for resumed sessions)
-  const existingActions = stmts.agentActions.getBySession.all(sessionId);
+  const existingActions = _deps.stmts.agentActions.getBySession.all(sessionId);
   if (existingActions.length > 0) {
     for (const action of existingActions.slice(-10)) {
       messages.push({ role: 'assistant', content: `I performed ${action.action_type} on ${action.target}. Result: ${(action.result || '').slice(0, 200)}` });
@@ -439,27 +446,27 @@ Remember:
   }
 
   // Update session status
-  stmts.agentSessions.updateStatus.run('executing', sessionId);
-  broadcast('agent:loop:start', { session_id: sessionId, max_steps: maxSteps });
+  _deps.stmts.agentSessions.updateStatus.run('executing', sessionId);
+  _deps.broadcast('agent:loop:start', { session_id: sessionId, max_steps: maxSteps });
 
   let totalTokens = { prompt: 0, completion: 0 };
 
   for (let step = 0; step < maxSteps; step++) {
-    broadcast('agent:step', { session_id: sessionId, step: step + 1, status: 'thinking' });
-    stmts.agentSessions.updateStep.run(step + 1, sessionId);
+    _deps.broadcast('agent:step', { session_id: sessionId, step: step + 1, status: 'thinking' });
+    _deps.stmts.agentSessions.updateStep.run(step + 1, sessionId);
 
     let llmResult;
     try {
       llmResult = await callAgentLLMWithToolsRetry(messages, toolDefs, model);
     } catch (e) {
-      logger.error(`Agent loop LLM error at step ${step + 1}: ${e.message}`);
-      broadcast('agent:loop:error', { session_id: sessionId, step: step + 1, error: e.message });
-      stmts.agentSessions.updateStatus.run('failed', sessionId);
+      _deps.logger.error(`Agent loop LLM error at step ${step + 1}: ${e.message}`);
+      _deps.broadcast('agent:loop:error', { session_id: sessionId, step: step + 1, error: e.message });
+      _deps.stmts.agentSessions.updateStatus.run('failed', sessionId);
 
       // Record the error as an action for debugging
       const errActionId = randomUUID();
-      const errStepIdx = stmts.agentActions.getBySession.all(sessionId).length;
-      stmts.agentActions.insert.run(errActionId, sessionId, errStepIdx, 'error', 'llm_call', e.message, JSON.stringify({ error: e.message }), 'failed');
+      const errStepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+      _deps.stmts.agentActions.insert.run(errActionId, sessionId, errStepIdx, 'error', 'llm_call', e.message, JSON.stringify({ error: e.message }), 'failed');
 
       return { completed: false, error: e.message, steps: step + 1, tokens: totalTokens };
     }
@@ -473,7 +480,7 @@ Remember:
         const toolName = toolCall.function.name;
         const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
 
-        broadcast('agent:step', {
+        _deps.broadcast('agent:step', {
           session_id: sessionId,
           step: step + 1,
           status: 'executing_tool',
@@ -487,8 +494,8 @@ Remember:
         // Check if suggest mode requires approval
         if (session.mode === 'suggest' && ['file_write', 'shell_exec', 'git_op'].includes(toolName)) {
           const actionId = randomUUID();
-          const stepIdx = stmts.agentActions.getBySession.all(sessionId).length;
-          stmts.agentActions.insert.run(
+          const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+          _deps.stmts.agentActions.insert.run(
             actionId, sessionId, stepIdx, toolName === 'file_write' ? 'write' : 'exec',
             toolArgs.path || toolArgs.command || toolName,
             toolArgs.content || JSON.stringify(toolArgs),
@@ -496,7 +503,7 @@ Remember:
             'pending'
           );
 
-          broadcast('agent:approval_required', {
+          _deps.broadcast('agent:approval_required', {
             session_id: sessionId,
             step: step + 1,
             action_id: actionId,
@@ -505,7 +512,7 @@ Remember:
             result: result.error ? result : { preview: 'Draft created' },
           });
 
-          stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
+          _deps.stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
           return {
             completed: false,
             paused: true,
@@ -518,8 +525,8 @@ Remember:
 
         // Record the action
         const actionId = randomUUID();
-        const stepIdx = stmts.agentActions.getBySession.all(sessionId).length;
-        stmts.agentActions.insert.run(
+        const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+        _deps.stmts.agentActions.insert.run(
           actionId, sessionId, stepIdx,
           toolName === 'file_read' ? 'read' :
           toolName === 'file_write' ? 'write' :
@@ -531,7 +538,7 @@ Remember:
           'completed'
         );
 
-        broadcast('agent:step', {
+        _deps.broadcast('agent:step', {
           session_id: sessionId,
           step: step + 1,
           status: 'tool_complete',
@@ -563,11 +570,11 @@ Remember:
 
     // Record the final response
     const actionId = randomUUID();
-    const stepIdx = stmts.agentActions.getBySession.all(sessionId).length;
-    stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'response', 'complete', content.slice(0, 5000), JSON.stringify({ summary: content.slice(0, 2000) }), 'completed');
+    const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+    _deps.stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'response', 'complete', content.slice(0, 5000), JSON.stringify({ summary: content.slice(0, 2000) }), 'completed');
 
-    stmts.agentSessions.updateStatus.run('completed', sessionId);
-    broadcast('agent:loop:complete', {
+    _deps.stmts.agentSessions.updateStatus.run('completed', sessionId);
+    _deps.broadcast('agent:loop:complete', {
       session_id: sessionId,
       steps: step + 1,
       summary: content.slice(0, 500),
@@ -576,14 +583,14 @@ Remember:
 
     // ── Comms reply: if this session was triggered by a comms message, send result back ──
     try {
-      const commsMsg = db.prepare('SELECT * FROM comms_messages WHERE agent_session_id = ?').get(sessionId);
+      const commsMsg = _deps.db.prepare('SELECT * FROM comms_messages WHERE agent_session_id = ?').get(sessionId);
       if (commsMsg) {
-        const channel = stmts.commsChannels.getById.get(commsMsg.channel_id);
+        const channel = _deps.stmts.commsChannels.getById.get(commsMsg.channel_id);
         if (channel) {
           await sendCommsReply(channel, commsMsg, content);
         }
       }
-    } catch (e) { logger.error(`Comms reply hook failed: ${e.message}`); }
+    } catch (e) { _deps.logger.error(`Comms reply hook failed: ${e.message}`); }
 
     return {
       completed: true,
@@ -594,8 +601,8 @@ Remember:
   }
 
   // Hit max steps
-  stmts.agentSessions.updateStatus.run('max_steps_reached', sessionId);
-  broadcast('agent:loop:complete', { session_id: sessionId, steps: maxSteps, summary: 'Max steps reached', tokens: totalTokens });
+  _deps.stmts.agentSessions.updateStatus.run('max_steps_reached', sessionId);
+  _deps.broadcast('agent:loop:complete', { session_id: sessionId, steps: maxSteps, summary: 'Max steps reached', tokens: totalTokens });
 
   return {
     completed: false,
@@ -609,12 +616,12 @@ Remember:
 async function callAgentLLMWithTools(messages, toolDefs, modelOverride) {
   let provider, modelRecord;
   if (modelOverride) {
-    modelRecord = db.prepare('SELECT * FROM llm_models WHERE model_id = ? OR display_name = ?').get(modelOverride, modelOverride);
-    if (modelRecord) provider = stmts.providers.getById.get(modelRecord.provider_id);
+    modelRecord = _deps.db.prepare('SELECT * FROM llm_models WHERE model_id = ? OR display_name = ?').get(modelOverride, modelOverride);
+    if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider) {
-    modelRecord = stmts.models.getDefault.get();
-    if (modelRecord) provider = stmts.providers.getById.get(modelRecord.provider_id);
+    modelRecord = _deps.stmts.models.getDefault.get();
+    if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider || !provider.api_key) throw new Error('No LLM provider with API key configured');
 
@@ -658,7 +665,7 @@ async function callAgentLLMWithTools(messages, toolDefs, modelOverride) {
     const errText = await resp.text().catch(() => '');
     // Check if it's a tools-related error (400/422 with "tools" or "function" in the message)
     if ((resp.status === 400 || resp.status === 422) && /tool|function/i.test(errText)) {
-      logger.warn(`Provider ${provider.name} doesn't support function calling, retrying with tool_prompt fallback`);
+      _deps.logger.warn(`Provider ${provider.name} doesn't support function calling, retrying with tool_prompt fallback`);
       // Remove tools and inject tool descriptions into system prompt instead
       const fallbackBody = { ...body };
       delete fallbackBody.tools;
@@ -724,7 +731,7 @@ async function callAgentLLMWithToolsRetry(messages, toolDefs, modelOverride, max
       const is429 = err.message?.includes('(429)') || err.message?.includes('Too Many Requests');
       if (is429 && attempt < maxRetries - 1) {
         const delay = Math.pow(2, attempt + 1) * 1000;
-        logger.warn(`Agent LLM rate limited, retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
+        _deps.logger.warn(`Agent LLM rate limited, retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -756,12 +763,12 @@ function compactAgentHistory(messages, maxMessages = 20) {
 async function callAgentLLM(messages, modelOverride) {
   let provider, modelRecord;
   if (modelOverride) {
-    modelRecord = db.prepare('SELECT * FROM llm_models WHERE model_id = ? OR display_name = ?').get(modelOverride, modelOverride);
-    if (modelRecord) provider = stmts.providers.getById.get(modelRecord.provider_id);
+    modelRecord = _deps.db.prepare('SELECT * FROM llm_models WHERE model_id = ? OR display_name = ?').get(modelOverride, modelOverride);
+    if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider) {
-    modelRecord = stmts.models.getDefault.get();
-    if (modelRecord) provider = stmts.providers.getById.get(modelRecord.provider_id);
+    modelRecord = _deps.stmts.models.getDefault.get();
+    if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider || !provider.api_key) throw new Error('No LLM provider with API key configured');
   const modelId = modelRecord?.model_id || 'gpt-3.5-turbo';
@@ -820,7 +827,7 @@ async function callAgentLLMWithRetry(messages, modelOverride, maxRetries = 3) {
         const is429 = err.message?.includes('LLM error (429)') || err.message?.includes('429') || err.message?.includes('Too Many Requests');
         if (is429 && attempt < maxRetries - 1) {
           const delay = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
-          logger.warn(`LLM rate limited, retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
+          _deps.logger.warn(`LLM rate limited, retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
@@ -837,6 +844,9 @@ async function callAgentLLMWithRetry(messages, modelOverride, maxRetries = 3) {
 // POST /api/agent/sessions — create a new agent session
 
 export default function agentRoutes(ctx) {
+  // Wire _deps to ctx so module-level functions can access ctx props lazily
+  // (getters for later-declared vars would TDZ if accessed eagerly)
+  _ctxRef = ctx;
   const { db, stmts, authMiddleware, requireRole, apiLimiter, PORT, logger, broadcast, broadcastLog, fireHook, getDevSetting, executeSkill } = ctx;
   const router = express.Router();
 
