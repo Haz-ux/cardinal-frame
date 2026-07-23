@@ -35,6 +35,7 @@ import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain, executeToolChain, resolveStepInput, buildChainIntentPrompt } from './chains.mjs';
 import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from './evolution.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
+import { runMigrations } from './migrator.mjs';
 
 dotenv.config();
 
@@ -111,6 +112,9 @@ mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'cardinal.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+
+// ─── Run migrations (version-tracked SQL files) ────────────────────
+runMigrations(db);
 
 // Schema with task_logs, task_assignments, and RBAC
 const adminHash = bcrypt.hashSync('admin123', 10);
