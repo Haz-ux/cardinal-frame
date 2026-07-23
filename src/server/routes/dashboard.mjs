@@ -38,6 +38,7 @@ export default function dashboardRoutes(ctx) {
     wss,
     logger,
     authMiddleware,
+    optionalAuth,
     apiLimiter,
   } = ctx;
 
