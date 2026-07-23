@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, memo, useMemo } from 'react';
 import { api } from './AuthContext';
 import { cachedFetch } from './dataCache';
 import { usePolling } from './usePolling';
-import { Shield, Key, Eye, EyeOff, Plus, Trash2, RefreshCw, Save, AlertTriangle, CheckCircle, Zap, Server, Globe, Cpu, Bot, Search, Wifi, WifiOff, ChevronDown } from 'lucide-react';
+import { Shield, Key, Eye, EyeOff, Plus, Trash2, RefreshCw, Save, AlertTriangle, CheckCircle, Zap, Server, Globe, Cpu, Bot, Search, Wifi, WifiOff, ChevronDown, Terminal, ToggleLeft, ToggleRight } from 'lucide-react';
 
 const NEON = { cyan:'#00f0ff', blue:'#3b82f6', green:'#22c55e', yellow:'#eab308', red:'#ef4444', purple:'#a855f7', orange:'#f97316', pink:'#ec4899', magenta:'#ff00ff', teal:'#14b8a6' };
 
@@ -160,6 +160,237 @@ const VarRow = memo(function VarRow({ v, onSave, onDelete, onTest }) {
  );
 });
 
+// ─── Dev Settings (port, log level, debug, etc.) ───────────────────
+const DevSettings = memo(function DevSettings({ showToast }) {
+  const [settings, setSettings] = useState(null);
+  const [editing, setEditing] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(() => {
+    api('/api/settings/dev').then(setSettings).catch(() => {});
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (!settings) return (
+    <div className="rounded-xl p-5 text-center text-gray-600" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.green}10` }}>
+      <Terminal size={24} className="mx-auto mb-2 opacity-30 animate-pulse" />
+      Loading dev settings...
+    </div>
+  );
+
+  const startEdit = (key) => setEditing(prev => ({ ...prev, [key]: true }));
+  const cancelEdit = (key) => setEditing(prev => { const n = { ...prev }; delete n[key]; return n; });
+
+  const handleSave = async (updates) => {
+    setSaving(true);
+    try {
+      const r = await api('/api/settings/dev', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) });
+      showToast(r.note || 'Dev settings saved', 'success');
+      setEditing({});
+      load();
+    } catch (err) { showToast(err.message || 'Save failed', 'error'); }
+    setSaving(false);
+  };
+
+  const portValue = editing.port !== undefined ? editing.port : settings.port;
+
+  return (
+    <div className="space-y-3">
+      {/* Port Setting */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.green}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.green}10`, border: `1px solid ${NEON.green}20` }}>
+          <Server size={16} style={{ color: NEON.green }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Server Port</div>
+          <div className="text-xs text-gray-500 mt-0.5">
+            Current: <span className="font-mono" style={{ color: NEON.green }}>{settings.port}</span> ·
+            {process.env.PORT ? ' Set via ENV (overrides saved)' : ' Saved in DB (persists on reboot)'}
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.port !== undefined ? (
+            <>
+              <input
+                type="number"
+                value={editing.port}
+                onChange={e => setEditing(prev => ({ ...prev, port: e.target.value }))}
+                min="1" max="65535"
+                className="w-24 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none focus:ring-1 focus:ring-green-500/30"
+                style={{ border: `1px solid ${NEON.green}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ port: editing.port })} disabled={saving || !editing.port} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green, opacity: saving || !editing.port ? 0.4 : 1 }}>
+                <Save size={10} className="inline mr-1" />Save
+              </button>
+              <button onClick={() => cancelEdit('port')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-300">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-sm font-mono font-bold" style={{ color: NEON.green }}>{settings.port}</span>
+              {!process.env.PORT && <button onClick={() => startEdit('port')} className="text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors" style={{ color: NEON.cyan }}>Change</button>}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Log Level Setting */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.purple}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.purple}10`, border: `1px solid ${NEON.purple}20` }}>
+          <Terminal size={16} style={{ color: NEON.purple }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Log Level</div>
+          <div className="text-xs text-gray-500 mt-0.5">Controls server console verbosity</div>
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          {['error', 'warn', 'info', 'debug'].map(level => (
+            <button
+              key={level}
+              onClick={() => handleSave({ logLevel: level })}
+              className="px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all"
+              style={{
+                background: settings.logLevel === level ? `${NEON.purple}15` : 'transparent',
+                border: `1px solid ${settings.logLevel === level ? NEON.purple + '40' : '#222'}`,
+                color: settings.logLevel === level ? NEON.purple : '#555',
+              }}
+            >
+              {level}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Debug Mode Toggle */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.yellow}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.yellow}10`, border: `1px solid ${NEON.yellow}20` }}>
+          {settings.debugMode ? <ToggleRight size={20} style={{ color: NEON.yellow }} /> : <ToggleLeft size={20} style={{ color: '#555' }} />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Debug Mode</div>
+          <div className="text-xs text-gray-500 mt-0.5">Enables verbose logging + stack traces in error responses</div>
+        </div>
+        <button
+          onClick={() => handleSave({ debugMode: !settings.debugMode })}
+          className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+          style={{
+            background: settings.debugMode ? `${NEON.yellow}15` : 'rgba(0,0,0,0.3)',
+            border: `1px solid ${settings.debugMode ? NEON.yellow + '30' : '#333'}`,
+            color: settings.debugMode ? NEON.yellow : '#555',
+          }}
+        >
+          {settings.debugMode ? 'ON' : 'OFF'}
+        </button>
+      </div>
+
+      {/* Sandbox Timeout */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.orange}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.orange}10`, border: `1px solid ${NEON.orange}20` }}>
+          <Zap size={16} style={{ color: NEON.orange }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Sandbox Timeout</div>
+          <div className="text-xs text-gray-500 mt-0.5">Seconds before sandboxed code execution is killed</div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.sandboxTimeout !== undefined ? (
+            <>
+              <input
+                type="number"
+                value={editing.sandboxTimeout}
+                onChange={e => setEditing(prev => ({ ...prev, sandboxTimeout: e.target.value }))}
+                min="1" max="300"
+                className="w-20 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none"
+                style={{ border: `1px solid ${NEON.orange}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ sandboxTimeout: editing.sandboxTimeout })} disabled={saving} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}>
+                <Save size={10} className="inline" />
+              </button>
+              <button onClick={() => cancelEdit('sandboxTimeout')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-sm font-mono font-bold" style={{ color: NEON.orange }}>{settings.sandboxTimeout}s</span>
+              <button onClick={() => startEdit('sandboxTimeout')} className="text-xs px-2 py-1 rounded hover:bg-white/5" style={{ color: NEON.cyan }}>Edit</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Max Concurrent Agents */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.blue}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.blue}10`, border: `1px solid ${NEON.blue}20` }}>
+          <Bot size={16} style={{ color: NEON.blue }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Max Concurrent Agents</div>
+          <div className="text-xs text-gray-500 mt-0.5">Maximum simultaneous agent executions</div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.maxConcurrentAgents !== undefined ? (
+            <>
+              <input
+                type="number"
+                value={editing.maxConcurrentAgents}
+                onChange={e => setEditing(prev => ({ ...prev, maxConcurrentAgents: e.target.value }))}
+                min="1" max="100"
+                className="w-20 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none"
+                style={{ border: `1px solid ${NEON.blue}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ maxConcurrentAgents: editing.maxConcurrentAgents })} disabled={saving} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}>
+                <Save size={10} className="inline" />
+              </button>
+              <button onClick={() => cancelEdit('maxConcurrentAgents')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-sm font-mono font-bold" style={{ color: NEON.blue }}>{settings.maxConcurrentAgents}</span>
+              <button onClick={() => startEdit('maxConcurrentAgents')} className="text-xs px-2 py-1 rounded hover:bg-white/5" style={{ color: NEON.cyan }}>Edit</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Embedding Model */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.teal}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.teal}10`, border: `1px solid ${NEON.teal}20` }}>
+          <Cpu size={16} style={{ color: NEON.teal }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Embedding Model</div>
+          <div className="text-xs text-gray-500 mt-0.5 truncate">Model used for semantic search & similarity</div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.embeddingModel !== undefined ? (
+            <>
+              <input
+                type="text"
+                value={editing.embeddingModel}
+                onChange={e => setEditing(prev => ({ ...prev, embeddingModel: e.target.value }))}
+                className="w-56 px-2.5 py-1.5 rounded-lg text-xs font-mono text-white bg-black/40 outline-none"
+                style={{ border: `1px solid ${NEON.teal}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ embeddingModel: editing.embeddingModel })} disabled={saving} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}>
+                <Save size={10} className="inline" />
+              </button>
+              <button onClick={() => cancelEdit('embeddingModel')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-xs font-mono truncate max-w-[200px]" style={{ color: NEON.teal }}>{settings.embeddingModel}</span>
+              <button onClick={() => startEdit('embeddingModel')} className="text-xs px-2 py-1 rounded hover:bg-white/5" style={{ color: NEON.cyan }}>Edit</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 // ─── Main Settings ─────────────────────────────────────────────────
 export default function Settings() {
   const [vars, setVars] = useState([]);
@@ -261,6 +492,16 @@ export default function Settings() {
             />
           ))}
         </div>
+      </div>
+
+      {/* ─── Dev Settings Section ─────────────────────────────────────── */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <Terminal size={16} style={{ color: NEON.green }} />
+          <h3 className="text-sm font-bold" style={{ color: NEON.green }}>Dev Settings</h3>
+          <span className="text-[10px] text-gray-600">Server port, log level, debug mode & runtime config</span>
+        </div>
+        <DevSettings showToast={showToast} />
       </div>
 
       {/* ─── Custom Env Vars ──────────────────────────────────────────── */}
