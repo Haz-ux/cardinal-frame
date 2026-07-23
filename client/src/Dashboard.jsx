@@ -59,96 +59,205 @@ function formatEvent(msg) {
 }
 
 // ─── Mini sparkline component ───────────────────────────────────────
-const Sparkline = memo(function Sparkline({ data, color = NEON.green, height = 32, width = 120 }) {
- if (!data || data.length < 2) return null;
+// Reusable inline-SVG line chart with a subtle gradient fill under the line.
+// Props: data (number[]), color, height, width, id (unique gradient id).
+let __sparkId = 0;
+const Sparkline = memo(function Sparkline({ data, color = NEON.green, height = 32, width = 120, id }) {
+ // Unique gradient id so multiple sparklines on the same page never collide.
+ const gid = useMemo(() => id || `spark-${color.replace('#','')}-${__sparkId++}`, [id, color]);
+ if (!data || data.length < 2) {
+  // Placeholder baseline so the card doesn't jump height when history is empty.
+  return <svg width={width} height={height} className="overflow-visible opacity-20">
+   <line x1="0" y1={height - 2} x2={width} y2={height - 2} stroke={color} strokeWidth="1" strokeDasharray="2 4" />
+  </svg>;
+ }
  const max = Math.max(...data, 1);
  const min = Math.min(...data, 0);
  const range = max - min || 1;
  const pts = data.map((v, i) => {
   const x = (i / (data.length - 1)) * width;
   const y = height - ((v - min) / range) * (height - 4) - 2;
-  return `${x},${y}`;
+  return `${x.toFixed(2)},${y.toFixed(2)}`;
  });
+ const linePath = `M ${pts.join(' L ')}`;
+ const areaPath = `${linePath} L ${width},${height} L 0,${height} Z`;
  return (
   <svg width={width} height={height} className="overflow-visible">
    <defs>
-    <linearGradient id={`grad-${color.replace('#','')}`} x1="0" y1="0" x2="0" y2="1">
-     <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+    <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+     <stop offset="0%" stopColor={color} stopOpacity="0.35" />
      <stop offset="100%" stopColor={color} stopOpacity="0" />
     </linearGradient>
    </defs>
-   <polyline
+   <path
+    d={areaPath}
+    fill={`url(#${gid})`}
+   />
+   <path
+    d={linePath}
     fill="none"
     stroke={color}
     strokeWidth="1.5"
-    points={pts.join(' ')}
+    strokeLinejoin="round"
+    strokeLinecap="round"
     style={{ filter: `drop-shadow(0 0 3px ${color})` }}
    />
-   <polygon
-    fill={`url(#grad-${color.replace('#','')})`}
-    points={`0,${height} ${pts.join(' ')} ${width},${height}`}
+   {/* Head dot — last sample */}
+   <circle
+    cx={width}
+    cy={height - ((data[data.length - 1] - min) / range) * (height - 4) - 2}
+    r="1.6"
+    fill={color}
+    style={{ filter: `drop-shadow(0 0 4px ${color})` }}
    />
   </svg>
  );
 });
 
+// ─── Heatmap (inline SVG, green→yellow→red, 2D grid) ───────────────
+// Generic reusable heatmap. Props:
+//   values: number[][] — values[row][col], row=day, col=hour (0=anchored)
+//   rows, cols, cell, gap, title, showAxisLabels
+// Color stops: 0=green, 0.5=yellow, 1=red. Cells fade in on dark bg.
+const Heatmap = memo(function Heatmap({
+ values, rows = 7, cols = 24, cell = 14, gap = 2,
+ showAxisLabels = true,
+}) {
+ const id = useMemo(() => `heat-${Math.random().toString(36).slice(2, 8)}`, []);
+ // Find max for normalization; bail gracefully with empty grid.
+ const flat = values ? values.flat() : [];
+ const max = flat.length ? Math.max(...flat, 1) : 1;
+ const W = cols * (cell + gap) + gap;
+ const H = rows * (cell + gap) + gap + (showAxisLabels ? 10 : 0);
+
+ // Interpolate green→yellow→red via HSL ballistics.
+ const colorFor = (t) => {
+  // t in [0,1]; 0=green(140°), ~0.55=yellow(55°), 1=red(0°)
+  const hue = Math.max(0, 140 - t * 140);
+  const light = 50 + (1 - t) * 5; // green a touch brighter
+  return `hsl(${hue.toFixed(0)} 100% ${light}%)`;
+ };
+
+ return (
+  <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ display: 'block' }}>
+   <defs>
+    {/* subtle radial wash for empty cells so the grid reads on #050510 */}
+    <radialGradient id={`${id}-bg`} cx="50%" cy="50%" r="70%">
+     <stop offset="0%" stopColor={NEON.green} stopOpacity="0.05" />
+     <stop offset="100%" stopColor={NEON.green} stopOpacity="0.01" />
+    </radialGradient>
+   </defs>
+   {Array.from({ length: rows }, (_, r) =>
+    Array.from({ length: cols }, (_, c) => {
+     const v = values?.[r]?.[c] ?? 0;
+     const t = max > 0 ? v / max : 0;
+     const x = gap + c * (cell + gap);
+     const y = gap + r * (cell + gap);
+     const fill = v === 0 ? `url(#${id}-bg)` : colorFor(t);
+     const glow = t > 0.55 ? `drop-shadow(0 0 3px ${colorFor(t)})` : 'none';
+     const opacity = v === 0 ? 0.35 : 0.85 + t * 0.15;
+     return (
+      <rect
+       key={`${r}-${c}`}
+       x={x}
+       y={y}
+       width={cell}
+       height={cell}
+        // Chamfered corners via clip-path (cyberpunk HUD aesthetic)
+       rx="1"
+       fill={fill}
+       opacity={opacity}
+       style={{ filter: glow }}
+      >
+       <title>{`day ${rows - 1 - r}, hour ${c}: ${v} events`}</title>
+      </rect>
+     );
+    })
+   )}
+   {/* Hour axis labels (sparse) */}
+   {showAxisLabels && [0, 6, 12, 18, 23].map(h => (
+    <text
+     key={`ax-${h}`}
+     x={gap + h * (cell + gap) + cell / 2}
+     y={H - 1}
+     fontSize="7"
+     fill="#444"
+     textAnchor="middle"
+     fontFamily="monospace"
+    >{h}</text>
+   ))}
+  </svg>
+ );
+});
+
 // ─── Activity Heatmap (last 7 days × 24 hours) ──────────────────────
-const ActivityHeatmap = memo(function ActivityHeatmap({ events }) {
- const cells = useMemo(() => {
-  const grid = {};
-  const now = Date.now();
-  for (let d = 6; d >= 0; d--) {
-   for (let h = 0; h < 24; h++) {
-    grid[`${d}-${h}`] = 0;
-   }
+// Builds a 7×24 2D array from WS events; falls back to seeded dummy data
+// so the visualization works visually even without a time-series endpoint.
+const DAYS_LABELS = ['6d', '5d', '4d', '3d', '2d', '1d', 'now'];
+
+// Deterministic dummy data for visual fallback (not random per render).
+const DUMMY_HEATMAP = (() => {
+ const grid = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
+ let seed = 7;
+ const rng = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+ for (let d = 0; d < 7; d++) {
+  for (let h = 0; h < 24; h++) {
+   // More activity in working hours; taper toward older days.
+   const dayWeight = (d + 1) / 7;
+   const hourWeight = h >= 8 && h <= 22 ? 1 : 0.15;
+   grid[d][h] = Math.floor(rng() * 6 * dayWeight * hourWeight);
   }
+ }
+ return grid;
+})();
+
+const ActivityHeatmap = memo(function ActivityHeatmap({ events }) {
+ // Aggregate live WS events into a 7×24 day×hour grid.
+ const cells = useMemo(() => {
+  const grid = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
+  const now = Date.now();
   events.forEach(ev => {
-   const ago = (now - ev.ts) / 3600000;
-   const dayIdx = Math.floor(ago / 24);
+   if (!ev || !ev.ts) return;
+   const agoHours = (now - ev.ts) / 3600000;
+   if (agoHours < 0 || agoHours > 7 * 24) return;
+   const dayIdx = Math.min(6, Math.floor(agoHours / 24));
+   // row 0 = oldest (6d ago); row 6 = now — invert so latest sits at bottom.
+   const row = 6 - dayIdx;
    const hourIdx = new Date(ev.ts).getHours();
-   const key = `${dayIdx}-${hourIdx}`;
-   if (grid[key] !== undefined) grid[key]++;
+   if (row >= 0 && row < 7 && hourIdx >= 0 && hourIdx < 24) grid[row][hourIdx]++;
   });
   return grid;
  }, [events]);
- const days = ['6d', '5d', '4d', '3d', '2d', '1d', 'Now'];
+
+ // Use live data once we have real events; otherwise show dummy so the
+ // visualization is meaningful even before traffic arrives.
+ const hasReal = events.length > 0;
+ const values = hasReal ? cells : DUMMY_HEATMAP;
+
  return (
   <div className="neon-card rounded-none p-4 hud-brackets">
    <div className="flex items-center gap-2 mb-2">
     <BarChart3 size={14} style={{ color: NEON.green, filter: `drop-shadow(0 0 3px ${NEON.green})` }} />
     <span className="text-xs font-bold tracking-wider uppercase font-hud" style={{ color: '#aaa' }}>Activity Heatmap</span>
+    {!hasReal && (
+     <span className="text-[9px] px-1.5 py-0.5 font-code ml-auto"
+      style={{ background: `${NEON.cyan}08`, color: NEON.cyan, border: `1px solid ${NEON.cyan}25` }}>
+      sample data
+     </span>
+    )}
    </div>
-   <div className="flex gap-[3px] items-center">
-    <div className="flex flex-col gap-0 mr-1">
-     {Array.from({ length: 6 }, (_, h) => (
-      <span key={h} className="text-[8px] h-[10px] leading-[10px] text-right w-5 font-code" style={{ color: '#444' }}>
-       {h * 4}h
+   {/* Day labels (left) */}
+   <div className="flex gap-2">
+    <div className="flex flex-col justify-between" style={{ paddingTop: 2, paddingBottom: 14 }}>
+     {DAYS_LABELS.map(lbl => (
+      <span key={lbl} className="text-[8px] leading-none font-code" style={{ color: '#444', height: 14 }}>
+       {lbl}
       </span>
      ))}
     </div>
-    {days.map((label, d) => (
-     <div key={d} className="flex flex-col gap-[1px] items-center">
-      {Array.from({ length: 24 }, (_, h) => {
-       const count = cells[`${d}-${h}`] || 0;
-       const intensity = Math.min(count / 3, 1);
-       return (
-        <div
-         key={h}
-         title={`${count} events`}
-         className="w-2 h-[3px]"
-         style={{
-          background: count === 0
-           ? `${NEON.green}08`
-           : `rgba(0,255,136,${0.15 + intensity * 0.75})`,
-          boxShadow: intensity > 0.5 ? `0 0 4px rgba(0,255,136,${intensity * 0.4})` : 'none',
-          clipPath: 'polygon(1px 0, calc(100% - 1px) 0, 100% 1px, 100% calc(100% - 1px), calc(100% - 1px) 100%, 1px 100%, 0 calc(100% - 1px), 0 1px)',
-         }}
-        />
-       );
-      })}
-      <span className="text-[8px] mt-[2px] font-code" style={{ color: '#444' }}>{label}</span>
-     </div>
-    ))}
+    <div className="flex-1">
+     <Heatmap values={values} rows={7} cols={24} cell={12} gap={2} showAxisLabels />
+    </div>
    </div>
   </div>
  );
@@ -377,44 +486,39 @@ const TelemetryBar = memo(function TelemetryBar() {
 });
 
 // ─── Cost Tracking Bar ──────────────────────────────────────────
-const CostTracker = memo(function CostTracker({ summary }) {
+const CostTracker = memo(function CostTracker({ summary, spark }) {
  const [usage, setUsage] = useState(null);
  useEffect(() => {
   cachedFetch('/api/dashboard/usage', 30000).then(setUsage).catch(() => setUsage(null));
  }, []);
  if (!usage) return null;
+ const cards = [
+  { label: 'Est. Cost', value: `$${usage.totalCost?.toFixed(4) || '0.00'}`, color: NEON.magenta, icon: DollarSign, data: spark?.cost },
+  { label: 'Total Tokens', value: (usage.totalTokens || 0).toLocaleString(), color: NEON.cyan, icon: Hash, data: spark?.tokens },
+  { label: 'Prompt Tokens', value: (usage.promptTokens || 0).toLocaleString(), color: NEON.green, icon: Sparkles, data: spark?.tokens },
+  { label: 'Completion', value: (usage.completionTokens || 0).toLocaleString(), color: NEON.yellow, icon: TrendingUp, data: spark?.tokens },
+ ];
  return (
   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 neon-card p-4 hud-brackets">
-   <div className="flex items-center gap-2">
-    <DollarSign size={14} style={{ color: NEON.magenta, filter: `drop-shadow(0 0 3px ${NEON.magenta})` }} />
-    <div>
-     <div className="text-gray-600 text-[10px] tracking-wider uppercase font-hud">Est. Cost</div>
-     <div className="text-white text-sm font-bold font-code" style={{ textShadow: `0 0 8px ${NEON.magenta}44` }}>
-      ${usage.totalCost?.toFixed(4) || '0.00'}
+   {cards.map(c => {
+    const Icon = c.icon;
+    return (
+     <div key={c.label} className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+       <Icon size={14} style={{ color: c.color, filter: `drop-shadow(0 0 3px ${c.color})` }} />
+       <div>
+        <div className="text-gray-600 text-[10px] tracking-wider uppercase font-hud">{c.label}</div>
+        <div className="text-white text-sm font-bold font-code" style={{ textShadow: `0 0 8px ${c.color}44` }}>
+         {c.value}
+        </div>
+       </div>
+      </div>
+      <div className="opacity-80">
+       <Sparkline data={c.data} color={c.color} width={140} height={26} id={`cost-${c.label.replace(/\s/g,'')}`} />
+      </div>
      </div>
-    </div>
-   </div>
-   <div className="flex items-center gap-2">
-    <Hash size={14} style={{ color: NEON.cyan }} />
-    <div>
-     <div className="text-gray-600 text-[10px] tracking-wider uppercase font-hud">Total Tokens</div>
-     <div className="text-white text-sm font-bold font-code">{(usage.totalTokens || 0).toLocaleString()}</div>
-    </div>
-   </div>
-   <div className="flex items-center gap-2">
-    <Sparkles size={14} style={{ color: NEON.green }} />
-    <div>
-     <div className="text-gray-600 text-[10px] tracking-wider uppercase font-hud">Prompt Tokens</div>
-     <div className="text-white text-sm font-bold font-code">{(usage.promptTokens || 0).toLocaleString()}</div>
-    </div>
-   </div>
-   <div className="flex items-center gap-2">
-    <TrendingUp size={14} style={{ color: NEON.yellow }} />
-    <div>
-     <div className="text-gray-600 text-[10px] tracking-wider uppercase font-hud">Completion</div>
-     <div className="text-white text-sm font-bold font-code">{(usage.completionTokens || 0).toLocaleString()}</div>
-    </div>
-   </div>
+    );
+   })}
   </div>
  );
 });
@@ -486,8 +590,24 @@ export default function Dashboard() {
     agents: [...(prev.agents || []).slice(-29), s.activeAgents],
     tasks: [...(prev.tasks || []).slice(-29), s.totalTasks],
     running: [...(prev.running || []).slice(-29), s.runningTasks],
+    pending: [...(prev.pending || []).slice(-29), s.pendingTasks],
    }));
  }).catch(() => {}), 'dashboard:update', 15000);
+
+ // Cost + token trend — refreshed from the usage endpoint and appended to
+ // spark history each load. Updated on a slower cadence than stats.
+ useEffect(() => {
+  let mounted = true;
+  cachedFetch('/api/dashboard/usage', 30000).then(u => {
+   if (!mounted || !u) return;
+   setSparkHistory(prev => ({
+    ...prev,
+    cost: [...(prev.cost || []).slice(-29), u.totalCost || 0],
+    tokens: [...(prev.tokens || []).slice(-29), u.totalTokens || 0],
+   }));
+  }).catch(() => {});
+  return () => { mounted = false; };
+ }, []);
 
  useEffect(() => {
   if (!lastMsg || lastMsg.type === 'task:log') return;
@@ -518,7 +638,7 @@ export default function Dashboard() {
   { label: 'Active Agents', value: summary.activeAgents, icon: Bot, color: NEON.blue, sub: summary.activeAgents > 0 ? `${summary.activeAgents} online` : 'No agents', spark: sparkHistory.agents },
   { label: 'Total Tasks', value: summary.totalTasks, icon: ListTodo, color: NEON.green, sub: `${summary.runningTasks} running`, spark: sparkHistory.tasks },
   { label: 'Running', value: summary.runningTasks, icon: Activity, color: NEON.yellow, sub: `${summary.pendingTasks} pending`, spark: sparkHistory.running },
-  { label: 'Pending', value: summary.pendingTasks, icon: Clock, color: '#888', sub: 'Queued' },
+  { label: 'Pending', value: summary.pendingTasks, icon: Clock, color: '#888', sub: 'Queued', spark: sparkHistory.pending },
   { label: 'DAGs', value: summary.totalDags, icon: GitBranch, color: NEON.purple, sub: 'Workflows' },
   { label: 'Users', value: summary.totalUsers, icon: Users, color: NEON.pink, sub: 'Registered' },
   { label: 'LLM Providers', value: summary.totalProviders || 0, icon: Plug, color: NEON.orange, sub: `${summary.totalModels || 0} models` },
@@ -583,7 +703,7 @@ export default function Dashboard() {
    {summary && <ProviderStatusBar summary={summary} />}
 
    {/* ── Cost Tracking ───────────────────────────────────────── */}
-   {summary && <CostTracker summary={summary} />}
+   {summary && <CostTracker summary={summary} spark={sparkHistory} />}
 
    {/* ── Sentinel Alerts ─────────────────────────────────────── */}
    <SentinelAlertBar />

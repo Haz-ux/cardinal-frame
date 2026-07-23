@@ -8,7 +8,7 @@ let _loadPromise = null;
 let _lastUsed = null;
 let _modelSize = null;
 
-const MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
+const MODEL_ID = process.env.CF_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2';
 const IDLE_UNLOAD_MS = 5 * 60 * 1000; // auto-unload after 5 min idle
 
 /**

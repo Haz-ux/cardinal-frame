@@ -2267,12 +2267,14 @@ async function executeSkill(skill, input = {}) {
       const code = handlerStr.slice('hybrid:'.length).trim();
       const llmCall = (messages, model) => callAgentLLM(messages, model || skill.model || undefined);
       const secrets = collectSkillSecrets(skill);
-      const { result: sandboxResult } = await runSandboxedHybrid({ code, input, llmCall, secrets });
+      const sandboxTimeoutMs = parseInt(getDevSetting('sandboxTimeout', '30'), 10) * 1000;
+      const { result: sandboxResult } = await runSandboxedHybrid({ code, input, llmCall, secrets, timeoutMs: sandboxTimeoutMs });
       result = { ok: true, type: 'hybrid', output: sandboxResult, duration_ms: Date.now() - startTime };
     } else {
       // Script skill — pure JS function (sandboxed via vm.runInNewContext)
       const secrets = collectSkillSecrets(skill);
-      const { result: sandboxResult } = await runSandboxed({ code: handlerStr, input, secrets });
+      const sandboxTimeoutMs = parseInt(getDevSetting('sandboxTimeout', '30'), 10) * 1000;
+      const { result: sandboxResult } = await runSandboxed({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
       result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime };
     }
   } catch (err) {
@@ -2969,8 +2971,8 @@ app.post('/api/heartbeat/rules', authMiddleware, requireRole('admin'), (req, res
   if (!name || !condition || !action_type || !action_target)
     return res.status(400).json({ error: 'name, condition, action_type, action_target required' });
 
-  // Validate action_type — webhook is not implemented yet
-  const validActions = ['chain', 'skill', 'alert'];
+  // Validate action_type — webhook, chain, skill, alert
+  const validActions = ['chain', 'skill', 'alert', 'webhook'];
   if (!validActions.includes(action_type))
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
 
@@ -4092,18 +4094,92 @@ app.post('/api/tools/file-write', authMiddleware, requireRole('admin'), apiLimit
   }
 });
 
-app.post('/api/tools/pdf-parse', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+app.post('/api/tools/pdf-parse', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const { path: filePath } = req.body;
   if (!filePath) return res.status(400).json({ error: 'path required' });
-  // Stub implementation — will be replaced with real PDF parser
-  res.json({ error: 'PDF not found', pages: 0 });
+
+  // Resolve relative to data dir or absolute
+  const { existsSync, readFileSync } = await import('fs');
+  const resolved = filePath.startsWith('/') ? filePath : path.join(DATA_DIR, filePath);
+  if (!existsSync(resolved)) return res.status(404).json({ error: 'PDF not found', path: resolved });
+
+  try {
+    const pdfParse = (await import('pdf-parse')).default;
+    const buffer = readFileSync(resolved);
+    const data = await pdfParse(buffer);
+    // Split text into pages (pdf-parse gives all text; split on form feed \f)
+    const pages = data.text.split('\f').map(p => p.trim()).filter(Boolean);
+    res.json({
+      pages: pages.length || data.numpages || 1,
+      text: data.text,
+      pages_array: pages.length ? pages : [data.text],
+      info: data.info || {},
+    });
+  } catch (err) {
+    logger.error(`pdf-parse: ${err.message}`);
+    res.status(500).json({ error: 'PDF parse failed', detail: err.message });
+  }
 });
 
-app.post('/api/tools/web-search', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
-  const { query } = req.body;
+app.post('/api/tools/web-search', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  const { query, max_results, search_depth } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
-  // Stub implementation — will be replaced with real search integration
-  res.json({ results: [] });
+
+  const tavilyKey = process.env.TAVILY_API_KEY;
+  if (!tavilyKey) {
+    return res.status(400).json({
+      error: 'TAVILY_API_KEY is not configured. Set it under Settings → Environment Variables (key: TAVILY_API_KEY) and retry.',
+    });
+  }
+
+  // Coerce + bound optional params. max_results default 5, search_depth default 'basic'.
+  const maxResults = (() => {
+    const n = Number(max_results);
+    if (!Number.isFinite(n)) return 5;
+    return Math.max(1, Math.min(10, Math.trunc(n)));
+  })();
+  const validDepths = new Set(['basic', 'advanced']);
+  const depth = validDepths.has(search_depth) ? search_depth : 'basic';
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    let resp;
+    try {
+      resp = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: tavilyKey, query, max_results: maxResults, search_depth: depth }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!resp.ok) {
+      let detail;
+      try { detail = (await resp.json()).detail; } catch { /* non-JSON error body */ }
+      const message = detail || `Tavily API error (HTTP ${resp.status})`;
+      logger.warn(`web-search: Tavily upstream error ${resp.status} for query "${query.slice(0, 80)}"`);
+      return res.status(502).json({ error: 'Tavily search failed', detail: message });
+    }
+
+    const data = await resp.json();
+    const results = (data.results || []).map(r => ({
+      title: r.title,
+      url: r.url,
+      content: r.content,
+      score: r.score,
+    }));
+    res.json({ results, answer: data.answer || null });
+  } catch (err) {
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+      logger.warn(`web-search: Tavily request timed out for query "${query.slice(0, 80)}"`);
+      return res.status(504).json({ error: 'Tavily search timed out', detail: 'Request exceeded 15s limit' });
+    }
+    logger.error(`web-search: ${err.message}`);
+    return res.status(502).json({ error: 'Tavily search failed', detail: err.message });
+  }
 });
 
 app.post('/api/tools/code-exec', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
@@ -4904,10 +4980,53 @@ app.put('/api/settings/dev', authMiddleware, requireRole('admin'), apiLimiter, (
       process.env.LOG_LEVEL = updates.debugMode === 'true' ? 'debug' : (updates.logLevel || process.env.LOG_LEVEL || 'info');
     }
     if (updates.logLevel) process.env.LOG_LEVEL = updates.logLevel;
+    if (updates.embeddingModel) process.env.CF_EMBEDDING_MODEL = updates.embeddingModel;
 
     res.json({ success: true, updated, note: updates.port ? 'Restart server to apply new port' : undefined });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// POST /api/settings/dev/restart — graceful restart (applies new port + settings)
+app.post('/api/settings/dev/restart', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  res.json({ success: true, message: 'Server restarting...' });
+  // Flush logs, close WS, then exit — Docker/process manager will respawn
+  setTimeout(() => {
+    logger.info('Restart requested via dev settings — initiating graceful shutdown...');
+    fireHook('onServerStop', { signal: 'restart', port: PORT });
+    wss.clients.forEach(c => c.close(1001, 'Server restarting'));
+    server.close(() => {
+      try { db.close(); } catch {}
+      process.exit(0);
+    });
+    // Force exit after 3s
+    setTimeout(() => process.exit(0), 3000);
+  }, 500);
+});
+
+// ─── Dev Settings Helper (read saved settings from DB) ─────────────
+function getDevSetting(key, fallback) {
+  try {
+    const row = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get(key);
+    return row ? row.value : fallback;
+  } catch { return fallback; }
+}
+
+function getDevSettings() {
+  const defaults = {
+    port: String(process.env.PORT || '8080'),
+    logLevel: process.env.LOG_LEVEL || 'info',
+    debugMode: 'false',
+    sandboxTimeout: '30',
+    maxConcurrentAgents: '5',
+    wsHeartbeatMs: '30000',
+    embeddingModel: 'Xenova/all-MiniLM-L6-v2',
+  };
+  try {
+    const rows = db.prepare('SELECT key, value FROM dev_settings').all();
+    for (const r of rows) defaults[r.key] = r.value;
+  } catch {}
+  return defaults;
+}
 
 // Load stored env vars into process.env on startup
 try {
@@ -4916,6 +5035,12 @@ try {
     process.env[row.key] = row.encrypted ? xorDecipher(row.value) : row.value;
   }
   if (stored.length) logger.info(`Loaded ${stored.length} env vars into process.env`);
+} catch {}
+
+// Load embedding model from dev_settings into env for embeddings.mjs
+try {
+  const savedModel = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get('embeddingModel');
+  if (savedModel) process.env.CF_EMBEDDING_MODEL = savedModel.value;
 } catch {}
 
 // ─── Aimi Coding Agent (VS Code Copilot-style) ────────────────────

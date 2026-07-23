@@ -32,219 +32,147 @@ function table(items, fields) {
 
 function truncate(s, len = 40) { return s && s.length > len ? s.slice(0, len) + '…' : s; }
 
-const commands = {
- // ─── Auth ──────────────────────────────────────────────────
- async login(args) {
-  const [username, password] = args;
-  if (!username || !password) { console.error('Usage: cardinal login <username> <password>'); process.exit(1); }
-  const data = await req('POST', '/auth/login', { username, password });
-  console.log(`Token: ${data.token}`);
-  console.log('Set CF_TOKEN=<token> to authenticate future commands.');
- },
+// ─── Command handlers ───────────────────────────────────────
+// Each handler receives the remaining argv slice (subcommand/arg already consumed).
+// Dispatch: command = process.argv[2], subcommand or primary arg = process.argv[3].
 
- // ─── Health ────────────────────────────────────────────────
- async health() {
+// `cardinal status` — GET /api/health
+async function status() {
   const data = await req('GET', '/health');
-  pretty(data);
- },
+  console.log(`Status: ${data.status || 'unknown'}`);
+  console.log(`Mode:   ${data.mode || '-'}`);
+  console.log(`Uptime: ${data.uptime ?? '-'}s`);
+  console.log(`WS clients: ${data.ws?.connected_clients ?? '-'}`);
+}
 
- // ─── Tasks ─────────────────────────────────────────────────
- async tasks() {
-  const data = await req('GET', '/tasks');
-  table(data, ['id', 'name', 'status', 'assigned_agent_id']);
- },
-
- async task(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal task <id>'); process.exit(1); }
-  const data = await req('GET', `/tasks/${id}`);
-  pretty(data);
- },
-
- async 'tasks:create'(args) {
-  const [name, command] = args;
-  if (!name || !command) { console.error('Usage: cardinal tasks:create <name> <command>'); process.exit(1); }
-  const data = await req('POST', '/tasks', { name, command });
-  console.log(`Task created: ${data.id}`);
-  pretty(data);
- },
-
- async 'tasks:run'(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal tasks:run <task_id>'); process.exit(1); }
-  const data = await req('POST', `/tasks/${id}/run`);
-  console.log(`Task started: ${id}`);
- },
-
- async 'tasks:cancel'(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal tasks:cancel <task_id>'); process.exit(1); }
-  const data = await req('POST', `/tasks/${id}/cancel`);
-  console.log(`Task cancelled: ${id}`);
- },
-
- // ─── Agents ────────────────────────────────────────────────
- async agents() {
+// `cardinal agents` — GET /api/agents
+async function agents() {
   const data = await req('GET', '/agents');
-  table(data, ['id', 'name', 'status', 'capabilities']);
- },
+  table(data, ['id', 'name', 'status', 'model']);
+}
 
- async 'agents:register'(args) {
-  const [name, capabilities] = args;
-  if (!name) { console.error('Usage: cardinal agents:register <name> [capabilities]'); process.exit(1); }
-  const data = await req('POST', '/agents/register', { name, capabilities: capabilities || 'general' });
-  console.log(`Agent registered: ${data.id}`);
+// `cardinal agents:create <name>` — POST /api/agents
+async function agentsCreate([name]) {
+  if (!name) { console.error('Usage: cardinal agents:create <name>'); process.exit(1); }
+  const data = await req('POST', '/agents', { name, system_prompt: '', model: 'auto' });
+  console.log(`Agent created: ${data.id || name}`);
   pretty(data);
- },
+}
 
- async 'agents:heartbeat'(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal agents:heartbeat <agent_id>'); process.exit(1); }
-  const data = await req('POST', `/agents/${id}/heartbeat`);
-  console.log(`Heartbeat sent for ${id}`);
- },
+// `cardinal tasks` — GET /api/tasks
+async function tasks() {
+  const data = await req('GET', '/tasks');
+  table(data, ['id', 'title', 'status', 'agent_id']);
+}
 
- async 'agents:health'() {
-  const data = await req('GET', '/agents/health');
+// `cardinal tasks:create <title> [agentId]` — POST /api/tasks
+async function tasksCreate(args) {
+  const [title, agentId] = args;
+  if (!title) { console.error('Usage: cardinal tasks:create <title> [agentId]'); process.exit(1); }
+  const body = { title, agent_id: agentId || null };
+  const data = await req('POST', '/tasks', body);
+  console.log(`Task created: ${data.id || title}`);
   pretty(data);
- },
+}
 
- // ─── Groups ────────────────────────────────────────────────
- async groups() {
-  const data = await req('GET', '/groups');
-  table(data, ['id', 'name', 'memberCount']);
- },
+// `cardinal token` — POST /api/auth/login (admin/admin123), print JWT
+async function token() {
+  const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+  if (data.token) {
+    console.log(data.token);
+  } else {
+    console.error('No token in response:');
+    pretty(data);
+  }
+}
 
- async 'groups:create'(args) {
-  const [name, description] = args;
-  if (!name) { console.error('Usage: cardinal groups:create <name> [description]'); process.exit(1); }
-  const data = await req('POST', '/groups', { name, description: description || '' });
-  console.log(`Group created: ${data.id}`);
- },
+// `cardinal port` — GET /api/settings/dev, print current port
+async function port() {
+  const data = await req('GET', '/settings/dev');
+  console.log(`Current port: ${data.port}`);
+}
 
- async 'groups:add-agent'(args) {
-  const [groupId, agentId] = args;
-  if (!groupId || !agentId) { console.error('Usage: cardinal groups:add-agent <group_id> <agent_id>'); process.exit(1); }
-  await req('POST', `/groups/${groupId}/members`, { agentId });
-  console.log(`Agent ${agentId} added to group ${groupId}`);
- },
+// `cardinal port:set <port>` — PUT /api/settings/dev with {port}
+async function portSet([portValue]) {
+  if (!portValue) { console.error('Usage: cardinal port:set <port>'); process.exit(1); }
+  const data = await req('PUT', '/settings/dev', { port: portValue });
+  console.log(`Port set to: ${data.port ?? portValue}`);
+}
 
- // ─── DAGs ──────────────────────────────────────────────────
- async dags() {
-  const data = await req('GET', '/dags');
-  table(data, ['id', 'name', 'status', 'created_at']);
- },
-
- async 'dags:create'(args) {
-  const [name] = args;
-  if (!name) { console.error('Usage: cardinal dags:create <name>'); process.exit(1); }
-  const data = await req('POST', '/dags', { name });
-  console.log(`DAG created: ${data.id}`);
- },
-
- // ─── Schedules ─────────────────────────────────────────────
- async schedules() {
-  const data = await req('GET', '/schedules');
-  table(data, ['id', 'name', 'cron_expr', 'enabled']);
- },
-
- async 'schedules:create'(args) {
-  const [name, cronExpr, command] = args;
-  if (!name || !cronExpr || !command) { console.error('Usage: cardinal schedules:create <name> <cron_expr> <command>'); process.exit(1); }
-  const data = await req('POST', '/schedules', { name, cron_expr: cronExpr, command });
-  console.log(`Schedule created: ${data.id}`);
- },
-
- async 'schedules:toggle'(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal schedules:toggle <schedule_id>'); process.exit(1); }
-  const data = await req('PATCH', `/schedules/${id}/toggle`);
-  console.log(`Schedule ${id} ${data.enabled ? 'enabled' : 'disabled'}`);
- },
-
- // ─── MCP ───────────────────────────────────────────────────
- async 'mcp:servers'() {
-  const data = await req('GET', '/mcp/servers');
-  table(data, ['id', 'name', 'command', 'status']);
- },
-
- async 'mcp:register'(args) {
-  const [name, command] = args;
-  if (!name || !command) { console.error('Usage: cardinal mcp:register <name> <command>'); process.exit(1); }
-  const data = await req('POST', '/mcp/servers', { name, command, args: [] });
-  console.log(`MCP server registered: ${data.id}`);
- },
-
- // ─── Plugins ───────────────────────────────────────────────
- async plugins() {
-  const data = await req('GET', '/plugins');
-  table(data, ['id', 'name', 'version', 'enabled', 'loaded']);
- },
-
- async 'plugins:toggle'(args) {
-  const [id] = args;
-  if (!id) { console.error('Usage: cardinal plugins:toggle <plugin_id>'); process.exit(1); }
-  const data = await req('PATCH', `/plugins/${id}/toggle`);
-  console.log(`Plugin ${id} ${data.enabled ? 'enabled' : 'disabled'}`);
- },
-
- // ─── Files ─────────────────────────────────────────────────
- async files() {
-  const data = await req('GET', '/files');
-  table(data, ['id', 'original_name', 'size', 'mime_type']);
- },
-};
+// `cardinal chat <message>` — POST /api/chat
+async function chat(args) {
+  const message = args.join(' ');
+  if (!message) { console.error('Usage: cardinal chat <message>'); process.exit(1); }
+  const data = await req('POST', '/chat', { messages: [{ role: 'user', content: message }] });
+  if (data && typeof data === 'object' && typeof data.response === 'string') {
+    console.log(data.response);
+  } else {
+    pretty(data);
+  }
+}
 
 // ─── Main ────────────────────────────────────────────────────
-const [,, cmd, ...args] = process.argv;
+const cmd = process.argv[2];
+const sub = process.argv[3]; // subcommand or primary arg
+const rest = process.argv.slice(4); // remaining args
 
-if (!cmd) {
- console.log(`Cardinal Frame CLI
+const HELP = `Cardinal Frame CLI
 
-Usage: cardinal <command> [args...]
+Usage: cardinal <command> [subcommand|arg] [args...]
 
 Commands:
-  login <user> <pass>          Login and get token
-  health                       Check server health
-
-  tasks                        List tasks
-  task <id>                    Get task details
-  tasks:create <name> <cmd>   Create a task
-  tasks:run <id>               Execute a task
-  tasks:cancel <id>            Cancel a task
-
-  agents                       List agents
-  agents:register <name> [cap] Register an agent
-  agents:heartbeat <id>        Send heartbeat
-  agents:health                Agent health summary
-
-  groups                       List agent groups
-  groups:create <name> [desc]  Create a group
-  groups:add-agent <gid> <aid> Add agent to group
-
-  dags                         List DAGs
-  dags:create <name>           Create a DAG
-
-  schedules                    List schedules
-  schedules:create <n> <c> <cmd> Create a schedule
-  schedules:toggle <id>        Toggle schedule on/off
-
-  mcp:servers                  List MCP servers
-  mcp:register <name> <cmd>    Register MCP server
-
-  plugins                      List plugins
-  plugins:toggle <id>          Toggle plugin on/off
-
-  files                        List uploaded files
+  status                       Check server health (GET /api/health)
+  agents                       List agents (GET /api/agents)
+  agents:create <name>         Create an agent (POST /api/agents)
+  tasks                        List tasks (GET /api/tasks)
+  tasks:create <title> [aid]   Create a task (POST /api/tasks)
+  token                        Login as admin, print JWT (POST /api/auth/login)
+  port                         Show current dev port (GET /api/settings/dev)
+  port:set <port>              Set the dev port (PUT /api/settings/dev)
+  chat <message>               Send a chat message (POST /api/chat)
 
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
-`);
- process.exit(0);
+
+Run 'cardinal' (no args) or 'cardinal help' for this message.
+`;
+
+if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+  console.log(HELP);
+  process.exit(0);
 }
 
-const fn = commands[cmd];
-if (!fn) { console.error(`Unknown command: ${cmd}\nRun 'cardinal' with no args for help.`); process.exit(1); }
-
-fn(args).catch(err => { console.error('Fatal:', err.message); process.exit(1); });
+(async () => {
+  try {
+    switch (cmd) {
+      case 'status':
+        await status();
+        break;
+      case 'agents':
+        if (sub === 'create') await agentsCreate(rest);
+        else await agents();
+        break;
+      case 'tasks':
+        if (sub === 'create') await tasksCreate(rest);
+        else await tasks();
+        break;
+      case 'token':
+        await token();
+        break;
+      case 'port':
+        if (sub === 'set') await portSet(rest);
+        else await port();
+        break;
+      case 'chat':
+        await chat(sub !== undefined ? process.argv.slice(3) : []);
+        break;
+      default:
+        console.error(`Unknown command: ${cmd}\nRun 'cardinal help' for usage.`);
+        process.exit(1);
+    }
+  } catch (err) {
+    console.error('Fatal:', err.message);
+    process.exit(1);
+  }
+})();

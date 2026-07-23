@@ -252,6 +252,30 @@ export class HeartbeatDaemon {
           }
         } else if (rule.action_type === 'alert') {
           this.broadcast('heartbeat:alert', { rule: rule.name, message: rule.description, state });
+        } else if (rule.action_type === 'webhook') {
+          // POST alert data to an external URL
+          try {
+            const payload = {
+              rule: rule.name,
+              description: rule.description || '',
+              condition: rule.condition || '',
+              state,
+              timestamp: new Date().toISOString(),
+              input: inputData,
+            };
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 10000);
+            const resp = await fetch(rule.action_target, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            });
+            clearTimeout(timeout);
+            this.logger.info(`[heartbeat] Webhook "${rule.action_target}" triggered by rule "${rule.name}" — ${resp.status}`);
+          } catch (e) {
+            this.logger.error(`[heartbeat] Webhook action error for rule "${rule.name}":`, e.message);
+          }
         }
       } catch (e) {
         this.logger.error(`[heartbeat] Rule "${rule.name}" error:`, e.message);

@@ -387,6 +387,59 @@ const DevSettings = memo(function DevSettings({ showToast }) {
           )}
         </div>
       </div>
+
+      {/* Rate Limit Tiers */}
+      <div className="rounded-xl p-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.magenta}15` }}>
+        <div className="flex items-center gap-4 mb-3">
+          <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.magenta}10`, border: `1px solid ${NEON.magenta}20` }}>
+            <Shield size={16} style={{ color: NEON.magenta }} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-white">Rate Limit Tiers</div>
+            <div className="text-xs text-gray-500 mt-0.5">Requests per minute, per tier</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-4 gap-2">
+          {[
+            { label: 'Auth', value: '20/min', color: NEON.cyan },
+            { label: 'Writes', value: '50/min', color: NEON.blue },
+            { label: 'Reads', value: '200/min', color: NEON.green },
+            { label: 'Sandbox', value: '10/min', color: NEON.orange },
+          ].map(t => (
+            <div key={t.label} className="text-center px-2 py-1.5 rounded-lg" style={{ background: `${t.color}08`, border: `1px solid ${t.color}15` }}>
+              <div className="text-[10px] uppercase tracking-wider text-gray-500">{t.label}</div>
+              <div className="text-sm font-mono font-bold" style={{ color: t.color }}>{t.value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Restart Server Button */}
+      {settings.port && (
+        <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.red}15` }}>
+          <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.red}10`, border: `1px solid ${NEON.red}20` }}>
+            <RefreshCw size={16} style={{ color: NEON.red }} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-white">Restart Server</div>
+            <div className="text-xs text-gray-500 mt-0.5">Apply port change and reload all settings</div>
+          </div>
+          <button
+            onClick={async () => {
+              if (!confirm('Restart the server? This will briefly disconnect all clients.')) return;
+              showToast('Restarting server...', 'info');
+              try {
+                await api('/api/settings/dev/restart', { method: 'POST' });
+                showToast('Server restarting — reconnect in a few seconds', 'success');
+              } catch (e) { showToast(e.message || 'Restart failed (server may already be restarting)', 'error'); }
+            }}
+            className="px-4 py-2 rounded-lg text-xs font-semibold transition-all"
+            style={{ background: `${NEON.red}15`, border: `1px solid ${NEON.red}40`, color: NEON.red }}
+          >
+            <RefreshCw size={12} className="inline mr-1" />Restart
+          </button>
+        </div>
+      )}
     </div>
   );
 });
