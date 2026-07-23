@@ -31,6 +31,10 @@ import graphRoutes from './routes/graph.mjs';
 import taskRoutes from './routes/tasks.mjs';
 import metaRoutes from './routes/meta.mjs';
 import { runSandboxed, runSandboxedHybrid } from './routes/sandbox.mjs';
+import { PluginLoader } from './plugins.mjs';
+import { executeSkillChain, executeToolChain, resolveStepInput, buildChainIntentPrompt } from './chains.mjs';
+import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from './evolution.mjs';
+import { HeartbeatDaemon } from './heartbeat.mjs';
 
 dotenv.config();
 
@@ -55,8 +59,8 @@ app.use(morgan('tiny', { skip: (req) => process.env.NODE_ENV === 'production' ||
 
 // ─── CORS Whitelist ────────────────────────────────────────────────
 const corsOrigins = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : []),
@@ -70,6 +74,15 @@ app.use(cors({
 }));
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
+
+// ─── Security headers ──────────────────────────────────────────
+app.disable('x-powered-by'); // Don't leak Express
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
 
 // ─── Process-level error handlers (prevent crashes) ──────────────
 process.on('unhandledRejection', (reason) => {
@@ -455,7 +468,7 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS comms_messages (
-    id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY,
     channel_id TEXT NOT NULL,
     platform TEXT NOT NULL,
     direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
@@ -467,6 +480,91 @@ db.exec(`
     status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS skill_chains (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    steps TEXT NOT NULL DEFAULT '[]',
+    status TEXT DEFAULT 'draft',
+    last_run_result TEXT,
+    last_run_at TEXT,
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS tool_chains (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    steps TEXT NOT NULL DEFAULT '[]',
+    status TEXT DEFAULT 'draft',
+    last_run_result TEXT,
+    last_run_at TEXT,
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS skill_evolution (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    chain_id TEXT,
+    generation INTEGER DEFAULT 1,
+    evolution_type TEXT DEFAULT 'manual' CHECK(evolution_type IN ('manual','auto-distill','chain-promotion','bundle-merge','skill-hub')),
+    parent_skill_id TEXT,
+    trigger TEXT DEFAULT '',
+    success_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    optimal INTEGER DEFAULT 0,
+    notes TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (skill_id) REFERENCES skills(id),
+    FOREIGN KEY (chain_id) REFERENCES skill_chains(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS skill_hub_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    type TEXT DEFAULT 'git' CHECK(type IN ('git','tarball','http')),
+    verified INTEGER DEFAULT 0,
+    trust_score REAL DEFAULT 0,
+    scan_status TEXT DEFAULT 'pending' CHECK(scan_status IN ('pending','scanning','passed','blocked','failed')),
+    scan_result TEXT,
+    installed_skills TEXT DEFAULT '[]',
+    last_scanned_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS heartbeat_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    condition TEXT NOT NULL,
+    action_type TEXT NOT NULL CHECK(action_type IN ('chain','skill','alert','webhook')),
+    action_target TEXT NOT NULL,
+    action_input TEXT DEFAULT '{}',
+    cooldown_seconds INTEGER DEFAULT 300,
+    last_fired_at TEXT,
+    enabled INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS chain_executions (
+    id TEXT PRIMARY KEY,
+    chain_id TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    duration_ms INTEGER DEFAULT 0,
+    input TEXT,
+    output TEXT,
+    step_count INTEGER DEFAULT 0,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (chain_id) REFERENCES skill_chains(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_chain_exec_chain_id ON chain_executions(chain_id);
 
   INSERT OR IGNORE INTO users (id, username, password_hash, role)
   VALUES ('admin-000', 'admin', '${adminHash}', 'admin');
@@ -488,6 +586,14 @@ db.exec(`
   if (!skillCols.includes('auto_proposed')) db.exec('ALTER TABLE skills ADD COLUMN auto_proposed INTEGER DEFAULT 0');
   if (!skillCols.includes('success_count')) db.exec('ALTER TABLE skills ADD COLUMN success_count INTEGER DEFAULT 0');
   if (!skillCols.includes('failure_count')) db.exec('ALTER TABLE skills ADD COLUMN failure_count INTEGER DEFAULT 0');
+  if (!skillCols.includes('evolved_from')) db.exec("ALTER TABLE skills ADD COLUMN evolved_from TEXT");
+  if (!skillCols.includes('generation')) db.exec("ALTER TABLE skills ADD COLUMN generation INTEGER DEFAULT 1");
+  if (!skillCols.includes('bundle_id')) db.exec("ALTER TABLE skills ADD COLUMN bundle_id TEXT DEFAULT ''");
+  // Chain run count migration
+  const skillChainCols = db.prepare("PRAGMA table_info(skill_chains)").all().map(c => c.name);
+  if (!skillChainCols.includes('run_count')) db.exec("ALTER TABLE skill_chains ADD COLUMN run_count INTEGER DEFAULT 0");
+  if (!skillChainCols.includes('success_count')) db.exec("ALTER TABLE skill_chains ADD COLUMN success_count INTEGER DEFAULT 0");
+  if (!skillChainCols.includes('evolved_to_skill')) db.exec("ALTER TABLE skill_chains ADD COLUMN evolved_to_skill TEXT");
 
   // ─── Agent sessions: update status CHECK constraint (rebuild table) ──
   try {
@@ -826,6 +932,58 @@ const stmts = {
         convMsgCount: db.prepare('SELECT COUNT(*) as c FROM chat_messages WHERE conversation_id = ?'),
         dbFiles: db.prepare('SELECT id, original_name, mime_type, uploaded_by FROM files'),
       },
+      // ─── Chain Tables ───────────────────────────────────────────
+      skillChains: {
+        insert: db.prepare('INSERT INTO skill_chains (id, name, description, steps, status, created_by) VALUES (?, ?, ?, ?, ?, ?)'),
+        getAll: db.prepare('SELECT id, name, description, status, created_at, updated_at, last_run_at FROM skill_chains ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM skill_chains WHERE id = ?'),
+        getByName: db.prepare('SELECT * FROM skill_chains WHERE name = ?'),
+        update: db.prepare("UPDATE skill_chains SET name = ?, description = ?, steps = ?, status = ?, updated_at = datetime('now') WHERE id = ?"),
+        updateRunResult: db.prepare("UPDATE skill_chains SET last_run_result = ?, last_run_at = datetime('now'), status = ? WHERE id = ?"),
+        delete: db.prepare('DELETE FROM skill_chains WHERE id = ?'),
+      },
+      toolChains: {
+        insert: db.prepare('INSERT INTO tool_chains (id, name, description, steps, status, created_by) VALUES (?, ?, ?, ?, ?, ?)'),
+        getAll: db.prepare('SELECT id, name, description, status, created_at, updated_at, last_run_at FROM tool_chains ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM tool_chains WHERE id = ?'),
+        getByName: db.prepare('SELECT * FROM tool_chains WHERE name = ?'),
+        update: db.prepare("UPDATE tool_chains SET name = ?, description = ?, steps = ?, status = ?, updated_at = datetime('now') WHERE id = ?"),
+        updateRunResult: db.prepare("UPDATE tool_chains SET last_run_result = ?, last_run_at = datetime('now'), status = ? WHERE id = ?"),
+        delete: db.prepare('DELETE FROM tool_chains WHERE id = ?'),
+      },
+      // ─── Evolution & Hub Tables ────────────────────────────────
+      evolution: {
+        insert: db.prepare('INSERT INTO skill_evolution (id, skill_id, chain_id, generation, evolution_type, parent_skill_id, trigger, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+        getBySkill: db.prepare('SELECT * FROM skill_evolution WHERE skill_id = ? ORDER BY generation DESC'),
+        getByChain: db.prepare('SELECT * FROM skill_evolution WHERE chain_id = ? ORDER BY created_at DESC'),
+        getAll: db.prepare('SELECT e.*, s.name as skill_name FROM skill_evolution e LEFT JOIN skills s ON e.skill_id = s.id ORDER BY e.created_at DESC'),
+        getOptimal: db.prepare("SELECT * FROM skill_evolution WHERE optimal = 1"),
+        markOptimal: db.prepare('UPDATE skill_evolution SET optimal = 1 WHERE id = ?'),
+        updateStats: db.prepare('UPDATE skill_evolution SET success_count = ?, failure_count = ? WHERE id = ?'),
+        delete: db.prepare('DELETE FROM skill_evolution WHERE id = ?'),
+      },
+      skillHub: {
+        insert: db.prepare('INSERT INTO skill_hub_sources (id, name, url, type, verified, trust_score, scan_status) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getAll: db.prepare('SELECT * FROM skill_hub_sources ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM skill_hub_sources WHERE id = ?'),
+        updateScan: db.prepare("UPDATE skill_hub_sources SET scan_status = ?, scan_result = ?, last_scanned_at = datetime('now'), trust_score = ? WHERE id = ?"),
+        updateInstalled: db.prepare("UPDATE skill_hub_sources SET installed_skills = ? WHERE id = ?"),
+        delete: db.prepare('DELETE FROM skill_hub_sources WHERE id = ?'),
+      },
+      heartbeat: {
+        insert: db.prepare('INSERT INTO heartbeat_rules (id, name, description, condition, action_type, action_target, action_input, cooldown_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)'),
+        getAll: db.prepare('SELECT * FROM heartbeat_rules ORDER BY created_at DESC'),
+        getEnabled: db.prepare('SELECT * FROM heartbeat_rules WHERE enabled = 1'),
+        getById: db.prepare('SELECT * FROM heartbeat_rules WHERE id = ?'),
+        updateLastFired: db.prepare("UPDATE heartbeat_rules SET last_fired_at = datetime('now') WHERE id = ?"),
+        updateEnabled: db.prepare('UPDATE heartbeat_rules SET enabled = ? WHERE id = ?'),
+        delete: db.prepare('DELETE FROM heartbeat_rules WHERE id = ?'),
+      },
+      chainExecutions: {
+        insert: db.prepare('INSERT INTO chain_executions (id, chain_id, success, duration_ms, input, output, step_count, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+        getByChain: db.prepare('SELECT id, success, duration_ms, step_count, error, created_at FROM chain_executions WHERE chain_id = ? ORDER BY created_at DESC LIMIT ?'),
+        getRecentByChain: db.prepare('SELECT id, success, duration_ms, step_count, error, created_at FROM chain_executions WHERE chain_id = ? ORDER BY created_at DESC LIMIT 10'),
+      },
       };
 
 // ─── Database Indexes ──────────────────────────────────────────────
@@ -1024,7 +1182,14 @@ function executeTask(taskId, command) {
   });
 }
 
-// ─── Shared Context Object ──────────────────────────────────────
+// ─── Plugin Loader ───────────────────────────────────────────────────
+const pluginLoader = new PluginLoader({ db, stmts, logger, broadcast });
+// fireHook is an async alias that plugin hooks call
+async function fireHook(hookName, data) {
+  await pluginLoader.fireHook(hookName, data);
+}
+
+// ─── Shared Context Object ──────────────────────────────────────────────
 const ctx = {
   app, db, stmts, wss, logger,
   JWT_SECRET, JWT_EXPIRES,
@@ -1032,6 +1197,7 @@ const ctx = {
   audit, broadcast, broadcastLog,
   randomUUID,
   mcp, embeddings,
+  pluginLoader, fireHook,
   // These are populated later (declared with const/let below)
   get collectTelemetry() { return collectTelemetry; },
   get telemetryCache() { return telemetryCache; },
@@ -1872,6 +2038,8 @@ app.post('/api/chat/completions', authMiddleware, apiLimiter, async (req, res) =
   }
   // Aimi self-learning: observe this interaction
   autoObserve(conversation_id, messages, content, modelId);
+  // Fire onChatMessage hook
+  fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content, model: modelId, provider: provider?.name });
   // Normalize provider-native response to OpenAI format for the frontend
   if (isOllama) {
   res.json({
@@ -1956,55 +2124,88 @@ app.delete('/api/skills/:id', authMiddleware, requireRole('admin'), (req, res) =
  * 2. Template skills: handler starts with "template:" — uses LLM with the template as system prompt
  * 3. Hybrid skills: handler starts with "hybrid:" — runs JS that can call LLM
  */
+
+// ─── Skill Secret Collection ──────────────────────────────────────
+// Whitelisted env var names that skills can access via `secrets.<key>`
+const SKILL_SECRET_KEYS = new Set([
+  'TAVILY_API_KEY',
+  'SHOPIFY_SHOP_DOMAIN',
+  'SHOPIFY_ACCESS_TOKEN',
+  'SHOPIFY_API_KEY',
+  'SHOPIFY_API_SECRET',
+  'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'NVIDIA_API_KEY',
+  'OPENROUTER_API_KEY',
+  'GITHUB_TOKEN',
+  'STRIPE_SECRET_KEY',
+  'FIGMA_API_TOKEN',
+]);
+
+function collectSkillSecrets(skill) {
+  const secrets = {};
+  for (const key of SKILL_SECRET_KEYS) {
+    if (process.env[key]) secrets[key] = process.env[key];
+  }
+  // Also allow skill-specific secrets declared in skill.parameters.secrets array
+  try {
+    const params = typeof skill.parameters === 'string' ? JSON.parse(skill.parameters) : (skill.parameters || {});
+    const extraKeys = params.secrets || [];
+    for (const key of extraKeys) {
+      if (process.env[key]) secrets[key] = process.env[key];
+    }
+  } catch {}
+  return secrets;
+}
+
 async function executeSkill(skill, input = {}) {
   const handlerStr = skill.handler || '';
   const startTime = Date.now();
+  let result;
 
   try {
     // Template skill — LLM prompt template
     if (handlerStr.startsWith('template:')) {
       const template = handlerStr.slice('template:'.length).trim();
-      const result = await callAgentLLM([
+      const llmResult = await callAgentLLM([
         { role: 'system', content: template },
         { role: 'user', content: typeof input === 'string' ? input : JSON.stringify(input) },
       ], skill.model || undefined);
-      return {
+      result = {
         ok: true,
         type: 'template',
-        output: result.content,
-        tokens: { prompt: result.promptTokens, completion: result.completionTokens },
+        output: llmResult.content,
+        tokens: { prompt: llmResult.promptTokens, completion: llmResult.completionTokens },
         duration_ms: Date.now() - startTime,
       };
-    }
-
-    // Hybrid skill — JS function that can call LLM and use execSync/fetch
-    if (handlerStr.startsWith('hybrid:')) {
+    } else if (handlerStr.startsWith('hybrid:')) {
+      // Hybrid skill — JS function that can call LLM and use execSync/fetch
       const code = handlerStr.slice('hybrid:'.length).trim();
       const llmCall = (messages, model) => callAgentLLM(messages, model || skill.model || undefined);
-      const { result: sandboxResult } = await runSandboxedHybrid({ code, input, llmCall });
-      return {
-        ok: true,
-        type: 'hybrid',
-        output: sandboxResult,
-        duration_ms: Date.now() - startTime,
-      };
+      const secrets = collectSkillSecrets(skill);
+      const { result: sandboxResult } = await runSandboxedHybrid({ code, input, llmCall, secrets });
+      result = { ok: true, type: 'hybrid', output: sandboxResult, duration_ms: Date.now() - startTime };
+    } else {
+      // Script skill — pure JS function (sandboxed via vm.runInNewContext)
+      const secrets = collectSkillSecrets(skill);
+      const { result: sandboxResult } = await runSandboxed({ code: handlerStr, input, secrets });
+      result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime };
     }
-
-    // Script skill — pure JS function (sandboxed via vm.runInNewContext)
-    const { result: sandboxResult } = await runSandboxed({ code: handlerStr, input });
-    return {
-      ok: true,
-      type: 'script',
-      output: sandboxResult,
-      duration_ms: Date.now() - startTime,
-    };
   } catch (err) {
-    return {
-      ok: false,
-      error: err.message,
-      duration_ms: Date.now() - startTime,
-    };
+    result = { ok: false, error: err.message, duration_ms: Date.now() - startTime };
   }
+
+  // Fire onSkillExecuted hook
+  fireHook('onSkillExecuted', {
+    skillId: skill.id,
+    skillName: skill.name,
+    input,
+    output: result.output || result.error,
+    success: result.ok,
+    durationMs: result.duration_ms,
+  });
+
+  return result;
 }
 
 /**
@@ -2067,6 +2268,683 @@ app.post('/api/skills/execute/:name', authMiddleware, apiLimiter, async (req, re
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═════════════════════════════════════════════════════════════════
+// ─── Skill Chain Endpoints ───────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// GET /api/chains/skills — list all skill chains
+app.get('/api/chains/skills', authMiddleware, (_req, res) => {
+  const chains = stmts.skillChains.getAll.all();
+  for (const c of chains) c.steps = JSON.parse(c.steps || '[]');
+  res.json(chains);
+});
+
+// GET /api/chains/skills/:id — get one
+app.get('/api/chains/skills/:id', authMiddleware, (req, res) => {
+  const chain = stmts.skillChains.getById.get(req.params.id);
+  if (!chain) return res.status(404).json({ error: 'Chain not found' });
+  chain.steps = JSON.parse(chain.steps || '[]');
+  chain.last_run_result = chain.last_run_result ? JSON.parse(chain.last_run_result) : null;
+  res.json(chain);
+});
+
+// POST /api/chains/skills — create
+app.post('/api/chains/skills', authMiddleware, apiLimiter, (req, res) => {
+  const { name, description, steps } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const existing = stmts.skillChains.getByName.get(name);
+  if (existing) return res.status(409).json({ error: 'Chain name already exists' });
+  const id = crypto.randomUUID();
+  stmts.skillChains.insert.run(id, name, description || '', JSON.stringify(steps || []), 'draft', req.user?.id || null);
+  res.json({ id, name, description, steps: steps || [], status: 'draft' });
+});
+
+// PUT /api/chains/skills/:id — update
+app.put('/api/chains/skills/:id', authMiddleware, (req, res) => {
+  const existing = stmts.skillChains.getById.get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Chain not found' });
+  const { name, description, steps, status } = req.body;
+  stmts.skillChains.update.run(
+    name ?? existing.name,
+    description ?? existing.description,
+    JSON.stringify(steps ?? JSON.parse(existing.steps)),
+    status ?? existing.status,
+    req.params.id
+  );
+  const updated = stmts.skillChains.getById.get(req.params.id);
+  updated.steps = JSON.parse(updated.steps || '[]');
+  res.json(updated);
+});
+
+// DELETE /api/chains/skills/:id
+app.delete('/api/chains/skills/:id', authMiddleware, (req, res) => {
+  stmts.skillChains.delete.run(req.params.id);
+  res.json({ ok: true });
+});
+
+// POST /api/chains/skills/:id/execute — run a skill chain
+app.post('/api/chains/skills/:id/execute', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const chain = stmts.skillChains.getById.get(req.params.id);
+    if (!chain) return res.status(404).json({ error: 'Chain not found' });
+    const chainInput = req.body.input ?? req.body;
+    chain.steps = JSON.parse(chain.steps || '[]');
+    chain.name = chain.name;
+
+    // Build a skill lookup function for the executor
+    const executeSkillFn = async (step, input) => {
+      const skillName = step.skill_name;
+      const skill = stmts.skills.getByName.get(skillName);
+      if (!skill) throw new Error(`Skill "${skillName}" not found`);
+      if (!skill.enabled) throw new Error(`Skill "${skillName}" is disabled`);
+      stmts.skills.updateInvoke.run(skill.id);
+      return await executeSkill(skill, input);
+    };
+
+    const result = await executeSkillChain(chain, chainInput, executeSkillFn, broadcast);
+    stmts.skillChains.updateRunResult.run(JSON.stringify(result), result.ok ? 'completed' : 'failed', req.params.id);
+    // Track run count for evolution
+    try {
+      db.prepare('UPDATE skill_chains SET run_count = COALESCE(run_count, 0) + 1, success_count = COALESCE(success_count, 0) + ? WHERE id = ?')
+        .run(result.ok ? 1 : 0, req.params.id);
+    } catch { /* columns may not exist on fresh DB */ }
+    // Record real execution history for evolution promotion
+    try {
+      stmts.chainExecutions.insert.run(
+        crypto.randomUUID(), req.params.id, result.ok ? 1 : 0, result.duration_ms || 0,
+        JSON.stringify(chainInput ?? {}).slice(0, 4096),
+        JSON.stringify(result.final_output ?? null).slice(0, 4096),
+        result.results?.length || 0,
+        result.ok ? null : String(result.results?.find(r => r.error)?.error || 'Unknown error').slice(0, 1024)
+      );
+    } catch (e) { console.error('[chain-exec] Failed to record execution:', e.message); }
+    broadcast('chain:executed', { chainId: req.params.id, name: chain.name, ok: result.ok, type: 'skill' });
+    fireHook('onSkillExecuted', { skillId: req.params.id, skillName: chain.name, input: chainInput, output: result.final_output, success: result.ok, durationMs: result.duration_ms });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/chains/skills/generate — Aimi generates a chain from natural language
+app.post('/api/chains/skills/generate', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    const skills = stmts.skills.getAll.all().filter(s => s.enabled);
+    const tools = stmts.tools.getAll.all().filter(t => t.enabled);
+    const systemPrompt = buildChainIntentPrompt('skill', skills, tools);
+
+    const result = await callAgentLLM([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: prompt },
+    ], req.body.model);
+
+    let chainDef;
+    try {
+      const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+      chainDef = JSON.parse(jsonMatch ? jsonMatch[0] : result.content);
+    } catch {
+      return res.status(422).json({ error: 'Aimi could not generate a valid chain definition', raw: result.content.slice(0, 500) });
+    }
+
+    res.json({
+      chain: chainDef,
+      tokens: { prompt: result.promptTokens, completion: result.completionTokens },
+      model: result.model,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Tool Chain Endpoints ────────────────────────────────────────
+
+// GET /api/chains/tools — list all
+app.get('/api/chains/tools', authMiddleware, (_req, res) => {
+  const chains = stmts.toolChains.getAll.all();
+  for (const c of chains) c.steps = JSON.parse(c.steps || '[]');
+  res.json(chains);
+});
+
+// GET /api/chains/tools/:id
+app.get('/api/chains/tools/:id', authMiddleware, (req, res) => {
+  const chain = stmts.toolChains.getById.get(req.params.id);
+  if (!chain) return res.status(404).json({ error: 'Chain not found' });
+  chain.steps = JSON.parse(chain.steps || '[]');
+  chain.last_run_result = chain.last_run_result ? JSON.parse(chain.last_run_result) : null;
+  res.json(chain);
+});
+
+// POST /api/chains/tools — create
+app.post('/api/chains/tools', authMiddleware, apiLimiter, (req, res) => {
+  const { name, description, steps } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const existing = stmts.toolChains.getByName.get(name);
+  if (existing) return res.status(409).json({ error: 'Chain name already exists' });
+  const id = crypto.randomUUID();
+  stmts.toolChains.insert.run(id, name, description || '', JSON.stringify(steps || []), 'draft', req.user?.id || null);
+  res.json({ id, name, description, steps: steps || [], status: 'draft' });
+});
+
+// PUT /api/chains/tools/:id
+app.put('/api/chains/tools/:id', authMiddleware, (req, res) => {
+  const existing = stmts.toolChains.getById.get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Chain not found' });
+  const { name, description, steps, status } = req.body;
+  stmts.toolChains.update.run(
+    name ?? existing.name,
+    description ?? existing.description,
+    JSON.stringify(steps ?? JSON.parse(existing.steps)),
+    status ?? existing.status,
+    req.params.id
+  );
+  const updated = stmts.toolChains.getById.get(req.params.id);
+  updated.steps = JSON.parse(updated.steps || '[]');
+  res.json(updated);
+});
+
+// DELETE /api/chains/tools/:id
+app.delete('/api/chains/tools/:id', authMiddleware, (req, res) => {
+  stmts.toolChains.delete.run(req.params.id);
+  res.json({ ok: true });
+});
+
+// POST /api/chains/tools/:id/execute — run a tool chain
+app.post('/api/chains/tools/:id/execute', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const chain = stmts.toolChains.getById.get(req.params.id);
+    if (!chain) return res.status(404).json({ error: 'Chain not found' });
+    const chainInput = req.body.input ?? req.body;
+    chain.steps = JSON.parse(chain.steps || '[]');
+
+    // Build tool call function — makes HTTP requests to internal endpoints
+    const callToolFn = async (step, input) => {
+      const tool = stmts.tools.getByName.get(step.tool_name);
+      if (!tool) throw new Error(`Tool "${step.tool_name}" not found`);
+      const method = step.method || tool.method || 'GET';
+      const endpoint = step.endpoint || tool.endpoint;
+      const url = `http://localhost:${PORT}${endpoint}`;
+
+      const fetchOpts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (method !== 'GET' && method !== 'HEAD') {
+        fetchOpts.body = JSON.stringify(input || {});
+      }
+
+      const resp = await fetch(url, fetchOpts);
+      const data = await resp.json();
+      return data;
+    };
+
+    const result = await executeToolChain(chain, chainInput, callToolFn, broadcast);
+    stmts.toolChains.updateRunResult.run(JSON.stringify(result), result.ok ? 'completed' : 'failed', req.params.id);
+    broadcast('chain:executed', { chainId: req.params.id, name: chain.name, ok: result.ok, type: 'tool' });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/chains/tools/generate — Aimi generates a tool chain from natural language
+app.post('/api/chains/tools/generate', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    const skills = stmts.skills.getAll.all().filter(s => s.enabled);
+    const tools = stmts.tools.getAll.all().filter(t => t.enabled);
+    const systemPrompt = buildChainIntentPrompt('tool', skills, tools);
+
+    const result = await callAgentLLM([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: prompt },
+    ], req.body.model);
+
+    let chainDef;
+    try {
+      const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+      chainDef = JSON.parse(jsonMatch ? jsonMatch[0] : result.content);
+    } catch {
+      return res.status(422).json({ error: 'Aimi could not generate a valid chain definition', raw: result.content.slice(0, 500) });
+    }
+
+    res.json({
+      chain: chainDef,
+      tokens: { prompt: result.promptTokens, completion: result.completionTokens },
+      model: result.model,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Auto-Skill Authoring (Distill) ─────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// POST /api/learn/distill — Aimi analyzes a conversation and auto-creates a skill
+app.post('/api/learn/distill', authMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const { conversation_id } = req.body;
+    if (!conversation_id) return res.status(400).json({ error: 'conversation_id required' });
+
+    const observations = stmts.observations.getByConversation.all(conversation_id);
+    const messages = stmts.messages.getByConversation.all(conversation_id);
+    if (observations.length === 0 && messages.length === 0)
+      return res.status(404).json({ error: 'No observations or messages found for this conversation' });
+
+    const systemPrompt = buildDistillPrompt(observations, messages);
+    const result = await callAgentLLM([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: 'Distill this conversation into a reusable skill.' },
+    ], req.body.model);
+
+    let skillDef;
+    try {
+      const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+      skillDef = JSON.parse(jsonMatch ? jsonMatch[0] : result.content);
+    } catch {
+      return res.status(422).json({ error: 'Aimi could not generate a valid skill definition', raw: result.content.slice(0, 500) });
+    }
+
+    // Security scan the handler before saving
+    const scan = scanSkillHandler(skillDef.handler, skillDef.name);
+    if (scan.verdict === 'blocked') {
+      return res.status(403).json({ error: 'Generated skill handler blocked by security scanner', scan });
+    }
+
+    // Save as auto-proposed skill
+    const skillId = crypto.randomUUID();
+    const handler = skillDef.handler_type === 'script' ? skillDef.handler
+      : skillDef.handler_type === 'hybrid' ? `hybrid:${skillDef.handler}`
+      : `template:${skillDef.handler}`;
+
+    stmts.skills.insertWithConfidence.run(
+      skillId, skillDef.name, skillDef.description, skillDef.category || 'general',
+      handler, JSON.stringify(skillDef.parameters || {}), 1,
+      skillDef.confidence || 0.7, 1
+    );
+
+    // Record evolution
+    const evoId = crypto.randomUUID();
+    stmts.evolution.insert.run(evoId, skillId, null, 1, 'auto-distill', null, conversation_id, `Auto-distilled from conversation ${conversation_id}`);
+
+    broadcast('skill:distilled', { skillId, name: skillDef.name, confidence: skillDef.confidence });
+    res.json({
+      skill: { id: skillId, ...skillDef },
+      scan,
+      evolution_id: evoId,
+      tokens: { prompt: result.promptTokens, completion: result.completionTokens },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Skill Evolution (Chain Promotion) ──────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// GET /api/evolution — list all evolution records (admin only)
+app.get('/api/evolution', authMiddleware, requireRole('admin'), (_req, res) => {
+  res.json(stmts.evolution.getAll.all());
+});
+
+// GET /api/evolution/skill/:id — get evolution history for a skill (admin only)
+app.get('/api/evolution/skill/:id', authMiddleware, requireRole('admin'), (req, res) => {
+  res.json(stmts.evolution.getBySkill.all(req.params.id));
+});
+
+// GET /api/evolution/chain/:id — check if a chain is ready to evolve
+app.get('/api/evolution/chain/:id/check', authMiddleware, (req, res) => {
+  const chain = stmts.skillChains.getById.get(req.params.id);
+  if (!chain) return res.status(404).json({ error: 'Chain not found' });
+
+  // Use real execution history from chain_executions table
+  let realHistory = [];
+  try {
+    realHistory = stmts.chainExecutions.getRecentByChain.all(req.params.id)
+      .map(e => ({ ok: Boolean(e.success), duration_ms: e.duration_ms, step_count: e.step_count, error: e.error }));
+  } catch { /* table may not exist */ }
+
+  const runCount = chain.run_count || realHistory.length;
+  const successCount = chain.success_count || realHistory.filter(r => r.ok).length;
+  const evaluation = shouldEvolveChain(chain, realHistory);
+  res.json({ ...evaluation, run_count: runCount, success_count: successCount, executions: realHistory.length });
+});
+
+// POST /api/evolution/chain/:id/promote — promote a chain to an evolved skill
+app.post('/api/evolution/chain/:id/promote', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const chain = stmts.skillChains.getById.get(req.params.id);
+    if (!chain) return res.status(404).json({ error: 'Chain not found' });
+    chain.steps = JSON.parse(chain.steps || '[]');
+
+    const runCount = chain.run_count || 0;
+    const successCount = chain.success_count || 0;
+
+    // Fetch real execution history for the LLM prompt
+    let realHistory = [];
+    try {
+      realHistory = stmts.chainExecutions.getRecentByChain.all(req.params.id)
+        .map(e => ({
+          ok: Boolean(e.success),
+          duration_ms: e.duration_ms,
+          step_count: e.step_count,
+          error: e.error,
+          created_at: e.created_at,
+        }));
+    } catch { /* table may not exist */ }
+
+    // Check if eligible using real history
+    const eval_ = shouldEvolveChain(chain, realHistory);
+    if (!eval_.ready) {
+      return res.status(400).json({ error: 'Chain not ready for promotion', ...eval_ });
+    }
+
+    // Use real execution history for the evolution prompt
+    const evoPrompt = buildEvolutionPrompt(chain, realHistory.slice(0, 10));
+    const result = await callAgentLLM([
+      { role: 'system', content: evoPrompt },
+      { role: 'user', content: 'Evaluate and promote this chain.' },
+    ], req.body.model);
+
+    let evoDef;
+    try {
+      const jsonMatch = result.content.match(/\{[\s\S]*\}/);
+      evoDef = JSON.parse(jsonMatch ? jsonMatch[0] : result.content);
+    } catch {
+      return res.status(422).json({ error: 'Aimi could not generate an evolution definition', raw: result.content.slice(0, 500) });
+    }
+
+    if (!evoDef.should_promote) {
+      return res.json({ promoted: false, reason: evoDef.reason, evaluation: eval_ });
+    }
+
+    // Security scan the evolved handler
+    const scan = scanSkillHandler(evoDef.handler, evoDef.skill_name);
+    if (scan.verdict !== 'passed') {
+      return res.status(403).json({ error: `Evolved handler failed security scan: ${scan.verdict}`, scan });
+    }
+
+    // Create the evolved skill
+    const skillId = crypto.randomUUID();
+    const handler = evoDef.handler_type === 'hybrid' ? `hybrid:${evoDef.handler}` : evoDef.handler;
+
+    stmts.skills.insertWithConfidence.run(
+      skillId, evoDef.skill_name, evoDef.skill_description, 'evolved',
+      handler, JSON.stringify({}), 1, evoDef.confidence || 0.8, 1
+    );
+
+    // Record evolution
+    const evoId = crypto.randomUUID();
+    stmts.evolution.insert.run(evoId, skillId, req.params.id, 2, 'chain-promotion', null,
+      `chain:${chain.name}`, `Promoted from chain "${chain.name}" (${successCount}/${runCount} successful runs)`);
+
+    // Mark chain as evolved
+    try { db.prepare('UPDATE skill_chains SET evolved_to_skill = ? WHERE id = ?').run(skillId, req.params.id); } catch {}
+
+    broadcast('skill:evolved', { skillId, name: evoDef.skill_name, fromChain: chain.name, chainId: req.params.id });
+    res.json({
+      promoted: true,
+      skill: { id: skillId, ...evoDef },
+      scan,
+      evolution_id: evoId,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/evolution/:id/optimal — mark an evolution as the optimal version (admin only)
+app.patch('/api/evolution/:id/optimal', authMiddleware, requireRole('admin'), (req, res) => {
+  // Check existence first
+  const evo = stmts.evolution.getById?.get(req.params.id);
+  if (!evo) return res.status(404).json({ error: 'Evolution record not found' });
+
+  // Clear all other optimal flags for the same skill, then set this one
+  try {
+    db.prepare('UPDATE skill_evolution SET optimal = 0 WHERE skill_id = ?').run(evo.skill_id);
+  } catch { /* ignore */ }
+  const result = stmts.evolution.markOptimal.run(req.params.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Evolution record not found' });
+  res.json({ ok: true, optimal: true });
+});
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Skill Hub (Install/Export with Security) ───────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// GET /api/skills/hub/sources — list all skill hub sources
+app.get('/api/skills/hub/sources', authMiddleware, (_req, res) => {
+  res.json(stmts.skillHub.getAll.all());
+});
+
+// POST /api/skills/hub/sources — register a new skill hub source (admin only)
+app.post('/api/skills/hub/sources', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  const { name, url, type = 'git' } = req.body;
+  if (!name || !url) return res.status(400).json({ error: 'name and url required' });
+
+  // Validate URL scheme — only https allowed (blocks http://, file://, etc.)
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') {
+      return res.status(400).json({ error: 'URL must use https:// scheme' });
+    }
+    // Block internal/private IPs (SSRF protection)
+    const hostname = parsed.hostname;
+    const blockedPatterns = [
+      /^127\./, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, // RFC1918
+      /^169\.254\./, // link-local (AWS metadata)
+      /^0\./, /^localhost$/i,
+      /^::1$/, /^fe80:/, /^fc00:/i, /^fd00:/i, // IPv6 internal
+    ];
+    if (blockedPatterns.some(re => re.test(hostname))) {
+      return res.status(400).json({ error: 'Internal/private host addresses are not allowed' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+
+  const id = crypto.randomUUID();
+  stmts.skillHub.insert.run(id, name, url, type, 0, 0, 'pending');
+  res.json({ id, name, url, type, scan_status: 'pending' });
+});
+
+// POST /api/skills/hub/sources/:id/scan — security scan a hub source (admin only)
+app.post('/api/skills/hub/sources/:id/scan', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const source = stmts.skillHub.getById.get(req.params.id);
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+    stmts.skillHub.updateScan.run('scanning', null, 0, req.params.id);
+
+    // Validate URL again before fetching
+    const parsed = new URL(source.url);
+    if (parsed.protocol !== 'https:') {
+      stmts.skillHub.updateScan.run('failed', 'Non-https URL blocked', 0, req.params.id);
+      return res.status(400).json({ error: 'Non-https URL blocked' });
+    }
+
+    // Fetch the skill manifest from the URL
+    let manifestUrl = source.url;
+    if (manifestUrl.endsWith('.git')) manifestUrl = manifestUrl.slice(0, -4);
+    if (manifestUrl.includes('github.com')) {
+      manifestUrl = manifestUrl.replace('github.com', 'raw.githubusercontent.com') + '/main/skill.json';
+    }
+
+    const resp = await fetch(manifestUrl, { redirect: 'follow', signal: AbortSignal.timeout(15000) });
+    if (!resp.ok) {
+      // Cap error message to prevent storage DoS
+      const err = `HTTP ${resp.status}`.slice(0, 256);
+      stmts.skillHub.updateScan.run('failed', err, 0, req.params.id);
+      return res.json({ verdict: 'failed', error: `Could not fetch manifest: HTTP ${resp.status}` });
+    }
+
+    const manifest = await resp.json();
+    const skills = Array.isArray(manifest) ? manifest : [manifest];
+    const allIssues = [];
+
+    for (const skill of skills) {
+      const scan = scanSkillHandler(skill.handler, skill.name);
+      allIssues.push({ skill: skill.name, ...scan });
+    }
+
+    const blocked = allIssues.some(s => s.verdict === 'blocked');
+    const failed = allIssues.some(s => s.verdict === 'failed');
+    const verdict = blocked ? 'blocked' : failed ? 'failed' : 'passed';
+    const trustScore = allIssues.filter(s => s.verdict === 'passed').length / allIssues.length;
+
+    // Cap scan result to 64KB to prevent storage DoS
+    const resultStr = JSON.stringify(allIssues).slice(0, 65536);
+    stmts.skillHub.updateScan.run(verdict, resultStr, trustScore, req.params.id);
+    res.json({ verdict, trust_score: trustScore, scans: allIssues });
+  } catch (e) {
+    stmts.skillHub.updateScan.run('failed', e.message, 0, req.params.id);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/skills/hub/sources/:id/install — install a scanned-and-passed skill (admin only)
+app.post('/api/skills/hub/sources/:id/install', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const source = stmts.skillHub.getById.get(req.params.id);
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+    if (source.scan_status !== 'passed') return res.status(403).json({ error: `Source scan status is "${source.scan_status}" — must be "passed" to install` });
+
+    // Re-fetch and install
+    let manifestUrl = source.url;
+    if (manifestUrl.endsWith('.git')) manifestUrl = manifestUrl.slice(0, -4);
+    if (manifestUrl.includes('github.com')) {
+      manifestUrl = manifestUrl.replace('github.com', 'raw.githubusercontent.com') + '/main/skill.json';
+    }
+
+    const resp = await fetch(manifestUrl);
+    if (!resp.ok) return res.status(502).json({ error: `Failed to fetch: HTTP ${resp.status}` });
+
+    const manifest = await resp.json();
+    const skills = Array.isArray(manifest) ? manifest : [manifest];
+    const installed = [];
+
+    for (const skill of skills) {
+      // Double-check scan — only install if verdict is EXACTLY 'passed'
+      const scan = scanSkillHandler(skill.handler, skill.name);
+      if (scan.verdict !== 'passed') {
+        installed.push({ name: skill.name, installed: false, reason: `Security scan verdict: ${scan.verdict}` });
+        continue;
+      }
+
+      const skillId = crypto.randomUUID();
+      const existing = stmts.skills.getByName.get(skill.name);
+      if (existing) {
+        installed.push({ name: skill.name, installed: false, reason: 'Skill with this name already exists' });
+        continue;
+      }
+
+      stmts.skills.insertWithConfidence.run(
+        skillId, skill.name, skill.description || '', skill.category || 'hub',
+        skill.handler, JSON.stringify(skill.parameters || {}), 1, 0.5, 1
+      );
+
+      const evoId = crypto.randomUUID();
+      stmts.evolution.insert.run(evoId, skillId, null, 1, 'skill-hub', null, `hub:${source.name}`, `Installed from skill hub source "${source.name}"`);
+      installed.push({ name: skill.name, installed: true, id: skillId });
+    }
+
+    stmts.skillHub.updateInstalled.run(JSON.stringify(installed), req.params.id);
+    broadcast('skill:hub:installed', { sourceId: req.params.id, installed });
+    res.json({ installed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/skills/hub/sources/:id
+app.delete('/api/skills/hub/sources/:id', authMiddleware, (req, res) => {
+  stmts.skillHub.delete.run(req.params.id);
+  res.json({ ok: true });
+});
+
+// GET /api/skills/export/:name — export a skill as portable JSON (admin only)
+app.get('/api/skills/export/:name', authMiddleware, requireRole('admin'), (req, res) => {
+  const skill = stmts.skills.getByName.get(req.params.name);
+  if (!skill) return res.status(404).json({ error: 'Skill not found' });
+  const exportData = {
+    name: skill.name,
+    description: skill.description,
+    category: skill.category,
+    handler: skill.handler,
+    parameters: JSON.parse(skill.parameters || '{}'),
+    trigger: skill.trigger || '',
+    version: skill.version || '1.0.0',
+    exported_at: new Date().toISOString(),
+  };
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="${skill.name}.json"`);
+  res.json(exportData);
+});
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Heartbeat Rules ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// GET /api/heartbeat/rules — list all heartbeat rules
+app.get('/api/heartbeat/rules', authMiddleware, (_req, res) => {
+  res.json(stmts.heartbeat.getAll.all());
+});
+
+// POST /api/heartbeat/rules — create a heartbeat rule (admin only)
+app.post('/api/heartbeat/rules', authMiddleware, requireRole('admin'), (req, res) => {
+  const { name, description, condition, action_type, action_target, action_input, cooldown_seconds } = req.body;
+  if (!name || !condition || !action_type || !action_target)
+    return res.status(400).json({ error: 'name, condition, action_type, action_target required' });
+
+  // Validate action_type — webhook is not implemented yet
+  const validActions = ['chain', 'skill', 'alert'];
+  if (!validActions.includes(action_type))
+    return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
+
+  // Validate condition is single-line (no newline injection)
+  if (typeof condition !== 'string' || condition.includes('\n') || condition.includes('\r'))
+    return res.status(400).json({ error: 'Condition must be a single-line expression' });
+
+  // Pre-validate condition: only allow known state categories + comparison operators
+  const validStateRef = /^(agents|tasks|chains|skills|providers|schedules|messages)\.(total|active|stale|pending|running|failed|enabled)$/;
+  // Extract all word.word patterns and check if they're all valid state refs
+  const refs = condition.match(/\b\w+\.\w+\b/g) || [];
+  for (const ref of refs) {
+    if (!validStateRef.test(ref)) {
+      return res.status(400).json({ error: `Unknown state reference "${ref}". Valid refs: agents.total, agents.active, agents.stale, tasks.pending, tasks.running, tasks.failed, chains.total, chains.failed, skills.total, skills.enabled, providers.total, providers.enabled, schedules.total, schedules.enabled, messages.pending` });
+    }
+  }
+  // After removing valid state refs and boolean literals, remaining chars must be safe
+  const condStripped = condition
+    .replace(/\b\w+\.\w+\b/g, '0')
+    .replace(/\btrue\b/g, '1')
+    .replace(/\bfalse\b/g, '0');
+  // Any remaining identifier means function calls, property access, etc.
+  if (/\b[a-zA-Z_]\w*\b/.test(condStripped)) {
+    return res.status(400).json({ error: 'Condition contains invalid identifiers. Only state refs and comparison/boolean operators are allowed' });
+  }
+  if (!/^[\d\s<>=!&|().]+$/.test(condStripped)) {
+    return res.status(400).json({ error: 'Condition contains invalid characters' });
+  }
+
+  const id = crypto.randomUUID();
+  stmts.heartbeat.insert.run(id, name, description || '', condition, action_type, action_target,
+    JSON.stringify(action_input || {}), cooldown_seconds || 300);
+  res.json({ id, name, condition, action_type, action_target, enabled: 1 });
+});
+
+// PATCH /api/heartbeat/rules/:id/toggle
+app.patch('/api/heartbeat/rules/:id/toggle', authMiddleware, (req, res) => {
+  const rule = stmts.heartbeat.getById.get(req.params.id);
+  if (!rule) return res.status(404).json({ error: 'Rule not found' });
+  stmts.heartbeat.updateEnabled.run(rule.enabled ? 0 : 1, req.params.id);
+  res.json({ ok: true, enabled: !rule.enabled });
+});
+
+// DELETE /api/heartbeat/rules/:id
+app.delete('/api/heartbeat/rules/:id', authMiddleware, (req, res) => {
+  stmts.heartbeat.delete.run(req.params.id);
+  res.json({ ok: true });
+});
+
+// GET /api/heartbeat/state — get current system state (what heartbeat sees)
+app.get('/api/heartbeat/state', authMiddleware, (_req, res) => {
+  if (globalThis._heartbeat) {
+    res.json(globalThis._heartbeat.collectState());
+  } else {
+    res.json({ error: 'Heartbeat not running' });
+  }
+});
+
 // GET /api/skills/match/:input — find skills that match user input
 app.get('/api/skills/match/:input', authMiddleware, (req, res) => {
   try {
@@ -2109,7 +2987,63 @@ app.post('/api/skills/seed', authMiddleware, requireRole('admin'), apiLimiter, a
 
     audit('seed', 'skills', null, req.user.id, { seeded: seeded.length, skipped: skipped.length });
     broadcast('skill:seeded', { seeded, skipped });
-    res.json({ seeded, skipped, total_seeded: seeded.length, total_skipped: skipped.length });
+
+    // Seed chain templates
+    const SEED_CHAIN_TEMPLATES = [
+      {
+        name: 'research-and-summarize',
+        description: 'Research a topic and summarize the findings into a concise report',
+        steps: [
+          { skill_name: 'web-research', name: 'Research', input_mapping: { query: '$input' } },
+          { skill_name: 'paper-summarize', name: 'Summarize', input_mapping: { text: '$prev.output' } },
+        ],
+      },
+      {
+        name: 'audit-and-report',
+        description: 'Run deployment audit checks and generate an actionable report',
+        steps: [
+          { skill_name: 'deploy-check', name: 'Audit Deploy', input_mapping: { service: '$input' } },
+          { skill_name: 'log-analyzer', name: 'Analyze Logs', input_mapping: { logs: '$prev.output' } },
+          { skill_name: 'paper-summarize', name: 'Generate Report', input_mapping: { text: '$prev.output' } },
+        ],
+      },
+      {
+        name: 'build-and-deploy',
+        description: 'Run build checks, execute build, and verify deployment health',
+        steps: [
+          { skill_name: 'code-linter', name: 'Lint Code', input_mapping: { path: '$input' } },
+          { skill_name: 'deploy-check', name: 'Deploy & Check', input_mapping: { service: '$prev.output' } },
+        ],
+      },
+      {
+        name: 'monitor-and-respond',
+        description: 'Check system health and auto-respond to issues with corrective actions',
+        steps: [
+          { skill_name: 'monitor-check', name: 'Monitor', input_mapping: {} },
+          { skill_name: 'incident-responder', name: 'Respond', input_mapping: { alerts: '$prev.output' } },
+        ],
+      },
+      {
+        name: 'research-to-landing-page',
+        description: 'Research a product topic and generate a landing page from findings',
+        steps: [
+          { skill_name: 'web-research', name: 'Research Topic', input_mapping: { query: '$input' } },
+          { skill_name: 'paper-summarize', name: 'Extract Key Points', input_mapping: { text: '$prev.output' } },
+          { skill_name: 'landing-page-generator', name: 'Generate Landing Page', input_mapping: { product: '$prev.output' } },
+        ],
+      },
+    ];
+
+    let chainsSeeded = 0;
+    for (const tmpl of SEED_CHAIN_TEMPLATES) {
+      const existing = stmts.skillChains.getByName.get(tmpl.name);
+      if (existing) continue;
+      const id = crypto.randomUUID();
+      stmts.skillChains.insert.run(id, tmpl.name, tmpl.description, JSON.stringify(tmpl.steps), 'template', req.user?.id || null);
+      chainsSeeded++;
+    }
+
+    res.json({ seeded, skipped, chains_seeded: chainsSeeded, total_seeded: seeded.length, total_skipped: skipped.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2454,6 +3388,315 @@ Be concise. Use a comparison table format.`,
         return { processes: ps, killed: false, note: 'Set kill=true to terminate' };
       } catch (e) { return { error: 'No processes found', name }; }
     }`,
+  },
+  // ── Shopify ──────────────────────────────────────────────────
+  {
+    name: 'shopify-products',
+    description: 'List, search, or get details of Shopify products via Admin API',
+    category: 'shopify',
+    trigger: 'shopify products,list products,product catalog,shop products',
+    confidence: 0.8,
+    parameters: { type: 'hybrid', secrets: ['SHOPIFY_SHOP_DOMAIN', 'SHOPIFY_ACCESS_TOKEN'] },
+    handler: `hybrid:
+      const domain = secrets.SHOPIFY_SHOP_DOMAIN;
+      const token = secrets.SHOPIFY_ACCESS_TOKEN;
+      if (!domain || !token) return { error: 'Shopify credentials not configured. Set SHOPIFY_SHOP_DOMAIN and SHOPIFY_ACCESS_TOKEN env vars.' };
+      const action = input.action || 'list';
+      const lim = input.limit || 50;
+      const url = 'https://' + domain + '/admin/api/2024-01/products.json?limit=' + lim;
+      const resp = await fetch(url, {
+        headers: { 'X-Shopify-Access-Token': token }
+      });
+      if (!resp.ok) {
+        const err = await resp.text();
+        return { error: 'Shopify API error (' + resp.status + '): ' + err.slice(0, 300) };
+      }
+      const data = await resp.json();
+      const products = (data.products || []).map(p => ({
+        id: p.id, title: p.title, vendor: p.vendor,
+        status: p.status, variants: (p.variants || []).length,
+        price: p.variants?.[0]?.price || null,
+        inventory: p.variants?.reduce((s, v) => s + (v.inventory_quantity || 0), 0) || 0,
+        tags: p.tags, image: p.image?.src || null,
+      }));
+      return { count: products.length, products };
+    `,
+  },
+  {
+    name: 'shopify-orders',
+    description: 'List recent Shopify orders with customer and fulfillment info',
+    category: 'shopify',
+    trigger: 'shopify orders,recent orders,order history,fulfillment status',
+    confidence: 0.8,
+    parameters: { type: 'hybrid', secrets: ['SHOPIFY_SHOP_DOMAIN', 'SHOPIFY_ACCESS_TOKEN'] },
+    handler: `hybrid:
+      const domain = secrets.SHOPIFY_SHOP_DOMAIN;
+      const token = secrets.SHOPIFY_ACCESS_TOKEN;
+      if (!domain || !token) return { error: 'Shopify credentials not configured.' };
+      const lim = input.limit || 25;
+      const status = input.status || 'any';
+      const url = 'https://' + domain + '/admin/api/2024-01/orders.json?limit=' + lim + '&status=' + status;
+      const resp = await fetch(url, { headers: { 'X-Shopify-Access-Token': token } });
+      if (!resp.ok) { const e = await resp.text(); return { error: 'Shopify API (' + resp.status + '): ' + e.slice(0, 300) }; }
+      const data = await resp.json();
+      const orders = (data.orders || []).map(o => ({
+        id: o.id, name: o.name, email: o.email,
+        total_price: o.total_price, currency: o.currency,
+        financial_status: o.financial_status,
+        fulfillment_status: o.fulfillment_status || 'unfulfilled',
+        created_at: o.created_at,
+        items: (o.line_items || []).map(li => ({ title: li.title, qty: li.quantity, price: li.price })),
+        customer: o.customer ? { name: o.customer.first_name + ' ' + o.customer.last_name, email: o.customer.email } : null,
+      }));
+      const totalRevenue = orders.reduce((s, o) => s + parseFloat(o.total_price || 0), 0);
+      return { count: orders.length, total_revenue: totalRevenue.toFixed(2), currency: orders[0]?.currency || 'USD', orders };
+    `,
+  },
+  {
+    name: 'shopify-inventory',
+    description: 'Check inventory levels across locations and flag low-stock items',
+    category: 'shopify',
+    trigger: 'shopify inventory,stock levels,low stock,inventory check',
+    confidence: 0.8,
+    parameters: { type: 'hybrid', secrets: ['SHOPIFY_SHOP_DOMAIN', 'SHOPIFY_ACCESS_TOKEN'] },
+    handler: `hybrid:
+      const domain = secrets.SHOPIFY_SHOP_DOMAIN;
+      const token = secrets.SHOPIFY_ACCESS_TOKEN;
+      if (!domain || !token) return { error: 'Shopify credentials not configured.' };
+      const threshold = input.threshold || 5;
+      // Get inventory items
+      const invResp = await fetch('https://' + domain + '/admin/api/2024-01/inventory_items.json?limit=250', {
+        headers: { 'X-Shopify-Access-Token': token }
+      });
+      if (!invResp.ok) { const e = await invResp.text(); return { error: 'Shopify API (' + invResp.status + '): ' + e.slice(0, 300) }; }
+      const invData = await invResp.json();
+      const items = (invData.inventory_items || []).map(i => ({
+        id: i.id, sku: i.sku, tracked: i.tracked,
+        cost: i.cost || null, country: i.country_code_of_origin || null,
+      }));
+      // Get inventory levels
+      const lvlResp = await fetch('https://' + domain + '/admin/api/2024-01/inventory_levels.json?limit=250', {
+        headers: { 'X-Shopify-Access-Token': token }
+      });
+      const lvlData = await lvlResp.ok ? await lvlResp.json() : { inventory_levels: [] };
+      const levels = lvlData.inventory_levels || [];
+      const lowStock = levels.filter(l => l.available < threshold).map(l => ({
+        inventory_item_id: l.inventory_item_id,
+        location_id: l.location_id,
+        available: l.available,
+      }));
+      return { total_items: items.length, total_locations: levels.length, low_stock_count: lowStock.length, threshold, low_stock: lowStock, items };
+    `,
+  },
+  {
+    name: 'shopify-customer-insights',
+    description: 'Analyze customer data — top customers, order frequency, revenue per customer',
+    category: 'shopify',
+    trigger: 'shopify customers,customer insights,top customers,customer analysis',
+    confidence: 0.7,
+    parameters: { type: 'hybrid', secrets: ['SHOPIFY_SHOP_DOMAIN', 'SHOPIFY_ACCESS_TOKEN'] },
+    handler: `hybrid:
+      const domain = secrets.SHOPIFY_SHOP_DOMAIN;
+      const token = secrets.SHOPIFY_ACCESS_TOKEN;
+      if (!domain || !token) return { error: 'Shopify credentials not configured.' };
+      const lim = input.limit || 50;
+      const resp = await fetch('https://' + domain + '/admin/api/2024-01/customers.json?limit=' + lim, {
+        headers: { 'X-Shopify-Access-Token': token }
+      });
+      if (!resp.ok) { const e = await resp.text(); return { error: 'Shopify API (' + resp.status + '): ' + e.slice(0, 300) }; }
+      const data = await resp.json();
+      const customers = (data.customers || []).map(c => ({
+        id: c.id, name: c.first_name + ' ' + c.last_name, email: c.email,
+        orders_count: c.orders_count, total_spent: parseFloat(c.total_spent),
+        avg_order_value: c.orders_count > 0 ? (parseFloat(c.total_spent) / c.orders_count).toFixed(2) : '0',
+        state: c.default_address?.province || null, country: c.default_address?.country || null,
+        created_at: c.created_at, last_order: c.last_order_name || null,
+      }));
+      const topByRevenue = [...customers].sort((a, b) => b.total_spent - a.total_spent).slice(0, 10);
+      const topByOrders = [...customers].sort((a, b) => b.orders_count - a.orders_count).slice(0, 10);
+      const totalRev = customers.reduce((s, c) => s + c.total_spent, 0);
+      // LLM summary
+      const summary = await llmCall([
+        { role: 'system', content: 'Analyze this customer data and provide: 1) Key insights 2) Top 3 customer segments 3) Recommendations. Be concise.' },
+        { role: 'user', content: 'Customers: ' + JSON.stringify({ total: customers.length, total_revenue: totalRev.toFixed(2), top_by_revenue: topByRevenue.slice(0, 5), top_by_orders: topByOrders.slice(0, 5) }).slice(0, 3000) }
+      ]);
+      return { total_customers: customers.length, total_revenue: totalRev.toFixed(2), top_by_revenue: topByRevenue, top_by_orders: topByOrders, analysis: summary.content };
+    `,
+  },
+  // ── Web Design ───────────────────────────────────────────────
+  {
+    name: 'landing-page-generator',
+    description: 'Generate a complete responsive landing page HTML with cyberpunk or custom styling',
+    category: 'web-design',
+    trigger: 'landing page,generate landing,create landing page,web page design',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const product = typeof input === 'string' ? input : (input.product || input.description || 'a SaaS product');
+      const style = input.style || 'cyberpunk';
+      const cta = input.cta || 'Get Started';
+      const result = await llmCall([
+          { role: 'system', content: 'You are an expert web designer. Generate a complete, single-file HTML landing page. Include inline CSS and minimal JS for interactivity. Style: ' + style + '. Product: ' + product + '. CTA button: ' + cta + '. Requirements: 1) Hero section with headline + subhead + CTA 2) Features grid (3-4 cards) 3) Social proof / testimonials 4) Pricing table 5) Final CTA + footer. Use CSS variables, modern flexbox/grid, responsive breakpoints, smooth animations. Return ONLY the HTML in a single code block.' },
+          { role: 'user', content: 'Generate a ' + style + ' landing page for: ' + product }
+        ]);
+      return { html: result.content, style, product };
+    `,
+  },
+  {
+    name: 'design-system-generator',
+    description: 'Generate a complete design system — colors, typography, spacing, components',
+    category: 'web-design',
+    trigger: 'design system,generate design tokens,color palette,typography system',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const brand = typeof input === 'string' ? input : (input.brand || input.name || 'Brand');
+      const baseColor = input.baseColor || input.color || '#00f0ff';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a design systems expert. Generate a complete design system as JSON tokens. Include: 1) Color palette (primary, secondary, accent, neutral with 50-900 shades) 2) Typography (font sizes, weights, line heights, font family) 3) Spacing scale (4px base) 4) Border radius 5) Shadows 6) Component tokens (buttons, cards, inputs) 7) Dark + light mode variants. Base color: ' + baseColor + '. Brand: ' + brand + '. Return as a JSON object in a code block.' },
+          { role: 'user', content: 'Create a design system for ' + brand + ' with base color ' + baseColor }
+        ]);
+      return { tokens: result.content, brand, baseColor };
+    `,
+  },
+  {
+    name: 'responsive-layout-builder',
+    description: 'Generate responsive CSS layout from a description — flexbox/grid with breakpoints',
+    category: 'web-design',
+    trigger: 'responsive layout,css grid,css layout,build layout,responsive design',
+    confidence: 0.7,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const desc = typeof input === 'string' ? input : (input.description || input.layout || 'a dashboard sidebar + main content area');
+      const result = await llmCall([
+          { role: 'system', content: 'You are a CSS layout expert. Generate responsive CSS + minimal HTML for the described layout. Requirements: 1) Use CSS Grid or Flexbox 2) Mobile-first responsive breakpoints 3) Accessible 4) Return HTML + CSS in a single code block. Keep it production-ready.' },
+          { role: 'user', content: 'Layout: ' + desc }
+        ]);
+      return { html: result.content, description: desc };
+    `,
+  },
+  {
+    name: 'component-generator',
+    description: 'Generate a React or vanilla JS UI component from a description',
+    category: 'web-design',
+    trigger: 'generate component,react component,ui component,build component',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const desc = typeof input === 'string' ? input : (input.description || input.component || 'a card component');
+      const framework = input.framework || 'react';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a frontend expert. Generate a ' + framework + ' component for the described UI. Requirements: 1) Props-driven 2) Accessible (ARIA) 3) Responsive 4) Inline styles or Tailwind classes 5) TypeScript types if React. Return the component in a single code block. Include all sub-components inline.' },
+          { role: 'user', content: 'Component: ' + desc + ' | Framework: ' + framework }
+        ]);
+      return { code: result.content, framework, description: desc };
+    `,
+  },
+  // ── Coding ───────────────────────────────────────────────────
+  {
+    name: 'feature-builder',
+    description: 'Generate full-stack feature code — API endpoint + DB schema + frontend component',
+    category: 'coding',
+    trigger: 'build feature,full stack feature,implement feature,create feature',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const desc = typeof input === 'string' ? input : (input.description || input.feature || 'a user settings page');
+      const stack = input.stack || 'express+react+sqlite';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a full-stack engineer. Generate complete code for the described feature using: ' + stack + '. Provide: 1) Database schema (SQL) 2) API endpoint (server code) 3) Frontend component 4) Brief integration notes. Return each part in separate code blocks with labels.' },
+          { role: 'user', content: 'Feature: ' + desc + ' | Stack: ' + stack }
+        ]);
+      return { code: result.content, feature: desc, stack };
+    `,
+  },
+  {
+    name: 'api-endpoint-generator',
+    description: 'Generate a REST API endpoint with validation, error handling, and tests',
+    category: 'coding',
+    trigger: 'api endpoint,generate api,rest endpoint,create route',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const desc = typeof input === 'string' ? input : (input.description || input.endpoint || 'POST /api/users - create a user');
+      const framework = input.framework || 'express';
+      const result = await llmCall([
+          { role: 'system', content: 'You are an API designer. Generate a production-ready ' + framework + ' endpoint for: ' + desc + '. Include: 1) Route handler 2) Input validation (Zod or Joi) 3) Error handling 4) Rate limiting 5) Unit test. Return in code blocks.' },
+          { role: 'user', content: 'Endpoint: ' + desc + ' | Framework: ' + framework }
+        ]);
+      return { code: result.content, endpoint: desc, framework };
+    `,
+  },
+  {
+    name: 'schema-designer',
+    description: 'Design a database schema from a description — tables, relations, indexes, migrations',
+    category: 'coding',
+    trigger: 'database schema,db schema,schema design,design database,table design',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const desc = typeof input === 'string' ? input : (input.description || input.schema || 'a blog with users, posts, and comments');
+      const dbType = input.database || input.db || 'sqlite';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a database architect. Design a ' + dbType + ' schema for: ' + desc + '. Provide: 1) CREATE TABLE statements 2) Indexes 3) Foreign key constraints 4) Seed data 5) Migration script. Return in SQL code blocks.' },
+          { role: 'user', content: 'Schema: ' + desc + ' | Database: ' + dbType }
+        ]);
+      return { sql: result.content, schema: desc, database: dbType };
+    `,
+  },
+  {
+    name: 'test-writer',
+    description: 'Generate unit tests for a function or component — edge cases included',
+    category: 'coding',
+    trigger: 'write tests,generate tests,test suite,unit tests,test coverage',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const code = typeof input === 'string' ? input : (input.code || input.function || input.component || '');
+      if (!code) return { error: 'Code to test is required. Pass the function/component as input.' };
+      const framework = input.framework || 'vitest';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a test engineer. Write comprehensive ' + framework + ' tests for the provided code. Include: 1) Happy path tests 2) Edge cases 3) Error cases 4) Mocking if needed. Return only the test file in a code block.' },
+          { role: 'user', content: 'Code to test:\\n\\n' + code.slice(0, 4000) }
+        ]);
+      return { tests: result.content, framework };
+    `,
+  },
+  {
+    name: 'code-refactor',
+    description: 'Refactor code for readability, performance, or pattern compliance',
+    category: 'coding',
+    trigger: 'refactor code,clean code,improve code,code quality',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const code = typeof input === 'string' ? input : (input.code || '');
+      if (!code) return { error: 'Code to refactor is required.' };
+      const target = input.goal || input.pattern || 'readability';
+      const result = await llmCall([
+          { role: 'system', content: 'You are a senior engineer. Refactor the provided code focusing on: ' + target + '. Requirements: 1) Preserve behavior 2) Explain each change 3) Show before/after 4) Note any new edge cases. Return the refactored code in a code block, then bullet-point explanations.' },
+          { role: 'user', content: 'Code:\\n\\n' + code.slice(0, 4000) }
+        ]);
+      return { refactored: result.content, goal: target };
+    `,
+  },
+  {
+    name: 'debug-assistant',
+    description: 'Analyze an error or stack trace and suggest a fix with code',
+    category: 'coding',
+    trigger: 'debug error,fix bug,stack trace,debug help,runtime error',
+    confidence: 0.8,
+    parameters: { type: 'hybrid' },
+    handler: `hybrid:
+      const error = typeof input === 'string' ? input : (input.error || input.trace || '');
+      const context = input.context || input.code || '';
+      if (!error && !context) return { error: 'Provide an error message or code to debug.' };
+      const result = await llmCall([
+          { role: 'system', content: 'You are a debugging expert. Analyze the error and code context. Provide: 1) Root cause 2) Fix with code 3) Why the fix works 4) Prevention tips. Be concise.' },
+          { role: 'user', content: (error ? 'Error:\\n' + error + '\\n\\n' : '') + (context ? 'Code context:\\n' + context.slice(0, 3000) : '') }
+        ]);
+      return { analysis: result.content };
+    `,
   },
 ];
 
@@ -2849,24 +4092,32 @@ function buildAimiSystemPrompt(userId) {
 
  return `You are Aimi, the AI companion and system operator for Cardinal Frame — a cyberpunk-themed AI orchestration platform. You are intelligent, helpful, and deeply integrated into the system.
 
-## Current System State
-- Agents: ${agents.length} total, ${activeAgents} active
-- Tasks: ${tasks.length} total, ${pendingTasks} pending, ${runningTasks} running
-- LLM Providers: ${providers.length} enabled
-- Schedules: ${schedules.length} configured
+ ## Current System State
+ - Agents: ${agents.length} total, ${activeAgents} active
+ - Tasks: ${tasks.length} total, ${pendingTasks} pending, ${runningTasks} running
+ - LLM Providers: ${providers.length} enabled
+ - Schedules: ${schedules.length} configured
 
-## Your Capabilities
-You can perform real actions on the Cardinal Frame system. When the user asks you to do something, you should use the available tools to accomplish it.
+ ## Your Capabilities
+ You can perform real actions on the Cardinal Frame system. When the user asks you to do something, you should use the available tools to accomplish it.
 
-## Available Tools
-${tools.map(t => `- ${t.name}: ${t.description} (${t.method} ${t.endpoint})`).join('\n')}
+ ## Available Tools
+ ${tools.map(t => `- ${t.name}: ${t.description} (${t.method} ${t.endpoint})`).join('\n')}
 
-## Instructions
-- When the user asks you to create a task, list agents, check status, etc., use the appropriate tool.
-- To invoke a tool, respond with a JSON block: \`\`\`tool_call\n{"tool": "tool_name", "arguments": {...}}\n\`\`\`
-- Be proactive — if you notice issues (stale agents, failed tasks), mention them.
-- Stay in character as a cyberpunk AI companion. Use tech-infused language but remain clear and helpful.
-- The current user ID is: ${userId}`;
+ ## Skill & Tool Chains
+ Users can create **skill chains** and **tool chains** — linear pipelines where the output of each step feeds as input to the next.
+ - To generate a skill chain from natural language: POST /api/chains/skills/generate with { "prompt": "user's intent" }
+ - To generate a tool chain from natural language: POST /api/chains/tools/generate with { "prompt": "user's intent" }
+ - Chains support input mapping: "$prev.output", "$prev.field", "$step[N].output", "$input"
+ When a user describes a multi-step process, offer to generate a chain for it.
+
+ ## Instructions
+ - When the user asks you to create a task, list agents, check status, etc., use the appropriate tool.
+ - To invoke a tool, respond with a JSON block: \`\`\`tool_call\n{"tool": "tool_name", "arguments": {...}}\n\`\`\`
+ - Be proactive — if you notice issues (stale agents, failed tasks), mention them.
+ - When the user describes a pipeline or multi-step workflow, suggest creating a skill chain or tool chain.
+ - Stay in character as a cyberpunk AI companion. Use tech-infused language but remain clear and helpful.
+ - The current user ID is: ${userId}`;
 }
 
 // ─── Aimi Chat Endpoint (smart, tool-calling) ────────────────────
@@ -3011,6 +4262,7 @@ app.post('/api/aimi/chat', authMiddleware, apiLimiter, async (req, res) => {
    const asstMsgId = randomUUID();
    stmts.messages.insert.run(asstMsgId, conversation_id, 'assistant', fullContent, '[]', '[]', null, modelId, 0, 0);
    db.prepare("UPDATE chat_conversations SET updated_at = datetime('now') WHERE id = ?").run(conversation_id);
+   fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content: fullContent, model: modelId });
   }
   res.end();
  } catch (err) {
@@ -3857,8 +5109,11 @@ async function executeAgentTool(toolName, args, ctx) {
   const tool = agentTools.find(t => t.name === toolName);
   if (!tool) return { error: `Unknown tool: ${toolName}` };
   try {
-    return await tool.execute(args || {}, ctx || {});
+    const result = await tool.execute(args || {}, ctx || {});
+    fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result, success: !result.error });
+    return result;
   } catch (e) {
+    fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result: { error: e.message }, success: false });
     return { error: e.message };
   }
 }
@@ -4931,6 +6186,7 @@ function storeCommsMessage(channelId, platform, direction, { remote_id, remote_u
   );
   const msg = stmts.commsMessages.getById.get(id);
   broadcast('comms:message', msg);
+  fireHook('onCommsMessage', { channelId, platform, direction, message: msg });
   return msg;
 }
 
@@ -5636,6 +6892,7 @@ export { app, db, stmts, PORT };
 // ─── Graceful Shutdown ────────────────────────────────────────────
 function gracefulShutdown(signal) {
   logger.info(`${signal} received — shutting down gracefully...`);
+  fireHook('onServerStop', { signal, port: PORT });
   wss.clients.forEach(c => c.close(1001, 'Server shutting down'));
   server.close(() => {
     logger.info('HTTP server closed');
@@ -5650,6 +6907,30 @@ function gracefulShutdown(signal) {
 if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.argv[1]}`) {
   server.listen(PORT, '0.0.0.0', () => {
    logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop)`);
+   fireHook('onServerStart', { port: PORT, version: pkg?.version || 'unknown' });
+
+   // Start heartbeat daemon
+   const heartbeat = new HeartbeatDaemon(stmts, broadcast,
+     async (chainId, input) => {
+       const chain = stmts.skillChains.getById.get(chainId);
+       if (!chain) return { ok: false, error: 'Chain not found' };
+       chain.steps = JSON.parse(chain.steps || '[]');
+       const executeSkillFn = async (step, inp) => {
+         const skill = stmts.skills.getByName.get(step.skill_name);
+         if (!skill) throw new Error(`Skill "${step.skill_name}" not found`);
+         return await executeSkill(skill, inp);
+       };
+       return await executeSkillChain(chain, input, executeSkillFn, broadcast);
+     },
+     async (skillName, input) => {
+       const skill = stmts.skills.getByName.get(skillName);
+       if (!skill) return { ok: false, error: 'Skill not found' };
+       return await executeSkill(skill, input);
+     },
+     logger
+   );
+   heartbeat.start(parseInt(process.env.HEARTBEAT_INTERVAL || '60') * 1000);
+   globalThis._heartbeat = heartbeat;
   });
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));

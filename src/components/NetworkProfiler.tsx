@@ -739,7 +739,7 @@ func (b *WebsocketBroker) BroadcastEvent(event EventFrame) {
                     <div className="flex items-center justify-between bg-black/40 border border-zinc-850 p-2.5 rounded">
                       <div>
                         <span className="block text-[9px] font-bold text-gray-200 font-mono">BROADCAST LISTENER</span>
-                        <span className="text-[8px] text-gray-500 font-mono">ws://localhost:3000/api/v1/broadcast</span>
+                        <span className="text-[8px] text-gray-500 font-mono">ws://localhost:8080/api/v1/broadcast</span>
                       </div>
                       
                       <button

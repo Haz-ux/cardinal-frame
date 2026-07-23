@@ -11,6 +11,7 @@ const Tasks = lazy(() => import('./Tasks'));
 const Agents = lazy(() => import('./Agents'));
 const AgentGroups = lazy(() => import('./AgentGroups'));
 const DAGEditor = lazy(() => import('./DAGEditor'));
+const ChainsPage = lazy(() => import('./Chains'));
 const Users = lazy(() => import('./Users'));
 const Files = lazy(() => import('./Files'));
 const MCP = lazy(() => import('./MCP'));
@@ -25,8 +26,8 @@ const AimiLearnPage = lazy(() => import('./AimiLearn'));
 const SettingsPage = lazy(() => import('./Settings'));
 const AutomationPage = lazy(() => import('./Automation'));
 import { ToastProvider } from './ToastContext';
-import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain } from 'lucide-react';
-import CyberMascotCompanion from './CyberMascotCompanion';
+import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Link2 } from 'lucide-react';
+import AimiCanvasCompanion from './AimiCanvas';
 import { NEON, BG, FONTS } from './theme';
 
 function PublicRoute({ children }) {
@@ -74,6 +75,7 @@ function Layout() {
   { to: '/agents', icon: Bot, label: 'Agents', color: NEON.blue },
   { to: '/groups', icon: UsersRound, label: 'Groups', color: NEON.teal },
   { to: '/dags', icon: GitBranch, label: 'DAGs', color: NEON.purple },
+  { to: '/chains', icon: Link2, label: 'Chains', color: NEON.cyan },
   { to: '/schedules', icon: Clock, label: 'Schedules', color: NEON.yellow },
   { to: '/automation', icon: Activity, label: 'Automation', color: NEON.green },
   { to: '/files', icon: HardDrive, label: 'Files', color: NEON.orange },
@@ -274,6 +276,7 @@ function Layout() {
        <Route path="/agents" element={<Agents />} />
        <Route path="/groups" element={<AgentGroups />} />
        <Route path="/dags" element={<DAGEditor />} />
+       <Route path="/chains" element={<ChainsPage />} />
        <Route path="/schedules" element={<Schedules />} />
        <Route path="/automation" element={<AutomationPage />} />
        <Route path="/files" element={<Files />} />
@@ -291,7 +294,7 @@ function Layout() {
      </Suspense>
     </div>
     {/* Aimi companion */}
-    <CyberMascotCompanion />
+    <AimiCanvasCompanion />
    </main>
   </div>
  );

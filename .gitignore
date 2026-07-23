@@ -28,3 +28,24 @@ test-output/
 # OS
 Thumbs.db
 gemini_api_key.txt
+
+# Agent notes/plans/reports — never commit working docs
+*.md
+!README.md
+agent.md
+memory.md
+persona.md
+soul.md
+user.md
+state/
+data/uploads/
+audit/
+.hermes/
+
+# Test scripts and stray files
+test_endpoints.mjs
+test-plugins.mjs
+check_tables.mjs
+migrate_chat.mjs
+metadata.json
+*.log

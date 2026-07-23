@@ -4,7 +4,7 @@ import { cachedFetch } from './dataCache';
 import { usePolling } from './usePolling';
 import { useWsResource } from './useWsResource';
 import { useWebSocket } from './useWebSocket';
-import { Activity, Cpu, HardDrive, Users, ListTodo, GitBranch, Radio, Clock, Bot, Play, AlertTriangle, Trash2, Plus, Server, Zap, TrendingUp, DollarSign, BarChart3, Shield, Wifi, WifiOff, Timer, Hash, Sparkles, Plug } from 'lucide-react';
+import { Activity, Cpu, HardDrive, Users, ListTodo, GitBranch, Radio, Clock, Bot, Play, AlertTriangle, Trash2, Plus, Server, Zap, TrendingUp, DollarSign, BarChart3, Shield, Wifi, WifiOff, Timer, Hash, Sparkles, Plug, ShieldAlert, X } from 'lucide-react';
 import { NEON, BG, FONTS, GLOW } from './theme';
 
 // ─── Event icons ────────────────────────────────────────────────────
@@ -28,6 +28,7 @@ const eventIcons = {
  'group:created': <Users size={12} style={{ color: NEON.teal }} />,
  'group:broadcast': <Activity size={12} style={{ color: NEON.teal }} />,
  'connected': <Radio size={12} style={{ color: NEON.green }} />,
+ 'sentinel:alert': <ShieldAlert size={12} style={{ color: NEON.red }} />,
 };
 
 function formatEvent(msg) {
@@ -52,6 +53,7 @@ function formatEvent(msg) {
   'group:created': `Group "${p.name || p.id?.slice(0,8)}" created`,
   'group:broadcast': `Group broadcast: ${p.taskIds?.length || 0} tasks`,
   'connected': 'WebSocket connected',
+  'sentinel:alert': `SENTINEL ${p.severity?.toUpperCase()}: ${p.message}`,
  };
  return typeMap[msg.type] || msg.type;
 }
@@ -417,6 +419,54 @@ const CostTracker = memo(function CostTracker({ summary }) {
  );
 });
 
+// ─── Sentinel Alert Bar ───────────────────────────────────────────
+const SentinelAlertBar = memo(function SentinelAlertBar() {
+ const { lastMsg } = useWebSocket();
+ const [alerts, setAlerts] = useState([]);
+ const MAX_ALERTS = 12;
+
+ useEffect(() => {
+  if (!lastMsg || lastMsg.type !== 'sentinel:alert') return;
+  const p = lastMsg.payload || {};
+  setAlerts(prev => {
+   const entry = { ...p, ts: p.ts || Date.now(), id: Math.random().toString(36).slice(2) };
+   return [...prev, entry].slice(-MAX_ALERTS);
+  });
+ }, [lastMsg]);
+
+ const dismiss = (id) => setAlerts(prev => prev.filter(a => a.id !== id));
+
+ if (alerts.length === 0) return null;
+
+ const sevStyle = {
+  danger: { color: NEON.red, bg: `${NEON.red}08`, border: `${NEON.red}30`, glow: `${NEON.red}44` },
+  warning: { color: NEON.yellow, bg: `${NEON.yellow}08`, border: `${NEON.yellow}30`, glow: `${NEON.yellow}33` },
+ };
+
+ return (
+  <div className="space-y-1.5">
+   {alerts.map(a => {
+    const s = sevStyle[a.severity] || sevStyle.warning;
+    return (
+     <div key={a.id} className="flex items-start gap-2.5 px-4 py-2.5 fade-in" style={{ background: s.bg, border: `1px solid ${s.border}`, borderRadius: 10 }}>
+      <ShieldAlert size={14} style={{ color: s.color, filter: `drop-shadow(0 0 4px ${s.glow})`, marginTop: 1, flexShrink: 0 }} />
+      <div className="flex-1 min-w-0">
+       <div className="flex items-center gap-2">
+        <span className="text-[10px] font-bold tracking-wider uppercase font-hud" style={{ color: s.color }}>{a.severity}</span>
+        <span className="text-[10px] font-code" style={{ color: '#555' }}>{a.type || 'agent'}</span>
+        {a.sessionId && <span className="text-[10px] font-mono" style={{ color: '#444' }}>sess:{a.sessionId?.slice(0,8)}</span>}
+       </div>
+       <div className="text-xs font-code mt-0.5" style={{ color: '#ccc' }}>{a.message}</div>
+      </div>
+      <span className="text-[10px] shrink-0 font-code" style={{ color: '#444' }}>{new Date(a.ts).toLocaleTimeString()}</span>
+      <button onClick={() => dismiss(a.id)} style={{ color: '#444', flexShrink: 0, marginTop: 1 }}><X size={12} /></button>
+     </div>
+    );
+   })}
+  </div>
+ );
+});
+
 // ─── Main Dashboard ─────────────────────────────────────────────────
 export default function Dashboard() {
  const [summary, setSummary] = useState(null);
@@ -534,6 +584,9 @@ export default function Dashboard() {
 
    {/* ── Cost Tracking ───────────────────────────────────────── */}
    {summary && <CostTracker summary={summary} />}
+
+   {/* ── Sentinel Alerts ─────────────────────────────────────── */}
+   <SentinelAlertBar />
 
    {/* ── Quick Actions ───────────────────────────────────────── */}
    <QuickActions onAction={navigateTo} />

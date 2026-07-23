@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from './AuthContext';
 import { usePolling } from './usePolling';
-import { Puzzle, ToggleLeft, ToggleRight, Trash2, Plus, Search, ChevronDown, ChevronUp, Package, X } from 'lucide-react';
+import { Puzzle, ToggleLeft, ToggleRight, Trash2, Plus, Search, ChevronDown, ChevronUp, Package, X, RefreshCw } from 'lucide-react';
 const NEON = { cyan:'#00f0ff', blue:'#3b82f6', green:'#22c55e', yellow:'#eab308', red:'#ef4444', purple:'#a855f7', orange:'#f97316', pink:'#ec4899', teal:'#14b8a6', magenta:'#ff00ff' };
 const STATUS_STYLES = {
  active: { color: NEON.green, bg: `${NEON.green}15`, border: `${NEON.green}30` },
@@ -61,9 +61,16 @@ export default function Plugins() {
    return true;
  });
  const toggleStatus = async (plugin) => {
-   const newStatus = plugin.status === 'active' ? 'inactive' : 'active';
-   await api(`/api/plugins/${plugin.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: newStatus }) });
-   load();
+   try {
+     await api(`/api/plugins/${plugin.id}/toggle`, { method: 'PATCH' });
+     load();
+   } catch (err) { console.error('Toggle failed:', err); }
+ };
+ const reloadPlugin = async (id) => {
+   try {
+     await api(`/api/plugins/${id}/reload`, { method: 'POST' });
+     load();
+   } catch (err) { console.error('Reload failed:', err); }
  };
  const deletePlugin = async (id) => { await api(`/api/plugins/${id}`, { method: 'DELETE' }); load(); };
  const parseConfig = (plugin) => {
@@ -97,36 +104,48 @@ export default function Plugins() {
            <Puzzle size={32} className="mx-auto mb-2 opacity-30" />No plugins installed.
          </div>
        ) : filtered.map(plugin => {
-         const s = STATUS_STYLES[plugin.status] || STATUS_STYLES.inactive;
+         const isEnabled = plugin.enabled === 1 || plugin.enabled === true;
+         const s = isEnabled ? STATUS_STYLES.active : STATUS_STYLES.inactive;
          const isExpanded = expandedId === plugin.id;
          const config = parseConfig(plugin);
          return (
            <div key={plugin.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
              <div className="flex items-center gap-3 px-4 py-3 transition-colors cursor-pointer"
-
-
                onClick={() => setExpandedId(isExpanded ? null : plugin.id)}>
                <Package size={14} style={{ color: s.color }} />
                <span className="flex-1 text-sm font-semibold" style={{ color: '#ddd' }}>{plugin.name}</span>
+               {plugin.loaded && <span className="text-[10px] font-semibold" style={{ color: NEON.green }}>● loaded</span>}
                <span className="text-xs" style={{ color: '#555' }}>v{plugin.version || '0.0.0'}</span>
                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: s.bg, color: s.color, border: `1px solid ${s.border}` }}>
-                 {plugin.status}
+                 {isEnabled ? 'active' : 'inactive'}
                </span>
-               <button onClick={(e) => { e.stopPropagation(); toggleStatus(plugin); }} title={plugin.status === 'active' ? 'Disable' : 'Enable'}>
-                 {plugin.status === 'active' ? <ToggleRight size={18} style={{ color: NEON.green }} /> : <ToggleLeft size={18} style={{ color: '#555' }} />}
+               <button onClick={(e) => { e.stopPropagation(); toggleStatus(plugin); }} title={isEnabled ? 'Disable' : 'Enable'}>
+                 {isEnabled ? <ToggleRight size={18} style={{ color: NEON.green }} /> : <ToggleLeft size={18} style={{ color: '#555' }} />}
                </button>
-               <button onClick={(e) => { e.stopPropagation(); deletePlugin(plugin.id); }} className="p-1 rounded transition" style={{ color: '#555' }}
->
+               <button onClick={(e) => { e.stopPropagation(); reloadPlugin(plugin.id); }} title="Reload" className="p-1 rounded transition" style={{ color: NEON.cyan }}>
+                 <RefreshCw size={13} />
+               </button>
+               <button onClick={(e) => { e.stopPropagation(); deletePlugin(plugin.id); }} className="p-1 rounded transition" style={{ color: '#555' }}>
                  <Trash2 size={14} />
                </button>
                {isExpanded ? <ChevronUp size={14} style={{ color: '#555' }} /> : <ChevronDown size={14} style={{ color: '#555' }} />}
              </div>
              {isExpanded && (
-               <div className="px-4 py-3 text-xs" style={{ background: 'rgba(0,0,0,0.3)' }}>
-                 <div className="grid grid-cols-2 gap-2 mb-2">
-                   <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{plugin.id?.slice(0,12)}…</span></div>
-                   <div><span className="text-gray-500 block">Created</span><span style={{ color: '#888' }}>{plugin.created_at ? new Date(plugin.created_at).toLocaleString() : '—'}</span></div>
-                 </div>
+              <div className="px-4 py-3 text-xs" style={{ background: 'rgba(0,0,0,0.3)' }}>
+                <div className="grid grid-cols-2 gap-2 mb-2">
+                  <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{plugin.id?.slice(0,12)}…</span></div>
+                  <div><span className="text-gray-500 block">Created</span><span style={{ color: '#888' }}>{plugin.created_at ? new Date(plugin.created_at).toLocaleString() : '—'}</span></div>
+                </div>
+                {plugin.hooks && plugin.hooks.length > 0 && (
+                  <div className="mb-2">
+                    <span className="text-gray-500 block mb-1">Hooks</span>
+                    <div className="flex flex-wrap gap-1">
+                      {plugin.hooks.map(h => (
+                        <span key={h} className="px-2 py-0.5 rounded-full text-[10px] font-mono" style={{ background: `${NEON.cyan}10`, color: NEON.cyan, border: `1px solid ${NEON.cyan}20` }}>{h}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
                  {Object.keys(config).length > 0 && (
                    <div>
                      <span className="text-gray-500 block mb-1">Config</span>

@@ -194,7 +194,7 @@ export default function SkillsTools({ initialTab }) {
                   style={inputStyle} />
                 <select value={newSkill.category} onChange={e => setNewSkill(p => ({ ...p, category: e.target.value }))}
                   style={{ ...inputStyle, background: BG.surface }}>
-                  {['general', 'agents', 'tasks', 'llm', 'system', 'mcp', 'schedules', 'custom'].map(c => <option key={c} value={c}>{c}</option>)}
+                  {['general', 'agents', 'tasks', 'llm', 'system', 'mcp', 'schedules', 'custom', 'devops', 'development', 'coding', 'shopify', 'web-design', 'research', 'productivity', 'data', 'ai'].map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
                 <input placeholder="Handler (api, function, script)" value={newSkill.handler} onChange={e => setNewSkill(p => ({ ...p, handler: e.target.value }))}
                   style={inputStyle} />

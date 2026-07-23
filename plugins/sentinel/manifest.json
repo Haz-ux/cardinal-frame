@@ -1,0 +1,14 @@
+{
+  "name": "sentinel",
+  "version": "1.0.0",
+  "description": "Agent safety monitor - watches tool calls for dangerous patterns, infinite loops, and scope violations. Can auto-stop runaway sessions.",
+  "hooks": ["onAgentStep", "onChatMessage", "onTaskCompleted"],
+  "config": {
+    "alertWebSocket": true,
+    "autoStop": false,
+    "blockDangerousShell": true,
+    "blockMainBranch": true,
+    "maxToolCallsPer30s": 10,
+    "scope": "/home/haz/ai-workspace"
+  }
+}

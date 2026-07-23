@@ -99,7 +99,7 @@ function createRestrictedExecSync() {
  * @param {number} [opts.timeoutMs]   — timeout in ms (default 30000)
  * @returns {Promise<*>}               — the result of the executed code
  */
-export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000 }) {
+export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000, secrets = {} }) {
   const logs = [];
 
   const sandbox = {
@@ -120,6 +120,9 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
 
     // Read-only fetch passthrough (bound to global, no response mutation)
     fetch: (...args) => globalThis.fetch(...args),
+
+    // Secrets — only keys explicitly passed by the caller (never process.env directly)
+    secrets,
 
     // Debug logging (captured, not emitted to real stdout)
     console: {
@@ -144,10 +147,8 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
   // Only provide llmCall if explicitly requested (hybrid skills)
   if (llmCall) {
     sandbox.llmCall = llmCall;
-    sandbox.input = input;
-  } else {
-    sandbox.input = input;
   }
+  sandbox.input = input;
 
   // Create the V8 context
   const context = vm.createContext(sandbox, {
@@ -187,7 +188,7 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
  * Hybrid handlers are raw JS code (not a function expression) so we wrap
  * them in an async IIFE before running.
  */
-export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000 }) {
+export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000, secrets = {} }) {
   const logs = [];
 
   const sandbox = {
@@ -199,6 +200,7 @@ export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_
     Promise,
     execSync: createRestrictedExecSync(),
     fetch: (...args) => globalThis.fetch(...args),
+    secrets,
     input,
     llmCall,
     console: {

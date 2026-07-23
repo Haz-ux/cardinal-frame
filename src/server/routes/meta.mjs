@@ -387,86 +387,77 @@ setInterval(() => {
 }, 30_000);
 
 // ─── Plugins API ────────────────────────────────────────────────────
-const loadedPlugins = new Map(); // id → { module, hooks }
+// PluginLoader is imported from ctx — handles discovery, loading, unloading, reload, hook dispatch
+const { pluginLoader } = ctx;
 
-async function loadPluginFromDir(dirPath) {
- try {
-  const manifestPath = path.join(dirPath, 'manifest.json');
-  const entryPath = path.join(dirPath, 'index.mjs');
-  if (!existsSync(manifestPath) || !existsSync(entryPath)) return null;
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  const module = await import(pathToFileURL(entryPath).href);
-  return { manifest, module };
- } catch (err) {
-  logger.error(`Failed to load plugin from ${dirPath}: ${err.message}`);
-  return null;
- }
-}
-
-// Auto-load plugins from plugins/ directory on startup
-const pluginsDir = path.join(import.meta.dirname, '..', '..', 'plugins');
-if (existsSync(pluginsDir)) {
- (async () => {
-  try {
-   const entries = readdirSync(pluginsDir);
-   for (const entry of entries) {
-    const fullDir = path.join(pluginsDir, entry);
-    if (statSync(fullDir).isDirectory()) {
-     const result = await loadPluginFromDir(fullDir);
-     if (result) {
-      const { manifest, module } = result;
-      const existing = db.prepare('SELECT id FROM plugins WHERE name = ?').get(manifest.name);
-      if (!existing) {
-       const id = randomUUID();
-       stmts.plugins.insert.run(id, manifest.name, manifest.version || '1.0.0', path.join(fullDir, 'index.mjs'), 1, '{}', JSON.stringify(manifest.hooks || []));
-       loadedPlugins.set(id, { module, hooks: manifest.hooks || [] });
-       logger.info(`Plugin loaded: ${manifest.name} v${manifest.version || '1.0.0'}`);
-      }
-     }
-    }
-   }
-  } catch (err) { logger.error('Plugin auto-load error:', err); }
- })();
-}
-
-// Fire plugin hooks
-async function fireHook(hookName, data) {
- for (const [id, plugin] of loadedPlugins) {
-  if (!plugin.module[hookName]) continue;
-  const pluginRow = stmts.plugins.getById.get(id);
-  if (!pluginRow || !pluginRow.enabled) continue;
-  try {
-   await plugin.module[hookName](data, JSON.parse(pluginRow.config));
-  } catch (err) {
-   logger.error(`Plugin ${pluginRow.name} hook ${hookName} error: ${err.message}`);
-  }
- }
-}
+// Auto-discover + load plugins from plugins/ directory on startup
+pluginLoader.discover();
 
 // List plugins
 router.get('/plugins', optionalAuth, (_req, res) => {
  const plugins = stmts.plugins.getAll.all();
- res.json(plugins.map(p => ({ ...p, config: JSON.parse(p.config), hooks: JSON.parse(p.hooks), loaded: loadedPlugins.has(p.id) })));
+ res.json(plugins.map(p => ({
+   ...p,
+   config: JSON.parse(p.config || '{}'),
+   hooks: JSON.parse(p.hooks || '[]'),
+   loaded: pluginLoader.loaded.has(p.id),
+ })));
 });
 
-// Toggle plugin
-router.patch('/plugins/:id/toggle', authMiddleware, requireRole('admin'), (req, res) => {
+// Toggle plugin (syncs with in-memory loader)
+router.patch('/plugins/:id/toggle', authMiddleware, requireRole('admin'), async (req, res) => {
  const plugin = stmts.plugins.getById.get(req.params.id);
  if (!plugin) return res.status(404).json({ error: 'Plugin not found' });
  const newEnabled = plugin.enabled ? 0 : 1;
  stmts.plugins.updateEnabled.run(newEnabled, req.params.id);
+
+ // Sync with in-memory loader
+ if (newEnabled === 1 && !pluginLoader.loaded.has(req.params.id)) {
+   // Load the plugin from disk
+   await pluginLoader.loadById(req.params.id);
+ } else if (newEnabled === 0 && pluginLoader.loaded.has(req.params.id)) {
+   // Unload from memory
+   pluginLoader.unload(req.params.id);
+ }
+
  broadcast('plugin:toggled', { id: req.params.id, enabled: newEnabled });
  res.json({ id: req.params.id, enabled: newEnabled });
+});
+
+// Hot-reload a single plugin
+router.post('/plugins/:id/reload', authMiddleware, requireRole('admin'), async (req, res) => {
+ const result = await pluginLoader.reload(req.params.id);
+ if (result.error) return res.status(404).json(result);
+ res.json(result);
+});
+
+// Reload all plugins
+router.post('/plugins/reload-all', authMiddleware, requireRole('admin'), async (_req, res) => {
+ const results = await pluginLoader.reloadAll();
+ res.json({ reloaded: results.length, results });
 });
 
 // Delete plugin
 router.delete('/plugins/:id', authMiddleware, requireRole('admin'), (req, res) => {
  const plugin = stmts.plugins.getById.get(req.params.id);
  if (!plugin) return res.status(404).json({ error: 'Plugin not found' });
- loadedPlugins.delete(req.params.id);
+ pluginLoader.unload(req.params.id);
  stmts.plugins.delete.run(req.params.id);
  broadcast('plugin:deleted', { id: req.params.id });
  res.json({ deleted: true });
+});
+
+// Register a plugin in DB (for manual install — no download yet)
+router.post('/plugins', authMiddleware, requireRole('admin'), (req, res) => {
+ const { name, version, url, status, config } = req.body;
+ if (!name?.trim()) return res.status(400).json({ error: 'Plugin name required' });
+ const existing = db.prepare('SELECT id FROM plugins WHERE name = ?').get(name);
+ if (existing) return res.status(409).json({ error: 'Plugin with this name already exists' });
+ const id = randomUUID();
+ const enabled = status === 'active' ? 1 : 1;
+ stmts.plugins.insert.run(id, name.trim(), version || '1.0.0', url || 'manual', enabled, JSON.stringify(config || { source: url || 'local' }), '[]');
+ broadcast('plugin:installed', { id, name });
+ res.status(201).json({ id, name, version: version || '1.0.0', enabled: true });
 });
 
 // ─── Audit Log API ────────────────────────────────────────────────

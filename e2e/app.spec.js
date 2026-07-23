@@ -7,11 +7,11 @@ test.describe('Cardinal Frame UI', () => {
   // Login once and reuse
   test.beforeAll(async ({ browser }) => {
     const page = await browser.newPage();
-    await page.goto('http://localhost:3000/login');
+    await page.goto('http://localhost:8080/login');
     await page.fill('input[type="text"]', 'admin');
     await page.fill('input[type="password"]', 'cardinal');
     await page.getByRole('button', { name: /sign in/i }).first().click();
-    await page.waitForURL('http://localhost:3000/', { timeout: 15000 });
+    await page.waitForURL('http://localhost:8080/', { timeout: 15000 });
     await page.waitForTimeout(2000);
     // Store the localStorage token
     authCookie = await page.evaluate(() => localStorage.getItem('cf_token'));
@@ -20,9 +20,9 @@ test.describe('Cardinal Frame UI', () => {
 
   test.beforeEach(async ({ page }) => {
     // Inject auth token before navigating
-    await page.goto('http://localhost:3000/login');
+    await page.goto('http://localhost:8080/login');
     await page.evaluate((token) => localStorage.setItem('cf_token', token), authCookie);
-    await page.goto('http://localhost:3000/');
+    await page.goto('http://localhost:8080/');
     await page.waitForTimeout(1500);
   });
 
@@ -32,7 +32,7 @@ test.describe('Cardinal Frame UI', () => {
   });
 
   test('LLM Models page shows all providers', async ({ page }) => {
-    await page.goto('http://localhost:3000/llm');
+    await page.goto('http://localhost:8080/llm');
     await expect(page.locator('main').locator('text=PROVIDERS').first()).toBeVisible({ timeout: 10000 });
     await expect(page.locator('main').locator('text=OpenAI').first()).toBeVisible();
     await expect(page.locator('main').locator('text=NVIDIA').first()).toBeVisible();
@@ -41,53 +41,53 @@ test.describe('Cardinal Frame UI', () => {
   });
 
   test('LLM Models page shows detected models', async ({ page }) => {
-    await page.goto('http://localhost:3000/llm');
+    await page.goto('http://localhost:8080/llm');
     await expect(page.locator('main').locator('text=ALL MODELS').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('Tasks page', async ({ page }) => {
-    await page.goto('http://localhost:3000/tasks');
+    await page.goto('http://localhost:8080/tasks');
     await expect(page.locator('main').locator('text=New Task').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('Agents page', async ({ page }) => {
-    await page.goto('http://localhost:3000/agents');
+    await page.goto('http://localhost:8080/agents');
     await expect(page.locator('main').locator('text=Register Agent').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('Schedules page', async ({ page }) => {
-    await page.goto('http://localhost:3000/schedules');
+    await page.goto('http://localhost:8080/schedules');
     await expect(page.locator('main').locator('text=New Schedule').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('MCP page', async ({ page }) => {
-    await page.goto('http://localhost:3000/mcp');
+    await page.goto('http://localhost:8080/mcp');
     await expect(page.locator('main').locator('text=MCP Servers').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('Agent Groups page', async ({ page }) => {
-    await page.goto('http://localhost:3000/groups');
+    await page.goto('http://localhost:8080/groups');
     await expect(page.locator('main').locator('text=New Group').first()).toBeVisible({ timeout: 10000 });
   });
 
   test('DAG Editor page loads', async ({ page }) => {
-    await page.goto('http://localhost:3000/dags');
+    await page.goto('http://localhost:8080/dags');
     // Just verify the page doesn't crash — content may vary
     await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
   });
 
   test('Users page loads', async ({ page }) => {
-    await page.goto('http://localhost:3000/users');
+    await page.goto('http://localhost:8080/users');
     await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
   });
 
   test('Audit Log page loads', async ({ page }) => {
-    await page.goto('http://localhost:3000/audit');
+    await page.goto('http://localhost:8080/audit');
     await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
   });
 
   test('Neural Map page loads with SVG graph', async ({ page }) => {
-    await page.goto('http://localhost:3000/neural');
+    await page.goto('http://localhost:8080/neural');
     await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
     // Check SVG graph renders (the neural map canvas)
     await page.waitForTimeout(3000);

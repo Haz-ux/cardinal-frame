@@ -2,7 +2,7 @@
 // Cardinal Frame CLI — manage tasks, agents, DAGs, schedules from terminal
 import { randomUUID } from 'crypto';
 
-const BASE = process.env.CF_API || 'http://localhost:3000/api';
+const BASE = process.env.CF_API || 'http://localhost:8080/api';
 const TOKEN = process.env.CF_TOKEN;
 
 async function req(method, path, body) {
@@ -238,7 +238,7 @@ Commands:
   files                        List uploaded files
 
 Environment:
-  CF_API    API base URL (default: http://localhost:3000/api)
+  CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
 `);
  process.exit(0);

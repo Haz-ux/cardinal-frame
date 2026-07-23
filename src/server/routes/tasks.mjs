@@ -9,7 +9,7 @@ import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand
  */
 export default function taskRoutes(ctx) {
-  const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand } = ctx;
+  const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand, fireHook } = ctx;
   const router = express.Router();
 
   // Multer config for file uploads

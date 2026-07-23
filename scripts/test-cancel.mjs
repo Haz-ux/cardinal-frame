@@ -1,5 +1,5 @@
 async function go() {
-  const BASE = 'http://localhost:3000/api';
+  const BASE = 'http://localhost:8080/api';
   const regH = { 'Content-Type': 'application/json' };
   const reg = await (await fetch(BASE+'/auth/register', {method:'POST',headers:regH,body:JSON.stringify({username:'testcancel2',password:'test1234'})})).json();
   console.log('Register:', reg.token ? 'ok' : reg.error);

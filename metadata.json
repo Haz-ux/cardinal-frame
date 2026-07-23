@@ -1,6 +1,0 @@
-{
-  "name": "Cardinal Frame",
-  "description": "High-fidelity simulation, visualization, and design sandbox for Cardinal Frame: a low-latency, distributed framework with real-time NPU telemetry, code scaffolding, and interactive workflow profiling.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

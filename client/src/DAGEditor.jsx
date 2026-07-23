@@ -1,23 +1,30 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { api } from './AuthContext';
 import { usePolling } from './usePolling';
-import { GitBranch, Save, Plus, Trash2, AlertTriangle, CheckCircle, Play, Square, ZoomIn, ZoomOut, Maximize2, RefreshCw, X, Copy, Power, PowerOff, Layers, Split, ChevronDown } from 'lucide-react';
+import { useWebSocket } from './useWebSocket';
+import { GitBranch, Save, Plus, Trash2, AlertTriangle, CheckCircle, Play, Square, ZoomIn, ZoomOut, Maximize2, RefreshCw, X, Copy, Power, PowerOff, Layers, Split, ChevronDown, Layout, Code, Webhook, Repeat, Bell } from 'lucide-react';
 
 const NEON = { cyan:'#00f0ff', magenta:'#ff00ff', blue:'#3b82f6', purple:'#a855f7', green:'#22c55e', yellow:'#eab308', red:'#ef4444', pink:'#ec4899', orange:'#f97316', teal:'#14b8a6' };
 const BG = { base:'#050510', card:'#0a0a1e', surface:'#0f0f23' };
 
+// ─── Node Types (expanded) ────────────────────────────────────────
 const NODE_TYPES = {
-  trigger: { color: NEON.green, icon: '⚡', label: 'Trigger' },
-  task:    { color: NEON.cyan, icon: '▶', label: 'Task' },
-  condition:{ color: NEON.yellow, icon: '◆', label: 'Condition' },
-  parallel: { color: NEON.blue, icon: '⫸', label: 'Parallel' },
-  output:  { color: NEON.pink, icon: '◉', label: 'Output' },
-  delay:   { color: NEON.orange, icon: '⏱', label: 'Delay' },
+  trigger:   { color: NEON.green,  icon: '⚡', label: 'Trigger',   inputs: 0, outputs: 1 },
+  task:      { color: NEON.cyan,   icon: '▶',  label: 'Task',      inputs: 1, outputs: 1 },
+  condition: { color: NEON.yellow, icon: '◆',  label: 'Condition', inputs: 1, outputs: 2 },
+  parallel:  { color: NEON.blue,   icon: '⫸',  label: 'Parallel',  inputs: 1, outputs: 1 },
+  output:    { color: NEON.pink,   icon: '◉',  label: 'Output',    inputs: 1, outputs: 0 },
+  delay:     { color: NEON.orange, icon: '⏱',  label: 'Delay',     inputs: 1, outputs: 1 },
+  webhook:   { color: NEON.teal,   icon: '🔗', label: 'Webhook',   inputs: 0, outputs: 1 },
+  transform: { color: NEON.purple, icon: '⇄',  label: 'Transform', inputs: 1, outputs: 1 },
+  branch:    { color: NEON.magenta,icon: '⑂',  label: 'Branch',    inputs: 1, outputs: 3 },
+  loop:      { color: '#f59e0b',   icon: '↻',  label: 'Loop',      inputs: 1, outputs: 1 },
+  notify:    { color: '#ec4899',   icon: '🔔', label: 'Notify',    inputs: 1, outputs: 0 },
 };
 
 const NODE_W = 200, NODE_H = 72, PORT_R = 6;
 const PORT_GAP = 24;
-const STACK_OFFSET = 28; // pixel offset for stacked nodes
+const STACK_OFFSET = 28;
 
 // ─── SVG Glow Defs ─────────────────────────────────────────────────
 const DEFS = (
@@ -35,12 +42,16 @@ const DEFS = (
 );
 
 // ─── DAG Node (SVG) with z-index + hover stack/destack ─────────────
-const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack, stackCount, onSelect, onDragStart, onPortDown, onStack, onDestack }) {
+const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack, stackCount, onSelect, onDragStart, onPortDown, onPortUp, onStack, onDestack, running, progress }) {
   const cfg = NODE_TYPES[node.type] || NODE_TYPES.task;
   const x = node.x || 0, y = node.y || 0;
-  const hasInput = node.type !== 'trigger';
-  const outputCount = node.type === 'condition' ? 2 : 1;
+  const hasInput = cfg.inputs > 0;
+  const outputCount = cfg.outputs;
   const [hovered, setHovered] = useState(false);
+  const statusColor = node.status === 'running' ? NEON.green : node.status === 'completed' ? NEON.cyan : node.status === 'failed' ? NEON.red : '#444';
+
+  // Progress ring (when running)
+  const progressAngle = progress != null ? (progress / 100) * 360 : 0;
 
   return (
     <g transform={`translate(${x},${y})`}
@@ -48,6 +59,14 @@ const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
+      {/* Progress ring (when running) */}
+      {running && (
+        <circle cx={NODE_W/2} cy={NODE_H/2} r={NODE_H/2 + 4}
+          fill="none" stroke={NEON.green} strokeWidth="2" opacity="0.6"
+          strokeDasharray={`${(progressAngle/360) * (Math.PI * (NODE_H/2 + 4))} 999`}
+          transform={`rotate(-90 ${NODE_W/2} ${NODE_H/2})`}
+          strokeLinecap="round" />
+      )}
       {/* Shadow rect */}
       <rect width={NODE_W} height={NODE_H} rx="12"
         fill={BG.card}
@@ -57,14 +76,14 @@ const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack
         opacity={isDragging ? 1 : isTopOfStack ? 1 : 0.92}
       />
       {/* Top accent bar */}
-      <rect width={NODE_W} height="3" rx="1.5" fill={cfg.color} opacity="0.6" y="0" clipPath="inset(0 0 0 0 round 12px 12px 0 0)" />
+      <rect width={NODE_W} height="3" rx="1.5" fill={cfg.color} opacity="0.6" y="0" />
       {/* Icon + name */}
       <text x="14" y="30" fontSize="14" dominantBaseline="central">{cfg.icon}</text>
       <text x="36" y="24" fontSize="12" fontWeight="600" fill="#eee" fontFamily="sans-serif">{node.name}</text>
       <text x="36" y="42" fontSize="9" fill="#666" fontFamily="sans-serif">{cfg.label}{node.command ? ` · ${node.command.slice(0, 20)}` : ''}</text>
       {/* Status LED */}
       {node.status && (
-        <circle cx={NODE_W - 14} cy="14" r="4" fill={node.status === 'running' ? NEON.green : node.status === 'completed' ? NEON.cyan : node.status === 'failed' ? NEON.red : '#444'}>
+        <circle cx={NODE_W - 14} cy="14" r="4" fill={statusColor}>
           {node.status === 'running' && <animate attributeName="opacity" values="1;0.4;1" dur="1s" repeatCount="indefinite" />}
         </circle>
       )}
@@ -77,37 +96,38 @@ const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack
       )}
       {/* Input port */}
       {hasInput && (
-        <circle cx="0" cy={NODE_H / 2} r={PORT_R} fill={BG.base} stroke="#555" strokeWidth="1.5"
+        <circle cx="0" cy={NODE_H / 2} r={PORT_R} fill={selected ? cfg.color : BG.base} stroke="#555" strokeWidth="1.5"
           onMouseDown={e => { e.stopPropagation(); onPortDown(node.id, 'input', 0, x, y + NODE_H / 2); }}
+          onMouseUp={e => { e.stopPropagation(); onPortUp(node.id, 'input', 0); }}
           style={{ cursor: 'crosshair' }} />
       )}
       {/* Output ports */}
       {Array.from({ length: outputCount }, (_, i) => {
         const py = NODE_H / 2 + (i - (outputCount - 1) / 2) * PORT_GAP;
-        const label = node.type === 'condition' ? (i === 0 ? 'T' : 'F') : '';
+        const label = node.type === 'condition' ? (i === 0 ? 'T' : 'F') : node.type === 'branch' ? (['A','B','C'][i] || '') : '';
         return (
-          <g key={i} onMouseDown={e => { e.stopPropagation(); onPortDown(node.id, 'output', i, x + NODE_W, y + py); }} style={{ cursor: 'crosshair' }}>
-            <circle cx={NODE_W} cy={py} r={PORT_R} fill={BG.base} stroke={cfg.color} strokeWidth="1.5" />
+          <g key={i}
+            onMouseDown={e => { e.stopPropagation(); onPortDown(node.id, 'output', i, x + NODE_W, y + py); }}
+            onMouseUp={e => { e.stopPropagation(); onPortUp(node.id, 'output', i); }}
+            style={{ cursor: 'crosshair' }}>
+            <circle cx={NODE_W} cy={py} r={PORT_R} fill={selected ? cfg.color : BG.base} stroke={cfg.color} strokeWidth="1.5" />
             {label && <text x={NODE_W + 10} y={py + 3} fontSize="8" fill={cfg.color} fontWeight="700">{label}</text>}
           </g>
         );
       })}
-      {/* Click area for selection / drag */}
+      {/* Click area */}
       <rect width={NODE_W} height={NODE_H} rx="12" fill="transparent"
         onClick={e => { e.stopPropagation(); onSelect(node.id); }}
         onMouseDown={e => { if (e.button === 0) onDragStart(node.id, e); }} />
-
-      {/* Hover action icons — stack/destack */}
+      {/* Hover action icons */}
       {hovered && !isDragging && (
         <g transform={`translate(${NODE_W - 42}, 2)`}>
-          {/* Stack icon (Layers) — shown when not in a stack */}
           {stackCount <= 1 && (
             <g onClick={e => { e.stopPropagation(); onStack(node.id); }} style={{ cursor: 'pointer' }}>
               <circle cx="12" cy="12" r="10" fill={`${NEON.blue}30`} stroke={NEON.blue} strokeWidth="1" />
               <text x="12" y="13" fontSize="10" fill={NEON.blue} textAnchor="middle" dominantBaseline="central">⊞</text>
             </g>
           )}
-          {/* Destack icon (Split) — shown when in a stack */}
           {stackCount > 1 && (
             <g onClick={e => { e.stopPropagation(); onDestack(node.id); }} style={{ cursor: 'pointer' }}>
               <circle cx="12" cy="12" r="10" fill={`${NEON.orange}30`} stroke={NEON.orange} strokeWidth="1" />
@@ -120,7 +140,7 @@ const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack
   );
 });
 
-// ─── Stacked nodes visual (collapsed pile behind top node) ─────────
+// ─── Stacked Shadow ────────────────────────────────────────────────
 const StackShadow = memo(function StackShadow({ node, count }) {
   const cfg = NODE_TYPES[node.type] || NODE_TYPES.task;
   const x = node.x || 0, y = node.y || 0;
@@ -131,29 +151,47 @@ const StackShadow = memo(function StackShadow({ node, count }) {
           x={x + (i + 1) * 4} y={y + (i + 1) * 4}
           width={NODE_W} height={NODE_H} rx="12"
           fill={BG.card} stroke={`${cfg.color}15`} strokeWidth="1"
-          opacity={0.3 - i * 0.08}
-        />
+          opacity={0.3 - i * 0.08} />
       ))}
     </g>
   );
 });
 
-// ─── Bezier Edge ───────────────────────────────────────────────────
-const DAGEdge = memo(function DAGEdge({ from, to, color, active, running }) {
+// ─── Bezier Edge with arrowhead + edge label ───────────────────────
+const DAGEdge = memo(function DAGEdge({ from, to, color, active, running, label, onClick, selected }) {
   const dx = to.x - from.x;
   const cp1x = from.x + Math.max(dx * 0.4, 50);
   const cp2x = to.x - Math.max(dx * 0.4, 50);
   const d = `M${from.x},${from.y} C${cp1x},${from.y} ${cp2x},${to.y} ${to.x},${to.y}`;
 
+  // Arrowhead at target
+  const angle = Math.atan2(to.y - (to.y - 0 + (to.y - from.y) * 0.1), to.x - from.x);
+  const arrowSize = 6;
+  const ax = to.x - arrowSize * Math.cos(angle);
+  const ay = to.y - arrowSize * Math.sin(angle);
+  const a1x = ax - arrowSize * 0.5 * Math.cos(angle - Math.PI / 6);
+  const a1y = ay - arrowSize * 0.5 * Math.sin(angle - Math.PI / 6);
+  const a2x = ax - arrowSize * 0.5 * Math.cos(angle + Math.PI / 6);
+  const a2y = ay - arrowSize * 0.5 * Math.sin(angle + Math.PI / 6);
+
   return (
-    <g>
-      <path d={d} fill="none" stroke={color} strokeWidth="2" opacity={active ? 0.5 : 0.15} />
+    <g style={{ cursor: 'pointer' }} onClick={onClick}>
+      <path d={d} fill="none" stroke={color} strokeWidth={selected ? 3 : 2} opacity={active ? 0.5 : selected ? 0.4 : 0.15} />
       {active && <path d={d} fill="none" stroke={color} strokeWidth="3" opacity="0.15" filter="url(#dag-glow)" />}
       {running && (
         <path d={d} fill="none" stroke={color} strokeWidth="2.5" opacity="0.6"
           strokeDasharray="6 8" strokeDashoffset="0">
           <animate attributeName="stroke-dashoffset" from="0" to="-28" dur="1s" repeatCount="indefinite" />
         </path>
+      )}
+      {/* Arrowhead */}
+      <path d={`M${to.x},${to.y} L${a1x},${a1y} L${a2x},${a2y} Z`} fill={color} opacity={active ? 0.7 : 0.3} />
+      {/* Edge label */}
+      {label && (
+        <g>
+          <rect x={(from.x + to.x) / 2 - 16} y={(from.y + to.y) / 2 - 8} width="32" height="14" rx="4" fill={BG.base} opacity="0.8" />
+          <text x={(from.x + to.x) / 2} y={(from.y + to.y) / 2 + 1} fontSize="8" fill={color} textAnchor="middle" dominantBaseline="central">{label}</text>
+        </g>
       )}
     </g>
   );
@@ -202,10 +240,10 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
               ))}
             </div>
           </div>
-          {(type === 'task' || type === 'trigger') && (
+          {(type === 'task' || type === 'trigger' || type === 'transform' || type === 'webhook' || type === 'notify') && (
             <div>
-              <label className="text-xs text-gray-400 mb-1 block">Command</label>
-              <input value={command} onChange={e => setCommand(e.target.value)} placeholder="e.g. python run.py" className="w-full px-3 py-2 rounded-lg text-sm text-white font-mono" style={{ background: 'rgba(0,0,0,0.4)', border: `1px solid ${NEON.purple}20`, outline: 'none' }} />
+              <label className="text-xs text-gray-400 mb-1 block">{type === 'transform' ? 'Expression' : type === 'webhook' ? 'Path' : type === 'notify' ? 'Message' : 'Command'}</label>
+              <input value={command} onChange={e => setCommand(e.target.value)} placeholder={type === 'transform' ? 'e.g. $.data.map(x => x.id)' : type === 'webhook' ? '/hook/my-dag' : type === 'notify' ? 'DAG completed' : 'python run.py'} className="w-full px-3 py-2 rounded-lg text-sm text-white font-mono" style={{ background: 'rgba(0,0,0,0.4)', border: `1px solid ${NEON.purple}20`, outline: 'none' }} />
             </div>
           )}
           <div className="flex gap-2 pt-2">
@@ -218,6 +256,140 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
   );
 }
 
+// ─── Mini-map ──────────────────────────────────────────────────────
+const MINI_W = 140, MINI_H = 90, MINI_PAD = 6;
+const DagMinimap = memo(function DagMinimap({ nodes, edges, dimensions, zoom, pan, onPan }) {
+  const canvasRef = useRef(null);
+
+  const bounds = useMemo(() => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      const nx = n.x || 0, ny = n.y || 0;
+      if (nx < minX) minX = nx; if (nx + NODE_W > maxX) maxX = nx + NODE_W;
+      if (ny < minY) minY = ny; if (ny + NODE_H > maxY) maxY = ny + NODE_H;
+    }
+    if (!isFinite(minX)) { minX = 0; minY = 0; maxX = 800; maxY = 500; }
+    return { minX, minY, maxX, maxY };
+  }, [nodes]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== MINI_W * dpr) { canvas.width = MINI_W * dpr; canvas.height = MINI_H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, MINI_W, MINI_H);
+    ctx.fillStyle = 'rgba(5,5,16,0.9)';
+    ctx.fillRect(0, 0, MINI_W, MINI_H);
+    const gw = bounds.maxX - bounds.minX || 1;
+    const gh = bounds.maxY - bounds.minY || 1;
+    const sx = (MINI_W - MINI_PAD * 2) / gw;
+    const sy = (MINI_H - MINI_PAD * 2) / gh;
+    const s = Math.min(sx, sy);
+    const ox = MINI_PAD + (MINI_W - MINI_PAD * 2 - gw * s) / 2;
+    const oy = MINI_PAD + (MINI_H - MINI_PAD * 2 - gh * s) / 2;
+    for (const e of edges) {
+      const fn = nodes.find(n => n.id === e.from);
+      const tn = nodes.find(n => n.id === e.to);
+      if (!fn || !tn) continue;
+      ctx.beginPath();
+      ctx.moveTo(ox + ((fn.x || 0) + NODE_W - bounds.minX) * s, oy + ((fn.y || 0) + NODE_H/2 - bounds.minY) * s);
+      ctx.lineTo(ox + ((tn.x || 0) - bounds.minX) * s, oy + ((tn.y || 0) + NODE_H/2 - bounds.minY) * s);
+      ctx.strokeStyle = '#3333';
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+    }
+    for (const n of nodes) {
+      const cfg = NODE_TYPES[n.type] || NODE_TYPES.task;
+      const mx = ox + ((n.x || 0) + NODE_W/2 - bounds.minX) * s;
+      const my = oy + ((n.y || 0) + NODE_H/2 - bounds.minY) * s;
+      ctx.fillStyle = cfg.color + '60';
+      ctx.beginPath();
+      ctx.arc(mx, my, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const vpW = (dimensions.width / zoom) * s;
+    const vpH = (dimensions.height / zoom) * s;
+    const vpX = ox + (-pan.x / zoom - bounds.minX) * s - vpW / 2;
+    const vpY = oy + (-pan.y / zoom - bounds.minY) * s - vpH / 2;
+    ctx.strokeStyle = `${NEON.cyan}cc`;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(vpX, vpY, vpW, vpH);
+    ctx.fillStyle = `${NEON.cyan}10`;
+    ctx.fillRect(vpX, vpY, vpW, vpH);
+    ctx.strokeStyle = `${NEON.magenta}40`;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, MINI_W - 1, MINI_H - 1);
+  }, [nodes, edges, bounds, dimensions, zoom, pan]);
+
+  useEffect(() => { draw(); });
+  const handleClick = useCallback((e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const gw = bounds.maxX - bounds.minX || 1;
+    const gh = bounds.maxY - bounds.minY || 1;
+    const sx = (MINI_W - MINI_PAD * 2) / gw;
+    const sy = (MINI_H - MINI_PAD * 2) / gh;
+    const s = Math.min(sx, sy);
+    const ox = MINI_PAD + (MINI_W - MINI_PAD * 2 - gw * s) / 2;
+    const oy = MINI_PAD + (MINI_H - MINI_PAD * 2 - gh * s) / 2;
+    const gx = (px - ox) / s + bounds.minX;
+    const gy = (py - oy) / s + bounds.minY;
+    onPan({ x: -(gx - dimensions.width / (2 * zoom)) * zoom, y: -(gy - dimensions.height / (2 * zoom)) * zoom });
+  }, [bounds, dimensions, zoom, onPan]);
+
+  return (
+    <canvas ref={canvasRef} onClick={handleClick}
+      className="absolute bottom-12 right-3 rounded-lg cursor-pointer"
+      style={{ width: MINI_W, height: MINI_H, border: `1px solid ${NEON.magenta}30`, background: BG.base, backdropFilter: 'blur(4px)' }}
+      title="Click to pan" />
+  );
+});
+
+// ─── Auto-layout (simple hierarchical) ─────────────────────────────
+function autoLayout(nodes, edges) {
+  if (nodes.length === 0) return nodes;
+  // Topological sort
+  const adj = {}; nodes.forEach(n => adj[n.id] = []);
+  edges.forEach(e => { if (adj[e.from]) adj[e.from].push(e.to); });
+  const inDeg = {}; nodes.forEach(n => inDeg[n.id] = 0);
+  edges.forEach(e => { if (inDeg[e.to] != null) inDeg[e.to]++; });
+
+  const levels = {};
+  const queue = nodes.filter(n => inDeg[n.id] === 0).map(n => ({ id: n.id, level: 0 }));
+  const visited = new Set();
+  while (queue.length) {
+    const { id, level } = queue.shift();
+    if (visited.has(id)) continue;
+    visited.add(id);
+    levels[id] = Math.max(levels[id] || 0, level);
+    for (const next of (adj[id] || [])) {
+      levels[next] = Math.max(levels[next] || 0, level + 1);
+      queue.push({ id: next, level: level + 1 });
+    }
+  }
+  // Position nodes by level
+  const byLevel = {};
+  nodes.forEach(n => {
+    const lv = levels[n.id] || 0;
+    if (!byLevel[lv]) byLevel[lv] = [];
+    byLevel[lv].push(n);
+  });
+  const colW = NODE_W + 80;
+  const rowH = NODE_H + 40;
+  const result = nodes.map(n => {
+    const lv = levels[n.id] || 0;
+    const col = byLevel[lv];
+    const idx = col.indexOf(n);
+    return { ...n, x: 40 + lv * colW, y: 40 + idx * rowH + (lv % 2) * 20 };
+  });
+  return result;
+}
+
 // ─── Main DAG Editor ───────────────────────────────────────────────
 export default function DAGEditor() {
   const svgRef = useRef(null);
@@ -226,6 +398,7 @@ export default function DAGEditor() {
   const [edges, setEdges] = useState([]);
   const [showAdd, setShowAdd] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
+  const [selectedEdge, setSelectedEdge] = useState(null);
   const [validation, setValidation] = useState(null);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -235,9 +408,12 @@ export default function DAGEditor() {
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [connecting, setConnecting] = useState(null);
   const [tempLine, setTempLine] = useState(null);
-  const [stacks, setStacks] = useState({}); // { stackGroupId: [nodeId, nodeId, ...] }
+  const [stacks, setStacks] = useState({});
+  const [running, setRunning] = useState(false);
+  const [showInspector, setShowInspector] = useState(false);
 
-  // Debounced resize
+  const { lastEvent } = useWebSocket();
+
   useEffect(() => {
     const obs = new ResizeObserver(entries => {
       const { width, height } = entries[0].contentRect;
@@ -247,7 +423,6 @@ export default function DAGEditor() {
     return () => obs.disconnect();
   }, []);
 
-  // Load DAG data
   const load = useCallback(() => {
     api('/api/dags').then(data => {
       const dagList = Array.isArray(data) ? data : (data.dags || []);
@@ -264,7 +439,6 @@ export default function DAGEditor() {
 
   usePolling(load, 30000);
 
-  // Validate DAG
   const validateDAG = useCallback(() => {
     const issues = [];
     const names = new Set();
@@ -289,7 +463,6 @@ export default function DAGEditor() {
     return issues.length === 0;
   }, [nodes, edges]);
 
-  // Save DAG
   const saveDAG = useCallback(async () => {
     if (!validateDAG()) return;
     try {
@@ -311,7 +484,6 @@ export default function DAGEditor() {
   const deleteNode = useCallback(async (id) => {
     await api(`/api/dags/${id}`, { method: 'DELETE' });
     setEdges(prev => prev.filter(e => e.from !== id && e.to !== id));
-    // Remove from stacks
     setStacks(prev => {
       const next = {};
       for (const [gid, nids] of Object.entries(prev)) {
@@ -323,33 +495,24 @@ export default function DAGEditor() {
     load(); setSelectedId(null);
   }, [load]);
 
-  // ─── Stack / Destack ──────────────────────────────────────────────
   const handleStack = useCallback((nodeId) => {
-    // If a node is selected, stack this node with the selected node
     if (selectedId && selectedId !== nodeId) {
       setStacks(prev => {
         const next = { ...prev };
-        // Find if either node is already in a stack
         let targetGroup = null;
         for (const [gid, nids] of Object.entries(next)) {
-          if (nids.includes(selectedId) || nids.includes(nodeId)) {
-            targetGroup = gid; break;
-          }
+          if (nids.includes(selectedId) || nids.includes(nodeId)) { targetGroup = gid; break; }
         }
         if (targetGroup) {
-          // Merge into existing stack
           const existing = next[targetGroup] || [];
           if (!existing.includes(nodeId)) next[targetGroup] = [...existing, nodeId];
           if (!existing.includes(selectedId)) next[targetGroup] = [...existing, selectedId];
         } else {
-          // Create new stack
           const gid = `stack-${Date.now()}`;
           next[gid] = [selectedId, nodeId];
         }
         return next;
       });
-    } else {
-      // No selected node — just flag this node as stackable (UI hint)
     }
   }, [selectedId]);
 
@@ -358,52 +521,32 @@ export default function DAGEditor() {
       const next = {};
       for (const [gid, nids] of Object.entries(prev)) {
         if (nids.includes(nodeId)) {
-          // Remove this node from the stack
           const filtered = nids.filter(nid => nid !== nodeId);
           if (filtered.length > 1) next[gid] = filtered;
-          // If only 1 left, dissolve the stack
-        } else {
-          next[gid] = nids;
-        }
+        } else { next[gid] = nids; }
       }
       return next;
     });
   }, []);
 
-  // ─── Compute render order (z-index: dragged node on top, stacked nodes grouped) ──
   const renderOrder = useMemo(() => {
-    // Build reverse map: nodeId → stackGroupId
     const nodeToStack = {};
     for (const [gid, nids] of Object.entries(stacks)) {
       for (const nid of nids) nodeToStack[nid] = gid;
     }
-
-    // Separate nodes into: non-stacked, stacked (only render top of stack)
-    const stackedShown = new Set(); // nodeIds that are top-of-stack
-    const stackedHidden = new Set(); // nodeIds hidden behind stack top
-    const stackGroups = {}; // groupId → ordered nodeIds
-
+    const stackedShown = new Set(), stackedHidden = new Set();
     for (const [gid, nids] of Object.entries(stacks)) {
-      stackGroups[gid] = nids;
-      nids.forEach((nid, i) => {
-        if (i === 0) stackedShown.add(nid);
-        else stackedHidden.add(nid);
-      });
+      nids.forEach((nid, i) => { if (i === 0) stackedShown.add(nid); else stackedHidden.add(nid); });
     }
-
-    // Build render list — dragged node goes last (on top)
     const regular = nodes.filter(n => !stackedHidden.has(n.id));
-    // Sort: dragged node to end
     const sorted = [...regular].sort((a, b) => {
       if (a.id === dragNodeId) return 1;
       if (b.id === dragNodeId) return -1;
       return 0;
     });
-
-    return { sorted, stackGroups, nodeToStack, stackedHidden };
+    return { sorted, nodeToStack, stackedHidden };
   }, [nodes, stacks, dragNodeId]);
 
-  // ─── Canvas interaction handlers ─────────────────────────────────
   const handleMouseDown = useCallback((e) => {
     if (e.target === svgRef.current || e.target.tagName === 'rect' || e.target.tagName === 'pattern' || e.target.tagName === 'circle') {
       setIsPanning(true);
@@ -412,9 +555,7 @@ export default function DAGEditor() {
   }, [pan]);
 
   const handleMouseMove = useCallback((e) => {
-    if (isPanning) {
-      setPan({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
-    }
+    if (isPanning) { setPan({ x: e.clientX - panStart.x, y: e.clientY - panStart.y }); }
     if (dragNodeId) {
       const mx = (e.clientX - svgRef.current.getBoundingClientRect().left - pan.x) / zoom;
       const my = (e.clientY - svgRef.current.getBoundingClientRect().top - pan.y) / zoom;
@@ -430,10 +571,7 @@ export default function DAGEditor() {
   const handleMouseUp = useCallback(() => {
     setIsPanning(false);
     setDragNodeId(null);
-    if (connecting) {
-      setConnecting(null);
-      setTempLine(null);
-    }
+    if (connecting) { setConnecting(null); setTempLine(null); }
   }, [connecting]);
 
   const handleWheel = useCallback((e) => {
@@ -441,7 +579,6 @@ export default function DAGEditor() {
     setZoom(z => Math.max(0.3, Math.min(3, z - e.deltaY * 0.001)));
   }, []);
 
-  // Node drag start — brings node to front
   const onDragStart = useCallback((nodeId, e) => {
     if (connecting) return;
     const node = nodes.find(n => n.id === nodeId);
@@ -451,37 +588,27 @@ export default function DAGEditor() {
     const my = (e.clientY - rect.top - pan.y) / zoom;
     setDragNodeId(nodeId);
     setDragOffset({ x: mx - node.x, y: my - node.y });
-    // If this node is in a stack, destack it first
     setStacks(prev => {
       const next = {};
       for (const [gid, nids] of Object.entries(prev)) {
         if (nids.includes(nodeId)) {
-          // Pull this node out of stack when dragged
           const filtered = nids.filter(nid => nid !== nodeId);
           if (filtered.length > 1) next[gid] = filtered;
-          // dissolve stack if < 2 remain
-        } else {
-          next[gid] = nids;
-        }
+        } else { next[gid] = nids; }
       }
       return next;
     });
   }, [nodes, zoom, pan, connecting]);
 
-  // Port connection start
   const onPortDown = useCallback((nodeId, portType, portIndex, portX, portY) => {
     setConnecting({ fromId: nodeId, fromType: portType, fromIndex: portIndex, x: portX, y: portY });
   }, []);
 
-  // Port connection end
-  const handlePortUp = useCallback((nodeId, portType, portIndex) => {
+  const onPortUp = useCallback((nodeId, portType, portIndex) => {
     if (!connecting) return;
     let fromId, toId;
-    if (connecting.fromType === 'output' && portType === 'input') {
-      fromId = connecting.fromId; toId = nodeId;
-    } else if (connecting.fromType === 'input' && portType === 'output') {
-      fromId = nodeId; toId = connecting.fromId;
-    }
+    if (connecting.fromType === 'output' && portType === 'input') { fromId = connecting.fromId; toId = nodeId; }
+    else if (connecting.fromType === 'input' && portType === 'output') { fromId = nodeId; toId = connecting.fromId; }
     if (fromId && toId && fromId !== toId) {
       setEdges(prev => {
         if (prev.some(e => e.from === fromId && e.to === toId)) return prev;
@@ -492,7 +619,11 @@ export default function DAGEditor() {
     setTempLine(null);
   }, [connecting]);
 
-  // Compute edge positions from nodes
+  const deleteEdge = useCallback((from, to) => {
+    setEdges(prev => prev.filter(e => !(e.from === from && e.to === to)));
+    setSelectedEdge(null);
+  }, []);
+
   const positionedEdges = useMemo(() => {
     return edges.map(e => {
       const fromNode = nodes.find(n => n.id === e.from);
@@ -511,7 +642,6 @@ export default function DAGEditor() {
   const selectedNode = nodes.find(n => n.id === selectedId);
   const selectedCfg = selectedNode ? (NODE_TYPES[selectedNode.type] || NODE_TYPES.task) : null;
 
-  // Get stack info for a node
   const getStackInfo = useCallback((nodeId) => {
     for (const [gid, nids] of Object.entries(stacks)) {
       if (nids.includes(nodeId)) {
@@ -538,6 +668,7 @@ export default function DAGEditor() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <button onClick={() => setNodes(autoLayout(nodes, edges))} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.teal}15`, border: `1px solid ${NEON.teal}30`, color: NEON.teal }} title="Auto-arrange nodes"><Layout size={12} /> Auto Arrange</button>
           <button onClick={validateDAG} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid #333', color: '#888' }}><AlertTriangle size={12} /> Validate</button>
           <button onClick={saveDAG} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}><Save size={12} /> Save</button>
           <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.purple}15`, border: `1px solid ${NEON.purple}30`, color: NEON.purple }}><Plus size={12} /> Add Node</button>
@@ -557,7 +688,6 @@ export default function DAGEditor() {
 
       {/* SVG Canvas */}
       <div className="rounded-xl overflow-hidden relative" style={{ background: BG.base, border: '1px solid rgba(168,85,247,0.12)' }}>
-        {/* Zoom controls */}
         <div className="absolute top-3 right-3 z-10 flex items-center gap-1">
           <button onClick={() => setZoom(z => Math.min(3, z + 0.2))} className="p-1 rounded text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-colors"><ZoomIn size={12} /></button>
           <button onClick={() => setZoom(z => Math.max(0.3, z - 0.2))} className="p-1 rounded text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-colors"><ZoomOut size={12} /></button>
@@ -578,25 +708,34 @@ export default function DAGEditor() {
           style={{ cursor: isPanning ? 'grabbing' : dragNodeId ? 'grabbing' : connecting ? 'crosshair' : 'grab' }}
         >
           {DEFS}
-          {/* Dot grid background */}
           <pattern id="dag-grid" width="24" height="24" patternUnits="userSpaceOnUse">
             <circle cx="12" cy="12" r="0.6" fill="#ffffff06" />
           </pattern>
           <rect width="100%" height="100%" fill="url(#dag-grid)" />
 
           <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
-            {/* Edges (render behind nodes) */}
             {positionedEdges.map((e, i) => (
-              <DAGEdge key={`${e.from.x}-${e.from.y}-${e.to.x}-${e.to.y}-${i}`} from={e.from} to={e.to} color={e.color} active running={false} />
+              <DAGEdge key={`${e.from.x}-${e.from.y}-${e.to.x}-${e.to.y}-${i}`}
+                from={e.from} to={e.to} color={e.color}
+                active={selectedEdge?.from === e.from && selectedEdge?.to === e.to}
+                running={running}
+                selected={selectedEdge?.from === e.from && selectedEdge?.to === e.to}
+                onClick={() => setSelectedEdge({ from: e.from, to: e.to })}
+              />
             ))}
 
-            {/* Temp connection line */}
+            {selectedEdge && (
+              <g style={{ cursor: 'pointer' }} onClick={() => deleteEdge(selectedEdge.from, selectedEdge.to)}>
+                <rect x={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.x + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.x) / 2 - 20} y={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.y + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.y) / 2 - 20} width="40" height="18" rx="4" fill={`${NEON.red}20`} stroke={NEON.red} strokeWidth="1" />
+                <text x={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.x + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.x) / 2} y={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.y + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.y) / 2 - 10} fontSize="9" fill={NEON.red} textAnchor="middle" fontWeight="700">DELETE</text>
+              </g>
+            )}
+
             {connecting && tempLine && (
               <line x1={connecting.x} y1={connecting.y} x2={tempLine.x} y2={tempLine.y}
                 stroke={NEON.cyan} strokeWidth="1.5" strokeDasharray="4 4" opacity="0.6" />
             )}
 
-            {/* Stack shadows (render behind stacked nodes) */}
             {renderOrder.sorted.map(n => {
               const info = getStackInfo(n.id);
               if (info.count > 1 && info.isTop) {
@@ -605,22 +744,14 @@ export default function DAGEditor() {
               return null;
             })}
 
-            {/* Nodes — rendered in z-order (dragged node last = on top) */}
             {renderOrder.sorted.map(n => {
               const info = getStackInfo(n.id);
               return (
-                <DAGNode
-                  key={n.id}
-                  node={n}
-                  selected={selectedId === n.id}
-                  isDragging={dragNodeId === n.id}
-                  isTopOfStack={info.isTop}
-                  stackCount={info.count}
-                  onSelect={setSelectedId}
-                  onDragStart={onDragStart}
-                  onPortDown={onPortDown}
-                  onStack={handleStack}
-                  onDestack={handleDestack}
+                <DAGNode key={n.id} node={n} selected={selectedId === n.id} isDragging={dragNodeId === n.id}
+                  isTopOfStack={info.isTop} stackCount={info.count}
+                  onSelect={setSelectedId} onDragStart={onDragStart} onPortDown={onPortDown} onPortUp={onPortUp}
+                  onStack={handleStack} onDestack={handleDestack}
+                  running={n.status === 'running'} progress={n.progress}
                 />
               );
             })}
@@ -628,19 +759,22 @@ export default function DAGEditor() {
         </svg>
 
         {/* Legend */}
-        <div className="absolute bottom-3 left-3 flex items-center gap-3 text-[10px] text-gray-600">
+        <div className="absolute bottom-3 left-3 flex flex-wrap items-center gap-2 text-[10px] text-gray-600 max-w-md">
           {Object.entries(NODE_TYPES).map(([key, cfg]) => (
             <span key={key} className="flex items-center gap-1"><span>{cfg.icon}</span> {cfg.label}</span>
           ))}
-          <span className="flex items-center gap-1">⊞ Stack</span>
-          <span className="flex items-center gap-1">⊟ Destack</span>
         </div>
 
-        {/* Instructions */}
-        <div className="absolute bottom-3 right-14 text-[10px] text-gray-700">Drag nodes · Connect ports · Scroll to zoom · ⊞ to stack into workflow</div>
+        {/* Mini-map */}
+        <DagMinimap nodes={nodes} edges={edges} dimensions={dimensions} zoom={zoom} pan={pan} onPan={setPan} />
+
+        {/* Hint */}
+        <div className="absolute top-3 left-3 text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded">
+          Drag nodes · Connect ports · Click edge to delete · Scroll to zoom · Auto Arrange for layout
+        </div>
       </div>
 
-      {/* Node detail panel */}
+      {/* Node detail side panel */}
       {selectedNode && selectedCfg && (
         <div className="rounded-xl p-4" style={{ background: `${BG.card}f5`, border: `1px solid ${selectedCfg.color}25` }}>
           <div className="flex items-center justify-between mb-3">
@@ -654,14 +788,15 @@ export default function DAGEditor() {
               <button onClick={() => setSelectedId(null)} className="p-1 text-gray-600 hover:text-gray-400"><X size={14} /></button>
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-3 text-xs">
+          <div className="grid grid-cols-3 md:grid-cols-5 gap-3 text-xs">
             <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{selectedNode.id?.slice(0, 12)}…</span></div>
             {(selectedNode.type === 'task' || selectedNode.type === 'trigger') && <div><span className="text-gray-500 block">Command</span><code style={{ color: NEON.green }}>{selectedNode.command || '—'}</code></div>}
+            {selectedNode.type === 'transform' && <div><span className="text-gray-500 block">Expression</span><code style={{ color: NEON.purple }}>{selectedNode.command || '—'}</code></div>}
+            {selectedNode.type === 'webhook' && <div><span className="text-gray-500 block">Path</span><code style={{ color: NEON.teal }}>{selectedNode.command || '—'}</code></div>}
             <div><span className="text-gray-500 block">Created</span><span style={{ color: '#888' }}>{selectedNode.created_at ? new Date(selectedNode.created_at).toLocaleString() : '—'}</span></div>
             <div><span className="text-gray-500 block">Incoming</span><span style={{ color: NEON.blue }}>{edges.filter(e => e.to === selectedNode.id).length}</span></div>
             <div><span className="text-gray-500 block">Outgoing</span><span style={{ color: NEON.blue }}>{edges.filter(e => e.from === selectedNode.id).length}</span></div>
           </div>
-          {/* Connected nodes */}
           <div className="mt-3 pt-3 text-xs" style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
             <span className="text-gray-500 block mb-1">Connections</span>
             <div className="flex flex-wrap gap-1.5">

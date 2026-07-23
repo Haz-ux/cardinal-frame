@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Cardinal Frame Verification Suite — tests all Sprint 1-7 endpoints
 import { randomUUID } from 'crypto';
-const BASE = process.argv[2] || 'http://localhost:3000/api';
+const BASE = process.argv[2] || 'http://localhost:8080/api';
 let token = '';
 let adminToken = '';
 let testResults = { pass: 0, fail: 0, errors: [] };

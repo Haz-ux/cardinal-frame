@@ -44,6 +44,41 @@ const STATUS_COLORS = {
  completed: '#666', failed: NEON.red, idle: '#444', disconnected: '#333', unknown: '#555',
 };
 
+// ─── Clustering modes ─────────────────────────────────────────────
+const CLUSTER_MODES = {
+ group:       { label: 'By Group', icon: '⊞' },
+ density:     { label: 'By Density', icon: '◉' },
+ activity:    { label: 'By Activity', icon: '◎' },
+};
+
+// ─── Convex hull helpers ───────────────────────────────────────────
+function convexHull(points) {
+ if (points.length < 3) return points;
+ const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+ const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+ const lower = [];
+ for (const p of sorted) {
+  while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+  lower.push(p);
+ }
+ const upper = [];
+ for (let i = sorted.length - 1; i >= 0; i--) {
+  const p = sorted[i];
+  while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+  upper.push(p);
+ }
+ lower.pop(); upper.pop();
+ return lower.concat(upper);
+}
+
+function drawHullPath(ctx, hull) {
+ if (hull.length < 3) return;
+ ctx.beginPath();
+ ctx.moveTo(hull[0].x, hull[0].y);
+ for (let i = 1; i < hull.length; i++) ctx.lineTo(hull[i].x, hull[i].y);
+ ctx.closePath();
+}
+
 // ─── Rope length by link type ────────────
 const ROPE_LENGTHS = {
  hosts: 25, uses: 30, api: 50, registered: 40, assigned: 35,
@@ -253,6 +288,11 @@ export default function NeuralMap() {
  const [activeGroups, setActiveGroups] = useState(new Set(Object.keys(GROUP_STYLE)));
  const [dim, setDim] = useState({ w: 900, h: 600 });
  const [pinMode, setPinMode] = useState(true);
+ const [clusterMode, setClusterMode] = useState('group');
+ const [showHulls, setShowHulls] = useState(true);
+ const [pathStart, setPathStart] = useState(null);
+ const [pathResult, setPathResult] = useState(null);
+ const [lodLevel, setLodLevel] = useState(2); // 0=minimal, 1=basic, 2=full
  const containerRef = useRef();
  const animTimeRef = useRef(0);
 
@@ -310,7 +350,7 @@ export default function NeuralMap() {
   if (graphData.nodes.length > 0 && fgRef.current) {
    setTimeout(() => {
     try { fgRef.current.zoomToFit(400, 50); } catch {}
-   }, 2500);
+   }, 4000);
   }
  }, [graphData.nodes.length]);
 
@@ -319,61 +359,91 @@ export default function NeuralMap() {
 // useEffect fires AFTER the simulation's first tick — default forces
 // would already have pulled all nodes to center.
 const CLUSTER_SECTORS = { runtime: 0, models: 72, interface: 144, integrate: 216, infra: 288 };
-const CLUSTER_RADIUS = 220;
-const SATELLITE_RING = 90;
 const toRad = deg => (deg * Math.PI) / 180;
+
+// Precompute per-cluster node count so we can scale cluster radius dynamically.
+// Updated on each data load — see configureForces.
+let _clusterCounts = {};
+let _clusterRadii = {};
+
+function recomputeClusterCounts(nodes) {
+  _clusterCounts = {};
+  for (const n of nodes) {
+    const c = n.cluster || (n.id && n.id.startsWith('cluster:') ? n.id.split(':')[1] : null) || 'unclustered';
+    _clusterCounts[c] = (_clusterCounts[c] || 0) + 1;
+  }
+  // Each node needs ~40px of ring circumference to avoid overlap.
+  // radius = max(120, count * 40 / (2π)) + padding
+  _clusterRadii = {};
+  for (const [c, count] of Object.entries(_clusterCounts)) {
+    const ringCircumference = count * 44;
+    const radius = Math.max(140, ringCircumference / (2 * Math.PI) + 30);
+    _clusterRadii[c] = radius;
+  }
+}
 
 const targetXY = (d) => {
   if (d.group === 'system') return [0, 0];
   const cluster = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
   if (!cluster) {
     const a = Math.random() * 2 * Math.PI;
-    const r = 280 + Math.random() * 40;
+    const r = 320 + Math.random() * 60;
     return [Math.cos(a) * r, Math.sin(a) * r];
   }
   const angle = CLUSTER_SECTORS[cluster] ?? 0;
+  const clusterRadius = _clusterRadii[cluster] || 200;
   if (d.group === 'cluster') {
-    return [Math.cos(toRad(angle)) * CLUSTER_RADIUS, Math.sin(toRad(angle)) * CLUSTER_RADIUS];
+    return [Math.cos(toRad(angle)) * clusterRadius, Math.sin(toRad(angle)) * clusterRadius];
   }
-  const offset = ((d.id ? d.id.charCodeAt(d.id.length - 1) : 0) * 37) % 360;
-  const satAngle = toRad(angle + (offset > 180 ? offset - 360 : offset) * 0.3);
-  const satR = CLUSTER_RADIUS + SATELLITE_RING + Math.random() * 20;
-  return [Math.cos(satAngle) * satR, Math.sin(satAngle) * satR];
+  // Spread satellites in a ring around their cluster center.
+  // Use deterministic hash for angle, plus radius proportional to cluster size.
+  const hash = d.id ? d.id.split('').reduce((a, c) => a + ((a * 31) + c.charCodeAt(0)) | 0, 0) : 0;
+  const nodeCount = _clusterCounts[cluster] || 1;
+  // Spread across full 360° but bias toward the cluster's outward direction
+  const spreadAngle = toRad(angle + (hash % 360));
+  const ringR = clusterRadius + 50 + (hash % 7) * 15;
+  return [Math.cos(spreadAngle) * ringR, Math.sin(spreadAngle) * ringR];
 };
 
 function configureForces(fg, n) {
+  // Recompute cluster sizes for dynamic radius
+  recomputeClusterCounts(fg.graphData().nodes);
+
   const sim = fg.d3Force('link');
   if (sim) {
    sim.distance(l => l.ropeLen || DEFAULT_ROPE);
-   sim.strength(0.3);
+   sim.strength(0.15);  // weaker link pull so clusters can spread
   }
-  fg.d3Force('center', d3.forceCenter().strength(0.01));
-  const chargeStrength = n > 150 ? -260 : n > 80 ? -200 : n > 40 ? -160 : -120;
+  fg.d3Force('center', d3.forceCenter().strength(0.005));
+  // Stronger charge for more nodes — they need more room
+  const chargeStrength = n > 150 ? -400 : n > 80 ? -320 : n > 40 ? -260 : -200;
   fg.d3Force('charge', d3.forceManyBody()
    .strength(d => {
     const base = (GROUP_STYLE[d.group] || GROUP_STYLE.system).size;
-    const mul = d.group === 'system' ? 2.5 : 1;
-    return chargeStrength * mul * (base / 8);
+    const mul = d.group === 'system' ? 3 : d.group === 'cluster' ? 2 : 1;
+    return chargeStrength * mul * (base / 6);
    })
-   .distanceMax(600)
+   .distanceMax(800)
    .theta(0.9)
   );
+  // Bigger collision radius — nodes need more breathing room
   fg.d3Force('collision', d3.forceCollide()
-   .radius(d => (GROUP_STYLE[d.group] || GROUP_STYLE.system).size * 2.5 + 2)
-   .strength(0.9)
-   .iterations(3)
+   .radius(d => (GROUP_STYLE[d.group] || GROUP_STYLE.system).size * 4 + 6)
+   .strength(1)
+   .iterations(4)
   );
+  // Stronger positional forces so clusters actually separate
   fg.d3Force('x', d3.forceX()
    .x(d => targetXY(d)[0])
-   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.7 : 0.25)
+   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.8 : 0.45)
   );
   fg.d3Force('y', d3.forceY()
    .y(d => targetXY(d)[1])
-   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.7 : 0.25)
+   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.8 : 0.45)
   );
   fg.d3Force('radial', null);
-  fg.d3AlphaDecay(0.015);
-  fg.d3VelocityDecay(0.35);
+  fg.d3AlphaDecay(0.008);   // slower cooldown = more time to settle
+  fg.d3VelocityDecay(0.3);  // less friction = nodes travel further apart
 }
 
 // Configure d3 forces — strong repulsion so nodes spread out, not pile up
@@ -437,23 +507,117 @@ function configureForces(fg, n) {
   return counts;
  }, [graphData]);
 
+ // ─── Pathfinding (BFS shortest path) ─────────────────────────────
+ const findPath = useCallback((startId, endId) => {
+  if (!startId || !endId || startId === endId) return null;
+  const adj = new Map();
+  for (const l of filteredData.links) {
+   const sId = l.source?.id ?? l.source;
+   const tId = l.target?.id ?? l.target;
+   if (!adj.has(sId)) adj.set(sId, []);
+   if (!adj.has(tId)) adj.set(tId, []);
+   adj.get(sId).push(tId);
+   adj.get(tId).push(sId);
+  }
+  const visited = new Set([startId]);
+  const queue = [[startId]];
+  while (queue.length) {
+   const path = queue.shift();
+   const node = path[path.length - 1];
+   if (node === endId) return path;
+   for (const next of (adj.get(node) || [])) {
+    if (!visited.has(next)) { visited.add(next); queue.push([...path, next]); }
+   }
+  }
+  return null;
+ }, [filteredData]);
+
+ // Handle path start/end selection
+ const handlePathClick = useCallback((node) => {
+  if (!pathStart) {
+   setPathStart(node);
+   setPathResult(null);
+  } else if (pathStart.id === node.id) {
+   setPathStart(null);
+   setPathResult(null);
+  } else {
+   const path = findPath(pathStart.id, node.id);
+   setPathResult(path ? { path, nodes: path.map(id => filteredData.nodes.find(n => n.id === id)).filter(Boolean) } : { path: [], nodes: [] });
+   setPathStart(null);
+  }
+ }, [pathStart, findPath, filteredData]);
+
+ // ─── Export functions ────────────────────────────────────────────
+ const exportPNG = useCallback(() => {
+  const fg = fgRef.current;
+  if (!fg) return;
+  const canvas = fg.container?.querySelector('canvas');
+  if (!canvas) return;
+  const link = document.createElement('a');
+  link.download = 'neural-map.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+ }, []);
+
+ const exportJSON = useCallback(() => {
+  const data = JSON.stringify({ nodes: filteredData.nodes.map(n => ({ id: n.id, name: n.name, group: n.group, cluster: n.cluster })), links: filteredData.links.map(l => ({ source: l.source?.id || l.source, target: l.target?.id || l.target, type: l.type })) }, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const link = document.createElement('a');
+  link.download = 'neural-map.json';
+  link.href = URL.createObjectURL(blob);
+  link.click();
+ }, [filteredData]);
+
+ // ─── LOD (Level of Detail) — adjust rendering based on zoom & node count ─
+ const computedLOD = useMemo(() => {
+  const zoom = fgRef.current?.zoom?.() ?? 1;
+  const count = filteredData.nodes.length;
+  if (count > 200 || zoom < 0.4) return 0; // minimal
+  if (count > 100 || zoom < 0.8) return 1;  // basic
+  return 2; // full
+ }, [filteredData.nodes.length]);
+
+ // ─── Cluster hulls for canvas overlay ─────────────────────────────
+ const clusterHulls = useMemo(() => {
+  if (!showHulls) return [];
+  const byCluster = {};
+  for (const n of filteredData.nodes) {
+   if (typeof n.x !== 'number') continue;
+   const c = n.cluster || (n.id && n.id.startsWith('cluster:') ? n.id.split(':')[1] : null) || n.group || 'unclustered';
+   if (!byCluster[c]) byCluster[c] = [];
+   byCluster[c].push({ x: n.x, y: n.y, color: (GROUP_STYLE[n.group] || GROUP_STYLE.system).color });
+  }
+  const hulls = [];
+  for (const [cluster, points] of Object.entries(byCluster)) {
+   if (points.length < 3) continue;
+   const hull = convexHull(points);
+   const color = points[0]?.color || NEON.magenta;
+   hulls.push({ cluster, hull, color, count: points.length });
+  }
+  return hulls;
+ }, [filteredData, showHulls]);
+
  // ─── Custom Canvas Renderer ─────────────────────────────────────
  const nodePaint = useCallback(({ id, name, group, status, isDefault, modelCount }, ctx, globalScale) => {
   const style = GROUP_STYLE[group] || GROUP_STYLE.system;
   const isHovered = hoverNode?.id === id;
   const isNeighbor = hoverNode ? hoverNeighbors.has(id) : true;
   const isSelected = selectedNode?.id === id;
+  const isPathStart = pathStart?.id === id;
+  const isOnPath = pathResult?.path?.includes(id);
   const opacity = hoverNode ? (isNeighbor ? 1 : 0.06) : 1;
+  const useLOD = computedLOD === 0;
 
   const baseR = style.size;
   const r = baseR * (isHovered ? 1.8 : isDefault ? 1.3 : 1);
 
-  // Outer glow
-  if ((style.glow || isHovered || isSelected) && opacity > 0.3) {
-   const glowR = r + (style.glow ? 14 : 10);
+  // Outer glow (skip at LOD 0 for performance)
+  if (!useLOD && ((style.glow || isHovered || isSelected || isOnPath) && opacity > 0.3)) {
+   const glowR = r + (style.glow ? 14 : 10) + (isOnPath ? 6 : 0);
    const gradient = ctx.createRadialGradient(0, 0, r, 0, 0, glowR);
-   gradient.addColorStop(0, style.color + '35');
-   gradient.addColorStop(1, style.color + '00');
+   const glowColor = isOnPath ? NEON.cyan : isPathStart ? NEON.yellow : style.color;
+   gradient.addColorStop(0, glowColor + '35');
+   gradient.addColorStop(1, glowColor + '00');
    ctx.beginPath();
    ctx.arc(0, 0, glowR, 0, 2 * Math.PI);
    ctx.fillStyle = gradient;
@@ -497,8 +661,8 @@ function configureForces(fg, n) {
    ctx.stroke();
   }
 
-  // Label
-  const showLabel = globalScale > 1.2 || isHovered || isSelected || group === 'system' || group === 'provider' || group === 'user' || group === 'agent';
+  // Label (respect LOD — hide labels at LOD 0)
+  const showLabel = !useLOD && (globalScale > 1.2 || isHovered || isSelected || isPathStart || isOnPath || group === 'system' || group === 'provider' || group === 'user' || group === 'agent');
   if (showLabel && opacity > 0.2) {
    const fontSize = Math.max(7, 10 / globalScale);
    ctx.font = `${isHovered || isSelected ? 'bold ' : ''}${fontSize}px "Share Tech Mono", "Fira Code", monospace`;
@@ -511,7 +675,7 @@ function configureForces(fg, n) {
    if (group === 'provider' && modelCount) label += ` (${modelCount})`;
    ctx.fillText(label, 0, r + 4);
   }
- }, [hoverNode, hoverNeighbors, selectedNode]);
+ }, [hoverNode, hoverNeighbors, selectedNode, pathStart, pathResult, computedLOD]);
 
  // ─── Custom Link Renderer ────────────────
  const neighborMapRef = useRef(neighborMap);
@@ -551,14 +715,29 @@ function configureForces(fg, n) {
 
  const linkCanvasObjectMode = useCallback(() => 'replace', []);
 
- // Click handler
+ // Click handler — supports pathfinding mode
  const handleNodeClick = useCallback(node => {
+  // If pathfinding mode is active (pathStart set, or path button was clicked)
+  if (pathStart !== null || pathResult !== null) {
+   if (!pathStart) {
+    setPathStart(node);
+    return;
+   }
+   if (pathStart.id === node.id) {
+    setPathStart(null);
+    return;
+   }
+   const path = findPath(pathStart.id, node.id);
+   setPathResult(path ? { path, nodes: path.map(id => filteredData.nodes.find(n => n.id === id)).filter(Boolean) } : { path: [], nodes: [] });
+   setPathStart(null);
+   return;
+  }
   setSelectedNode(prev => prev?.id === node.id ? null : node);
   if (fgRef.current) {
    fgRef.current.centerAt(node.x, node.y, 600);
    fgRef.current.zoom(2.5, 600);
   }
- }, []);
+ }, [pathStart, pathResult, findPath, filteredData.nodes]);
 
  // Right-click to fit all
  const handleNodeRightClick = useCallback((node, e) => {
@@ -677,6 +856,31 @@ function configureForces(fg, n) {
       <Filter size={14} />
      </button>
      <button onClick={load} className="p-1.5 rounded-lg text-gray-500 hover:text-magenta-400 hover:bg-white/5 transition-colors"><RefreshCw size={14} /></button>
+     <div className="w-px h-4 bg-gray-800" />
+     {/* Cluster mode selector */}
+     <select value={clusterMode} onChange={e => setClusterMode(e.target.value)}
+      className="text-[10px] rounded-lg bg-black/40 text-gray-400 outline-none px-2 py-1"
+      style={{ border: `1px solid ${NEON.magenta}20` }} title="Clustering mode">
+      {Object.entries(CLUSTER_MODES).map(([key, mode]) => (
+       <option key={key} value={key}>{mode.icon} {mode.label}</option>
+      ))}
+     </select>
+     <button onClick={() => setShowHulls(v => !v)} className="p-1.5 rounded-lg transition-colors"
+      style={{ border: showHulls ? `1px solid ${NEON.cyan}40` : '1px solid transparent', color: showHulls ? NEON.cyan : '#555' }}
+      title="Toggle cluster hulls">
+      <span className="text-[10px]">⊕</span> Hulls
+     </button>
+     <button onClick={() => { setPathStart(null); setPathResult(null); }} className="p-1.5 rounded-lg text-gray-500 hover:text-yellow-400 hover:bg-white/5 transition-colors"
+      style={{ border: pathStart ? `1px solid ${NEON.yellow}40` : '1px solid transparent', color: pathStart ? NEON.yellow : '#555' }}
+      title="Pathfinding: click two nodes">
+      <span className="text-[10px]">→</span> Path
+     </button>
+     <button onClick={exportPNG} className="p-1.5 rounded-lg text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-colors" title="Export PNG">
+      <span className="text-[10px]">PNG</span>
+     </button>
+     <button onClick={exportJSON} className="p-1.5 rounded-lg text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-colors" title="Export JSON">
+      <span className="text-[10px]">JSON</span>
+     </button>
     </div>
    </div>
 
@@ -740,11 +944,11 @@ function configureForces(fg, n) {
       onNodeDoubleClick={handleNodeDoubleClick}
       onBackgroundClick={() => setSelectedNode(null)}
       backgroundColor={BG.base}
-      warmupTicks={0}
-      cooldownTicks={200}
-      cooldownTime={8000}
-      d3AlphaDecay={0.012}
-      d3VelocityDecay={0.4}
+      warmupTicks={50}
+      cooldownTicks={300}
+      cooldownTime={15000}
+      d3AlphaDecay={0.008}
+      d3VelocityDecay={0.3}
       onEngineTick={() => {
         // One-shot force configuration on the very first tick.
         // Custom forces must be installed here because useEffect runs
@@ -877,6 +1081,47 @@ function configureForces(fg, n) {
      </div>
     </div>
    )}
+
+  {/* Pathfinding result panel */}
+  {(pathStart || pathResult) && (
+   <div className="rounded-xl p-4" style={{ background: `${BG.card}f5`, border: `1px solid ${NEON.yellow}25` }}>
+    <div className="flex items-center justify-between mb-2">
+     <div className="flex items-center gap-2">
+      <span className="text-[10px] font-bold" style={{ color: NEON.yellow }}>→ PATHFIND</span>
+      {pathStart && <span className="text-xs text-gray-400">Start: <span style={{ color: NEON.yellow }}>{pathStart.name}</span> — select end node</span>}
+      {pathResult?.path?.length > 0 && <span className="text-xs text-gray-400">{pathResult.path.length - 1} hops · {pathResult.path.length} nodes</span>}
+      {pathResult && pathResult.path.length === 0 && <span className="text-xs" style={{ color: NEON.red }}>No path found</span>}
+     </div>
+     <button onClick={() => { setPathStart(null); setPathResult(null); }} className="text-gray-600 hover:text-gray-400"><X size={14} /></button>
+    </div>
+    {pathResult?.nodes?.length > 0 && (
+     <div className="flex flex-wrap gap-1.5">
+      {pathResult.nodes.map((n, i) => {
+       const style = GROUP_STYLE[n.group] || GROUP_STYLE.system;
+       return (
+        <React.Fragment key={n.id}>
+         {i > 0 && <span className="text-gray-600 self-center">→</span>}
+         <span className="px-2 py-0.5 rounded text-[10px] cursor-pointer" style={{ background: `${style.color}10`, color: style.color, border: `1px solid ${style.color}20` }} onClick={() => { const fn = filteredData.nodes.find(nn => nn.id === n.id); if (fn) handleNodeClick(fn); }}>{n.name}</span>
+        </React.Fragment>
+       );
+      })}
+     </div>
+    )}
+   </div>
+  )}
+
+  {/* Cluster hull legend (when hulls are on) */}
+  {showHulls && clusterHulls.length > 0 && (
+   <div className="flex flex-wrap gap-2 text-[10px] text-gray-600">
+    {clusterHulls.slice(0, 8).map(h => (
+     <span key={h.cluster} className="flex items-center gap-1">
+      <span className="w-2 h-2 rounded-sm" style={{ background: h.color + '30', border: `1px solid ${h.color}` }} />
+      {h.cluster} ({h.count})
+     </span>
+    ))}
+    {clusterHulls.length > 8 && <span>+{clusterHulls.length - 8} more</span>}
+   </div>
+  )}
   </div>
  );
 }
