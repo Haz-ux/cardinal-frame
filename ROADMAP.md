@@ -26,6 +26,10 @@
 - [x] 3.2 Enforcement points in DAG/chain executor (`chains.mjs` governance param)
 - [x] 3.3 Audit trail integration with trace system (trace_id column + query)
 
+### Phase 4 — Post-roadmap features (Jul 2026)
+- [x] 4.1 P2 memory summarization — `?summary=true` on memory/search routes (`memory.mjs`)
+- [x] 4.2 Job catalog — reusable task templates + AI-suggested patterns from history (`job-catalog.mjs`)
+
 ---
 
 ## Principles
