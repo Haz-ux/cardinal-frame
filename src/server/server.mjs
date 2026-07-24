@@ -49,6 +49,7 @@ import llmRoutes, { initOllama } from './routes/llm.mjs';
 import agentRoutes, { callAgentLLM, agentTools } from './routes/agent.mjs';
 import commsRoutes from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
+import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain } from './chains.mjs';
@@ -620,6 +621,11 @@ db.exec(`
 
   INSERT OR IGNORE INTO users (id, username, password_hash, role)
   VALUES ('haz-001', 'Haz', '${hazHash}', 'admin');
+
+  INSERT OR IGNORE INTO personas (id, agent_id, name, description, soul, permissions, constraints, enabled)
+  VALUES ('persona-default', NULL, 'Default', 'Baseline governance — allows all actions with audit logging',
+    '{"identity":"Cardinal Frame agent","principles":["Be helpful","Be safe","Be transparent"],"boundaries":["Never expose secrets","Never modify system files"],"escalation":{"require_approval_for":["rm","sudo","chmod","chown","mkfs"],"auto_approve":["echo","ls","cat","pwd","date","grep","wc"]}}',
+    '[]', '[]', 1);
   `);
 
   // ─── Schema Migrations (add columns to existing DBs) ──────────
@@ -864,6 +870,7 @@ const stmts = {
        getRecent: db.prepare("SELECT * FROM token_usage ORDER BY created_at DESC LIMIT 50"),
       },
       traces: initTracing(db),
+      governance: initGovernance(db),
       fileWatchers: {
        insert: db.prepare('INSERT INTO file_watchers (id, path, recursive, trigger_skill, enabled) VALUES (?, ?, ?, ?, ?)'),
        getAll: db.prepare('SELECT * FROM file_watchers ORDER BY created_at DESC'),
@@ -1261,6 +1268,7 @@ const ctx = {
   getDevSetting, getDevSettings,
   runSandboxed, runSandboxedHybrid,
   getModelCost, buildAimiSystemPrompt,
+  checkPermission, auditLog,
   // These are populated later (declared with const/let below)
   get collectTelemetry() { return collectTelemetry; },
   get telemetryCache() { return telemetryCache; },
@@ -1299,6 +1307,7 @@ app.use('/api', llmRoutes(ctx));
 app.use('/api', agentRoutes(ctx));
 app.use('/api', commsRoutes(ctx));
 app.use('/api', tracesRoutes(ctx));
+app.use('/api', governanceRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
@@ -1335,8 +1344,8 @@ app.post('/api/jobs/:id/retry', authMiddleware, requireRole('admin'), apiLimiter
 // ─── Code Execution Sandbox ──────────────────────────────────────
 app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
  try {
-  // execSync is injected by the skill runtime
   const { code, language = 'javascript' } = req.body;
+  auditLog(stmts, req.user.username, 'sandbox:execute', language, { code_length: code.length });
   const fs = await import('fs');
   const tmpFile = path.join(os.tmpdir(), `cf_sandbox_${Date.now()}.${language === 'python' ? 'py' : 'mjs'}`);
   await fs.promises.writeFile(tmpFile, code);
