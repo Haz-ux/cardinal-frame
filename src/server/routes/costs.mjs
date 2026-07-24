@@ -31,8 +31,11 @@ const MODEL_PRICING = {
 };
 
 export function getModelCost(modelId, promptTokens, completionTokens) {
-  for (const [key, pricing] of Object.entries(MODEL_PRICING)) {
-    if (modelId.includes(key)) return (promptTokens/1e6*pricing[0]) + (completionTokens/1e6*pricing[1]);
+  // Sort keys by descending length so more specific matches win
+  // (e.g. 'gpt-4o-mini' matches before 'gpt-4o')
+  const sortedKeys = Object.keys(MODEL_PRICING).sort((a, b) => b.length - a.length);
+  for (const key of sortedKeys) {
+    if (modelId.includes(key)) return (promptTokens/1e6*MODEL_PRICING[key][0]) + (completionTokens/1e6*MODEL_PRICING[key][1]);
   }
   if (modelId.includes('local') || modelId.includes('ollama')) return 0;
   return (promptTokens/1e6*1) + (completionTokens/1e6*3);

@@ -89,8 +89,10 @@ export default function tracesRoutes(ctx) {
   const { stmts, authMiddleware, requireRole } = ctx;
   const router = express.Router();
 
-  // All trace endpoints require admin
-  router.use(authMiddleware, requireRole('admin'));
+  // All trace endpoints require admin — scoped to /traces path
+  // (router.use(authMiddleware) without a path would run for ALL requests
+  //  reaching this router, causing 401 on unmatched paths before the 404 catch-all)
+  router.use('/traces', authMiddleware, requireRole('admin'));
 
   // GET /api/traces/summary?period=-24 hours
   router.get('/traces/summary', (req, res) => {
