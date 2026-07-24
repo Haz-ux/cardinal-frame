@@ -1,4 +1,5 @@
 import express from 'express';
+import { GraphResponseSchema } from '../../shared/schemas.mjs';
 
 /**
  * Graph routes: /api/graph, /api/graph/core, /api/graph/expand
@@ -326,11 +327,20 @@ router.get('/graph', optionalAuth, async (_req, res) => {
    }
  }
 
- res.json({ nodes, links, meta: {
-   clusterHeads: Object.keys(CLUSTERS),
-   version: 2,
-   generated: Date.now(),
- }});
+   // Validate response against shared schema (strips unknown keys, catches drift)
+   const payload = { nodes, links, meta: {
+     clusterHeads: Object.keys(CLUSTERS),
+     version: 2,
+     generated: Date.now(),
+   }};
+   const validated = GraphResponseSchema.safeParse(payload);
+   if (!validated.success) {
+     logger?.warn?.('Graph response schema validation failed:', validated.error.issues.slice(0, 5));
+     // Still send the payload — don't break the UI for a schema mismatch
+     res.json(payload);
+   } else {
+     res.json(validated.data);
+   }
 });
 
 // ─── Graph: Core entities only (galaxy seed view) ──────────────────

@@ -7,10 +7,7 @@ export default defineConfig({
     include: ['tests/**/*.test.{js,mjs}'],
     testTimeout: 15000,
     hookTimeout: 15000,
-    // Sequential — each test file gets its own process + temp DB
+    // Each test file gets its own process + temp DB
     pool: 'forks',
-    poolOptions: {
-      forks: { singleFork: false },
-    },
   },
 });

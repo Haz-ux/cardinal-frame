@@ -7,26 +7,38 @@ AI agent orchestration platform with neural map, task automation, skill sandbox,
 - **Server:** Node.js + Express, single `server.mjs` entry point
 - **Database:** SQLite with WAL mode, 50 tables, better-sqlite3 (synchronous)
 - **Client:** Vite + React + Tailwind, code-split with lazy loading
-- **Bundle:** 796KB total, 51.8KB entry, 29 chunks
+- **Bundle:** 810KB total, 51.8KB entry, code-split with lazy loading
+
+## Shared Types
+- `src/shared/schemas.mjs` — Zod schemas for all API contract shapes (Node, Link, Agent, Task, DAG, Skill, LlmProvider, TokenUsage, User, etc.)
+- Single source of truth — server validates outbound responses, client imports for runtime validation
+- API boundary validation catches field drift without compile-time coupling
 
 ## Server Architecture
 ```
-src/server/
-├── server.mjs          # Main server — Express app, routes, DB, WebSocket
-├── migrator.mjs        # Lightweight SQL migration runner
-├── migrations/         # Versioned .sql files (001–004)
-├── chains.mjs          # Skill/tool chain execution engine
-├── evolution.mjs       # Auto-skill authoring, chain promotion, 15-pattern scanner
-├── heartbeat.mjs       # Heartbeat daemon with vm sandbox condition eval
-├── plugins.mjs         # Plugin loader
-├── validate.mjs        # Zod input validation middleware
-└── routes/
-    ├── auth.mjs        # Login, register, JWT
-    ├── dashboard.mjs   # Telemetry, summary, usage, cost-series
-    ├── graph.mjs       # Neural map graph data
-    ├── tasks.mjs       # Tasks, agents, DAGs
-    ├── meta.mjs        # MCP servers, groups, audit
-    └── sandbox.mjs     # Sandboxed code execution
+src/
+├── shared/
+│   └── schemas.mjs     # Zod schemas — single source of truth for API types
+├── server/
+│   ├── server.mjs      # Lean bootstrap — Express app, DB init, route mounts
+│   ├── migrator.mjs    # Lightweight SQL migration runner
+│   ├── migrations/     # Versioned .sql files (001–004)
+│   ├── chains.mjs      # Skill/tool chain execution engine
+│   ├── evolution.mjs   # Auto-skill authoring, chain promotion, 15-pattern scanner
+│   ├── heartbeat.mjs   # Heartbeat daemon with vm sandbox condition eval
+│   ├── plugins.mjs     # Plugin loader
+│   ├── validate.mjs    # Zod input validation middleware
+│   └── routes/         # 26 route modules (one per domain)
+│       ├── _ctx.mjs    # Shared ctx deps proxy
+│       ├── auth.mjs    # Login, register, JWT
+│       ├── dashboard.mjs   # Telemetry, summary, usage, cost-series
+│       ├── graph.mjs   # Neural map graph data (validates via shared schemas)
+│       ├── tasks.mjs   # Tasks, agents, DAGs
+│       ├── agent.mjs   # Agent loop, sessions, actions
+│       ├── comms.mjs   # Telegram/Discord channels, dispatch, webhooks
+│       └── ...         # skills, chains, evolution, llm, memory, etc.
+└── cli/
+    └── cardinal.mjs    # CLI tool
 ```
 
 ## Client Architecture
