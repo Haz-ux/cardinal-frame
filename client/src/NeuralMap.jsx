@@ -3,8 +3,9 @@ import ForceGraph2D from 'react-force-graph-2d';
 import * as d3 from 'd3-force';
 import { cachedFetch } from './dataCache';
 import { useWebSocket } from './useWebSocket';
+import { ActivityFeed, useActivityFeed } from './ActivityOverlay';
 import { usePolling } from './usePolling';
-import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle } from 'lucide-react';
+import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity } from 'lucide-react';
 
 const NEON = { cyan:'#00f0ff', magenta:'#ff00ff', blue:'#3b82f6', purple:'#a855f7', green:'#22c55e', yellow:'#eab308', red:'#ef4444', pink:'#ec4899', orange:'#f97316', teal:'#14b8a6' };
 const BG = { base:'#050510', card:'#0f0f23' };
@@ -285,6 +286,7 @@ export default function NeuralMap() {
  const [hoverNode, setHoverNode] = useState(null);
  const [selectedNode, setSelectedNode] = useState(null);
  const [showFilters, setShowFilters] = useState(true);
+ const [showActivity, setShowActivity] = useState(false);
  const [activeGroups, setActiveGroups] = useState(new Set(Object.keys(GROUP_STYLE)));
  const [dim, setDim] = useState({ w: 900, h: 600 });
  const [pinMode, setPinMode] = useState(true);
@@ -360,6 +362,9 @@ export default function NeuralMap() {
    fgRef.current.d3ReheatSimulation();
   }
  }, [lastEvent]);
+
+ // Activity feed
+ const activity = useActivityFeed();
 
  // Auto-fit graph on data load
  useEffect(() => {
@@ -897,6 +902,12 @@ function configureForces(fg, n) {
      <button onClick={exportJSON} className="p-1.5 rounded-lg text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-colors" title="Export JSON">
       <span className="text-[10px]">JSON</span>
      </button>
+     <div className="w-px h-4 bg-gray-800" />
+     <button onClick={() => setShowActivity(v => !v)} className="p-1.5 rounded-lg transition-colors"
+      style={{ border: showActivity ? `1px solid ${NEON.green}40` : '1px solid transparent', color: showActivity ? NEON.green : '#555' }}
+      title="Toggle live activity feed">
+      <Activity size={14} />
+     </button>
     </div>
    </div>
 
@@ -1003,6 +1014,20 @@ function configureForces(fg, n) {
      <button onClick={fitAll} className="p-1.5 rounded-lg bg-black/70 backdrop-blur-sm text-gray-500 hover:text-white hover:bg-white/5 transition-all" style={{ border: '1px solid #222' }}><Maximize2 size={14} /></button>
      <button onClick={zoomIn} className="p-1.5 rounded-lg bg-black/70 backdrop-blur-sm text-gray-500 hover:text-white hover:bg-white/5 transition-all" style={{ border: '1px solid #222' }}><ZoomIn size={14} /></button>
     </div>
+
+    {/* Live Activity Feed overlay */}
+    {showActivity && (
+     <div className="absolute top-3 right-3 w-72 max-w-[60%]" style={{ animation: 'fadeIn 0.2s ease' }}>
+      <ActivityFeed
+        events={activity.events}
+        connected={activity.connected}
+        paused={activity.paused}
+        setPaused={activity.setPaused}
+        clear={activity.clear}
+        compact
+      />
+     </div>
+    )}
 
     {/* Minimap — shows full graph bounding box + current viewport rectangle.
         Renders node dots + a cyan viewport rect. Click to pan. */}

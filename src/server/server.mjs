@@ -29,6 +29,7 @@ import dashboardRoutes from './routes/dashboard.mjs';
 import graphRoutes from './routes/graph.mjs';
 import taskRoutes from './routes/tasks.mjs';
 import jobCatalogRoutes from './routes/job-catalog.mjs';
+import activityRoutes from './routes/activity.mjs';
 import metaRoutes from './routes/meta.mjs';
 import { runSandboxed, runSandboxedHybrid } from './routes/sandbox.mjs';
 import usersRoutes from './routes/users.mjs';
@@ -1153,6 +1154,8 @@ function broadcast(type, payload) {
   for (const ws of wss.clients) {
     if (ws.readyState === 1) ws.send(msg);
   }
+  // Log activity for the live overlay feed
+  if (ctx.logActivity) ctx.logActivity(type, payload);
   logger.info(`WS broadcast: ${type}`);
 }
 
@@ -1329,6 +1332,7 @@ app.use('/api', dashboardRoutes(ctx));
 app.use('/api', graphRoutes(ctx));
 app.use('/api', taskRoutes(ctx));
 app.use('/api', jobCatalogRoutes(ctx));
+app.use('/api', activityRoutes(ctx));
 app.use('/api', metaRoutes(ctx));
 app.use('/api', usersRoutes(ctx));
 app.use('/api', stateRoutes(ctx));
