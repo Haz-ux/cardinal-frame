@@ -36,6 +36,7 @@ gemini_api_key.txt
 !CONTRIBUTING.md
 !docs/adr/
 !docs/adr/**
+!ROADMAP.md
 agent.md
 memory.md
 persona.md
