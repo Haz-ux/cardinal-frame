@@ -50,4 +50,7 @@ test-plugins.mjs
 check_tables.mjs
 migrate_chat.mjs
 metadata.json
-*.log
+
+# Dead artifacts
+*.bak
+test-results/
