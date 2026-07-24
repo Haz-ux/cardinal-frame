@@ -89,7 +89,14 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(compression());
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    const type = res.getHeader('Content-Type');
+    if (type && (String(type).includes('text/event-stream') || String(type).includes('image/'))) return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // ─── Security headers ──────────────────────────────────────────
@@ -953,6 +960,7 @@ const stmts = {
         tokenUsage: db.prepare(`SELECT COALESCE(SUM(prompt_tokens),0) as pt, COALESCE(SUM(completion_tokens),0) as ct FROM token_usage`),
       },
       graph: {
+        // Per-row statements kept for backward compat with /graph/core & /graph/expand
         modelCountByProvider: db.prepare('SELECT COUNT(*) as c FROM llm_models WHERE provider_id = ?'),
         modelProvider: db.prepare('SELECT provider_id FROM llm_models WHERE model_id = ? OR display_name = ?'),
         agentGroups: db.prepare('SELECT id, name FROM agent_groups'),
@@ -971,6 +979,13 @@ const stmts = {
         recentConvs: db.prepare('SELECT id, title, user_id, model FROM chat_conversations ORDER BY updated_at DESC LIMIT 40'),
         convMsgCount: db.prepare('SELECT COUNT(*) as c FROM chat_messages WHERE conversation_id = ?'),
         dbFiles: db.prepare('SELECT id, original_name, mime_type, uploaded_by FROM files'),
+        // ─── Batched aggregate statements (used by GET /graph) ───
+        // Each replaces a per-row sub-query loop with one grouped query.
+        skillUseCounts: (() => { try { return db.prepare('SELECT skill_id, COUNT(*) as c FROM skill_executions GROUP BY skill_id'); } catch { return null; } })(),
+        allPluginsWithHooks: (() => { try { return db.prepare('SELECT id, name, version, enabled, hooks FROM plugins'); } catch { return null; } })(),
+        convMsgCounts: (() => { try { return db.prepare('SELECT conversation_id as id, COUNT(*) as c FROM chat_messages GROUP BY conversation_id'); } catch { return null; } })(),
+        modelCountsByProvider: (() => { try { return db.prepare('SELECT provider_id, COUNT(*) as c FROM llm_models GROUP BY provider_id'); } catch { return null; } })(),
+        allModelProviders: (() => { try { return db.prepare('SELECT model_id, display_name, provider_id FROM llm_models'); } catch { return null; } })(),
       },
       // ─── Chain Tables ───────────────────────────────────────────
       skillChains: {
@@ -1344,19 +1359,52 @@ app.post('/api/chat/compress-context', authMiddleware, apiLimiter, async (req, r
  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Device-State Ingestion (moved to routes/system.mjs) ────────
+// ─── Device-State Ingestion (async — no execSync on event loop) ──
 let deviceStateCache = { battery_pct: null, battery_charging: null, network_type: 'unknown', thermal_throttling: false, gpu_util: 0, npu_util: 0, ram_pct: 0, cpu_temp: 0, swap_pct: 0 };
 async function collectDeviceState() {
- try {
-  const { execSync: exec2 } = await import('child_process');
-  try { const b = exec2('cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo ""').toString().trim(); if (b) deviceStateCache.battery_pct = parseInt(b); const bs = exec2('cat /sys/class/power_supply/battery/status 2>/dev/null || cat /sys/class/power_supply/AC/online 2>/dev/null || echo ""').toString().trim(); deviceStateCache.battery_charging = bs.includes('Charging') || bs === '1'; } catch {}
-  try { const iface = exec2("ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1").toString().trim(); if (iface) { const s = exec2(`cat /sys/class/net/${iface}/operstate 2>/dev/null || echo ""`).toString().trim(); deviceStateCache.network_type = s === 'up' ? (iface.startsWith('wlan') ? 'wifi' : 'ethernet') : 'disconnected'; } } catch {}
-  try { const t = exec2('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0').toString().trim(); const tc = parseInt(t) / 1000; deviceStateCache.cpu_temp = tc; deviceStateCache.thermal_throttling = tc > 80; } catch {}
-  try { const f = exec2('free -m 2>/dev/null').toString(); const ml = f.split('\n').find(l => l.startsWith('Mem:')); if (ml) { const p = ml.split(/\s+/); deviceStateCache.ram_pct = Math.round(parseInt(p[2])/parseInt(p[1])*100); } const sl = f.split('\n').find(l => l.startsWith('Swap:')); if (sl) { const p = sl.split(/\s+/); deviceStateCache.swap_pct = p[2] !== '0' ? Math.round(parseInt(p[2])/parseInt(p[1])*100) : 0; } } catch {}
-  try { const t = exec2('timeout 1 tegrastats --start 2>/dev/null || echo ""', { timeout: 2000 }).toString().trim(); if (t) { const rm = t.match(/RAM\s+(\d+)\/(\d+)/); if (rm) deviceStateCache.ram_pct = Math.round(parseInt(rm[1])/parseInt(rm[2])*100); const gm = t.match(/GR3D\s+(\d+)%/); if (gm) deviceStateCache.gpu_util = parseInt(gm[1]); } } catch {}
- } catch {}
+  try {
+    const { readFile } = await import('fs/promises');
+    const read = async (p) => { try { return (await readFile(p, 'utf-8')).trim(); } catch { return ''; } };
+
+    const b = await read('/sys/class/power_supply/battery/capacity');
+    if (b) deviceStateCache.battery_pct = parseInt(b);
+    const bs = await read('/sys/class/power_supply/battery/status') || await read('/sys/class/power_supply/AC/online');
+    deviceStateCache.battery_charging = bs.includes('Charging') || bs === '1';
+
+    const iface = await read('/sys/class/net/wlan0/operstate').then(() => 'wlan0').catch(() =>
+      read('/sys/class/net/eth0/operstate').then(() => 'eth0').catch(() => ''));
+    if (iface) {
+      const s = await read(`/sys/class/net/${iface}/operstate`);
+      deviceStateCache.network_type = s === 'up' ? (iface.startsWith('wlan') ? 'wifi' : 'ethernet') : 'disconnected';
+    }
+
+    const t = await read('/sys/class/thermal/thermal_zone0/temp');
+    if (t) { const tc = parseInt(t) / 1000; deviceStateCache.cpu_temp = tc; deviceStateCache.thermal_throttling = tc > 80; }
+
+    // RAM/Swap via /proc/meminfo (no shell fork)
+    const meminfo = await read('/proc/meminfo');
+    if (meminfo) {
+      const getKB = (key) => { const m = meminfo.match(new RegExp(`${key}:\\s+(\\d+)`)); return m ? parseInt(m[1]) : 0; };
+      const memTotal = getKB('MemTotal'), memAvail = getKB('MemAvailable');
+      if (memTotal) deviceStateCache.ram_pct = Math.round(((memTotal - memAvail) / memTotal) * 100);
+      const swapTotal = getKB('SwapTotal'), swapFree = getKB('SwapFree');
+      if (swapTotal) deviceStateCache.swap_pct = Math.round(((swapTotal - swapFree) / swapTotal) * 100);
+    }
+
+    // tegrastats (short, non-blocking timeout)
+    try {
+      const { exec: execCb } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(execCb);
+      const { stdout } = await execAsync('tegrastats --sleep 1 2>&1 | head -1', { timeout: 3000 });
+      const rm = stdout.match(/RAM\s+(\d+)\/(\d+)/);
+      if (rm) deviceStateCache.ram_pct = Math.round(parseInt(rm[1]) / parseInt(rm[2]) * 100);
+      const gm = stdout.match(/GR3D\s+(\d+)%/);
+      if (gm) deviceStateCache.gpu_util = parseInt(gm[1]);
+    } catch {}
+  } catch {}
 }
-setInterval(collectDeviceState, 10000);
+setInterval(collectDeviceState, 15000);
 collectDeviceState();
 
 // ─── File Watcher Service (moved to routes/system.mjs) ──────────
@@ -1385,31 +1433,47 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Live Telemetry ────────────────────────────────────────────────
+// ─── Live Telemetry (async — no execSync) ────────────────────────
 let telemetryCache = { cpu: 0, mem: 0, gpu: 0, npu: 0, temp: 0, uptime: 0, wsClients: 0, ts: Date.now() };
+const _cores = parseInt(execSync('nproc').toString().trim()) || 4; // one-time at boot
 async function collectTelemetry() {
- try {
-  // execSync is injected by the skill runtime
-  // CPU usage (1-min load / cores)
-  let cpuLoad = 0;
-  try { const cores = parseInt(execSync('nproc').toString().trim()) || 4; const load = parseFloat(execSync('cat /proc/loadavg').toString().split(' ')[0]) || 0; cpuLoad = Math.min(100, Math.round((load / cores) * 100)); } catch {}
-  // Memory usage
-  let memUsage = 0;
-  try { const memInfo = execSync('free -m').toString(); const lines = memInfo.split('\n'); if (lines[1]) { const parts = lines[1].split(/\s+/); const total = parseInt(parts[1]) || 1; const used = parseInt(parts[2]) || 0; memUsage = Math.round((used / total) * 100); } } catch {}
-  // GPU/NPU (Jetson Tegra — try tegrastats)
-  let gpuUtil = 0, npuUtil = 0, tempC = 0;
   try {
-  const ts = execSync('tegrastats --sleep 1 2>&1 | head -1').toString();
-  // RAM 4021/15945MB, ltc 166@921MHz, EMC 28%@2133MHz, NVDEC 0%@689MHz, NVENC 0%@689MHz, ISP 0%, NVJPG 0%, OFA 0%, APE 0%@150MHz, SE 0%@201MHz, VPRS 0%, CPU 6%@1.5GHz, GPU 12%@318MHz, DLA 0%@1GHz, PVA 0%@1GHz, CIA 0%@115MHz
-  const gpuMatch = ts.match(/GPU\s+(\d+)%/); if (gpuMatch) gpuUtil = parseInt(gpuMatch[1]);
-  const dlaMatch = ts.match(/DLA\s+(\d+)%/); if (dlaMatch) npuUtil = parseInt(dlaMatch[1]);
-  const tempMatch = ts.match(/(\d+)C/); if (tempMatch) tempC = parseInt(tempMatch[1]);
+    const { readFile } = await import('fs/promises');
+    const read = async (p) => { try { return (await readFile(p, 'utf-8')).trim(); } catch { return ''; } };
+
+    // CPU from /proc/loadavg (no shell)
+    let cpuLoad = 0;
+    const loadavg = await read('/proc/loadavg');
+    if (loadavg) { const load = parseFloat(loadavg.split(' ')[0]) || 0; cpuLoad = Math.min(100, Math.round((load / _cores) * 100)); }
+
+    // Memory from /proc/meminfo (no shell)
+    let memUsage = 0;
+    const meminfo = await read('/proc/meminfo');
+    if (meminfo) {
+      const getKB = (key) => { const m = meminfo.match(new RegExp(`${key}:\\s+(\\d+)`)); return m ? parseInt(m[1]) : 0; };
+      const total = getKB('MemTotal'), avail = getKB('MemAvailable');
+      if (total) memUsage = Math.round(((total - avail) / total) * 100);
+    }
+
+    // GPU/NPU temp from sysfs (no shell)
+    let gpuUtil = deviceStateCache.gpu_util, npuUtil = 0, tempC = deviceStateCache.cpu_temp;
+    const zoneTemp = await read('/sys/class/thermal/thermal_zone0/temp');
+    if (zoneTemp) tempC = parseInt(zoneTemp) / 1000;
+
+    // tegrastats (non-blocking)
+    try {
+      const { exec: execCb } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(execCb);
+      const { stdout } = await execAsync('tegrastats --sleep 1 2>&1 | head -1', { timeout: 3000 });
+      const gpuMatch = stdout.match(/GPU\s+(\d+)%/); if (gpuMatch) gpuUtil = parseInt(gpuMatch[1]);
+      const dlaMatch = stdout.match(/DLA\s+(\d+)%/); if (dlaMatch) npuUtil = parseInt(dlaMatch[1]);
+      const tempMatch = stdout.match(/(\d+)C/); if (tempMatch) tempC = parseInt(tempMatch[1]);
+    } catch {}
+
+    telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, ts: Date.now() };
   } catch {}
-  // Temperature fallback
-  if (!tempC) { try { tempC = parseInt(execSync('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null').toString().trim()) / 1000; } catch {} }
-  telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, ts: Date.now() };
- } catch {}
- return telemetryCache;
+  return telemetryCache;
 }
 // Collect telemetry every 5s and broadcast via WS
 setInterval(async () => {

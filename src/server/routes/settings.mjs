@@ -94,14 +94,38 @@ export default function settingsRoutes(ctx) {
       const row = db.prepare('SELECT value, encrypted, category FROM env_vars WHERE key = ?').get(key);
       if (!row) return res.status(404).json({ success: false, message: 'Variable not found' });
       const val = row.encrypted ? xorDecipher(row.value) : row.value;
-      if (key.toLowerCase().includes('openai') || row.category === 'llm') {
+      if (!val) return res.json({ success: false, message: 'No value set' });
+
+      // Map env key → provider test config
+      const PROVIDER_TEST = {
+        OPENAI_API_KEY:     { url: 'https://api.openai.com/v1/models',            headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        ANTHROPIC_API_KEY:  { url: 'https://api.anthropic.com/v1/models',          headers: (k) => ({ 'x-api-key': k, 'anthropic-version': '2023-06-01' }) },
+        GOOGLE_API_KEY:     { url: 'https://generativelanguage.googleapis.com/v1beta/models', headers: (k) => ({}) , qs: (url, k) => `${url}?key=${encodeURIComponent(k)}` },
+        NVIDIA_API_KEY:     { url: 'https://integrate.api.nvidia.com/v1/models',   headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        OPENROUTER_API_KEY: { url: 'https://openrouter.ai/api/v1/models',         headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        GROQ_API_KEY:       { url: 'https://api.groq.com/openai/v1/models',       headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        TOGETHER_API_KEY:   { url: 'https://api.together.xyz/v1/models',          headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        DEEPSEEK_API_KEY:   { url: 'https://api.deepseek.com/v1/models',          headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        MISTRAL_API_KEY:    { url: 'https://api.mistral.ai/v1/models',            headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        XAI_API_KEY:        { url: 'https://api.x.ai/v1/models',                  headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        PERPLEXITY_API_KEY: { url: 'https://api.perplexity.ai/models',            headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+        COHERE_API_KEY:     { url: 'https://api.cohere.ai/v1/models',             headers: (k) => ({ Authorization: `Bearer ${k}` }) },
+      };
+
+      const testConfig = PROVIDER_TEST[key.toUpperCase()];
+      if (testConfig) {
         try {
-          const r = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${val}` }, signal: AbortSignal.timeout(8000) });
-          if (r.ok) return res.json({ success: true, message: 'OpenAI API key valid' });
-          return res.json({ success: false, message: `API returned ${r.status}` });
+          const testUrl = testConfig.qs ? testConfig.qs(testConfig.url, val) : testConfig.url;
+          const r = await fetch(testUrl, { headers: { 'Content-Type': 'application/json', ...testConfig.headers(val) }, signal: AbortSignal.timeout(10000) });
+          const label = key.replace('_API_KEY', '').replace('_', ' ');
+          if (r.ok) return res.json({ success: true, message: `${label} API key valid` });
+          if (r.status === 401) return res.json({ success: false, message: `${label} API key rejected (401)` });
+          return res.json({ success: false, message: `${label} API returned ${r.status}` });
         } catch (e) { return res.json({ success: false, message: e.message }); }
       }
-      if (val && val.length > 5) return res.json({ success: true, message: 'Value looks valid (non-trivial length)' });
+
+      // Non-LLM keys: basic validation
+      if (val.length > 5) return res.json({ success: true, message: 'Value looks valid (non-trivial length)' });
       return res.json({ success: false, message: 'Value too short to be a valid key' });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });

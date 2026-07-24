@@ -329,6 +329,22 @@ export default function NeuralMap() {
     l.ropeLen = ROPE_LENGTHS[l.type] || DEFAULT_ROPE;
    }
    setGraphData({ nodes: data.nodes, links: data.links || [] });
+   // Seed initial positions from targetXY so simulation starts spread at cluster sectors,
+   // not collapsed at origin (important with warmupTicks={0} — no pre-render ticks to spread)
+   requestAnimationFrame(() => {
+     const fg = fgRef.current;
+     if (!fg) return;
+     const nodes = fg.graphData().nodes;
+     recomputeClusterCounts(nodes);
+     for (const n of nodes) {
+       if (n.fx == null && n.fy == null) {
+         const [tx, ty] = targetXY(n);
+         if (typeof n.x !== 'number') n.x = tx;
+         if (typeof n.y !== 'number') n.y = ty;
+       }
+     }
+     fg.d3ReheatSimulation();
+   });
   }).catch(err => {
    console.error('Neural Map load error:', err);
    setError('Failed to load graph data. Check that the server is running and /api/graph responds.');
@@ -944,7 +960,7 @@ function configureForces(fg, n) {
       onNodeDoubleClick={handleNodeDoubleClick}
       onBackgroundClick={() => setSelectedNode(null)}
       backgroundColor={BG.base}
-      warmupTicks={50}
+      warmupTicks={0}
       cooldownTicks={300}
       cooldownTime={15000}
       d3AlphaDecay={0.008}

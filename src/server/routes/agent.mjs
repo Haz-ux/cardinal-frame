@@ -32,7 +32,7 @@ const CMD_BLOCKLIST = [
 ];
 const ALLOWED_READ_EXT = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.json', '.md', '.txt', '.py', '.sh', '.html', '.css', '.yaml', '.yml', '.env', '.sql', '.xml'];
 const MAX_AGENT_STEPS = 20;
-const AGENT_STEP_DELAY_MS = 500;
+const AGENT_STEP_DELAY_MS = 100;
 
 // Module-level deps — populated by agentRoutes(ctx)
 // Proxy that lazily forwards to _ctx (avoids TDZ on getter properties in ctx)
@@ -445,6 +445,9 @@ Remember:
     messages.push({ role: 'user', content: 'Continue working on the task.' });
   }
 
+  // Track step index in JS to avoid redundant getBySession.all() queries
+  let stepCounter = existingActions.length;
+
   // Update session status
   _deps.stmts.agentSessions.updateStatus.run('executing', sessionId);
   _deps.broadcast('agent:loop:start', { session_id: sessionId, max_steps: maxSteps });
@@ -465,8 +468,9 @@ Remember:
 
       // Record the error as an action for debugging
       const errActionId = randomUUID();
-      const errStepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+      const errStepIdx = stepCounter;
       _deps.stmts.agentActions.insert.run(errActionId, sessionId, errStepIdx, 'error', 'llm_call', e.message, JSON.stringify({ error: e.message }), 'failed');
+      stepCounter++;
 
       return { completed: false, error: e.message, steps: step + 1, tokens: totalTokens };
     }
@@ -494,7 +498,7 @@ Remember:
         // Check if suggest mode requires approval
         if (session.mode === 'suggest' && ['file_write', 'shell_exec', 'git_op'].includes(toolName)) {
           const actionId = randomUUID();
-          const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+          const stepIdx = stepCounter;
           _deps.stmts.agentActions.insert.run(
             actionId, sessionId, stepIdx, toolName === 'file_write' ? 'write' : 'exec',
             toolArgs.path || toolArgs.command || toolName,
@@ -513,6 +517,7 @@ Remember:
           });
 
           _deps.stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
+          stepCounter++;
           return {
             completed: false,
             paused: true,
@@ -525,7 +530,7 @@ Remember:
 
         // Record the action
         const actionId = randomUUID();
-        const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+        const stepIdx = stepCounter;
         _deps.stmts.agentActions.insert.run(
           actionId, sessionId, stepIdx,
           toolName === 'file_read' ? 'read' :
@@ -537,6 +542,7 @@ Remember:
           JSON.stringify(result).slice(0, 5000),
           'completed'
         );
+        stepCounter++;
 
         _deps.broadcast('agent:step', {
           session_id: sessionId,
@@ -570,8 +576,9 @@ Remember:
 
     // Record the final response
     const actionId = randomUUID();
-    const stepIdx = _deps.stmts.agentActions.getBySession.all(sessionId).length;
+    const stepIdx = stepCounter;
     _deps.stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'response', 'complete', content.slice(0, 5000), JSON.stringify({ summary: content.slice(0, 2000) }), 'completed');
+    stepCounter++;
 
     _deps.stmts.agentSessions.updateStatus.run('completed', sessionId);
     _deps.broadcast('agent:loop:complete', {

@@ -90,7 +90,7 @@ function AimiIntentBox({ type, onGenerated }) {
     setError('');
     setPreview(null);
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('cf_token');
       const resp = await fetch(`${API}/${type === 'skill' ? 'skills' : 'tools'}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -110,7 +110,7 @@ function AimiIntentBox({ type, onGenerated }) {
     if (!preview) return;
     setLoading(true);
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('cf_token');
       const resp = await fetch(`${API}/${type === 'skill' ? 'skills' : 'tools'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -327,7 +327,7 @@ export default function Chains() {
   const { lastMsg } = useWebSocket();
 
   const loadChains = useCallback(async () => {
-    const token = localStorage.getItem('token');
+    const token = localStorage.getItem('cf_token');
     const [skillResp, toolResp, skillData, toolData] = await Promise.all([
       fetch(`${API}/skills`, { headers: { Authorization: `Bearer ${token}` } }),
       fetch(`${API}/tools`, { headers: { Authorization: `Bearer ${token}` } }),
@@ -363,7 +363,7 @@ export default function Chains() {
     setRunning(true);
     setRunState({ runningStep: 0, status: 'running', results: [] });
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('cf_token');
       const endpoint = tab === 'skill' ? `${API}/skills/${chain.id}/execute` : `${API}/tools/${chain.id}/execute`;
       const resp = await fetch(endpoint, {
         method: 'POST',
@@ -380,7 +380,7 @@ export default function Chains() {
   };
 
   const saveChain = async (chainData) => {
-    const token = localStorage.getItem('token');
+    const token = localStorage.getItem('cf_token');
     const endpoint = tab === 'skill' ? `${API}/skills` : `${API}/tools`;
     if (selected) {
       await fetch(`${endpoint}/${selected.id}`, {
@@ -403,7 +403,7 @@ export default function Chains() {
 
   const deleteChain = async (chain) => {
     if (!confirm(`Delete chain "${chain.name}"?`)) return;
-    const token = localStorage.getItem('token');
+    const token = localStorage.getItem('cf_token');
     const endpoint = tab === 'skill' ? `${API}/skills` : `${API}/tools`;
     await fetch(`${endpoint}/${chain.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
     setSelected(null);
