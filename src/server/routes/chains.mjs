@@ -19,6 +19,8 @@ export default function chainsRoutes(ctx) {
     callAgentLLM,
     PORT,
     executeSkill,
+    checkPermission,
+    auditLog,
   } = ctx;
   const router = express.Router();
 
@@ -93,7 +95,16 @@ export default function chainsRoutes(ctx) {
         return await executeSkill(skill, input);
       };
 
-      const result = await executeSkillChain(chain, chainInput, executeSkillFn, broadcast);
+      // Governance: build enforcement object
+      const persona = stmts.governance?.personas.getById.get('persona-default') || null;
+      const traceId = req.id;
+      const governance = persona ? {
+        persona,
+        checkPermission,
+        auditLog: (action, details) => auditLog(stmts, req.user?.username || 'system', action, null, details, traceId),
+      } : null;
+
+      const result = await executeSkillChain(chain, chainInput, executeSkillFn, broadcast, governance);
       stmts.skillChains.updateRunResult.run(JSON.stringify(result), result.ok ? 'completed' : 'failed', req.params.id);
       // Track run count for evolution
       try {
@@ -225,7 +236,16 @@ export default function chainsRoutes(ctx) {
         return data;
       };
 
-      const result = await executeToolChain(chain, chainInput, callToolFn, broadcast);
+      // Governance: build enforcement object
+      const persona = stmts.governance?.personas.getById.get('persona-default') || null;
+      const traceId = req.id;
+      const governance = persona ? {
+        persona,
+        checkPermission,
+        auditLog: (action, details) => auditLog(stmts, req.user?.username || 'system', action, null, details, traceId),
+      } : null;
+
+      const result = await executeToolChain(chain, chainInput, callToolFn, broadcast, governance);
       stmts.toolChains.updateRunResult.run(JSON.stringify(result), result.ok ? 'completed' : 'failed', req.params.id);
       broadcast('chain:executed', { chainId: req.params.id, name: chain.name, ok: result.ok, type: 'tool' });
       res.json(result);

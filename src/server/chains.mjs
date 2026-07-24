@@ -105,29 +105,49 @@ export function resolveStepInput(step, stepResults, chainInput) {
  * @param {function} broadcastFn - optional (type, payload) => void for WS updates
  * @returns {object} { ok, results, error, step_failed }
  */
-export async function executeSkillChain(chain, input, executeSkillFn, broadcastFn = null) {
+export async function executeSkillChain(chain, input, executeSkillFn, broadcastFn = null, governance = null) {
   const steps = typeof chain.steps === 'string' ? JSON.parse(chain.steps) : chain.steps;
   const stepResults = [];
   const startTime = Date.now();
+  const { checkPermission, auditLog, persona } = governance || {};
 
   if (broadcastFn) broadcastFn('chain:step:start', { chainName: chain.name, stepIndex: 0, totalSteps: steps.length });
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const stepStart = Date.now();
+    const stepName = step.skill_name || step.name || `Step ${i + 1}`;
+
+    // ─── Governance: permission check before execution ───
+    if (checkPermission && persona) {
+      const action = `skill:${step.skill_name || step.name || 'unnamed'}`;
+      const perm = checkPermission(persona, action, step);
+      auditLog?.(action, { chain: chain.name, step: stepName, allowed: perm.allowed });
+      if (!perm.allowed) {
+        const stepResult = {
+          stepIndex: i, stepName, ok: false,
+          error: `Governance: ${perm.reason}`,
+          duration_ms: Date.now() - stepStart,
+          governance_denied: true,
+        };
+        stepResults.push(stepResult);
+        if (broadcastFn) broadcastFn('chain:step:governance_denied', {
+          chainName: chain.name, stepIndex: i, stepName, reason: perm.reason,
+        });
+        if (!step.continue_on_error) {
+          return { ok: false, error: `Step ${i + 1} denied by governance: ${perm.reason}`, step_failed: i, results: stepResults, duration_ms: Date.now() - startTime };
+        }
+        continue;
+      }
+    }
 
     try {
-      // Look up the skill by name or id
-      const skill = step.skill_name
-        ? null // will be resolved by caller
-        : null;
-
       const resolvedInput = resolveStepInput(step, stepResults, input);
 
       if (broadcastFn) broadcastFn('chain:step:running', {
         chainName: chain.name,
         stepIndex: i,
-        stepName: step.skill_name || step.name || `Step ${i + 1}`,
+        stepName,
         input: typeof resolvedInput === 'string' ? resolvedInput.slice(0, 200) : '(object)',
       });
 
@@ -136,7 +156,7 @@ export async function executeSkillChain(chain, input, executeSkillFn, broadcastF
 
       const stepResult = {
         stepIndex: i,
-        stepName: step.skill_name || step.name || `Step ${i + 1}`,
+        stepName,
         input: resolvedInput,
         output: result.output ?? result,
         ok: result.ok ?? true,
@@ -216,14 +236,38 @@ export async function executeSkillChain(chain, input, executeSkillFn, broadcastF
  * @param {function} callToolFn - async (step, resolvedInput) => result
  * @param {function} broadcastFn - optional WS broadcaster
  */
-export async function executeToolChain(chain, input, callToolFn, broadcastFn = null) {
+export async function executeToolChain(chain, input, callToolFn, broadcastFn = null, governance = null) {
   const steps = typeof chain.steps === 'string' ? JSON.parse(chain.steps) : chain.steps;
   const stepResults = [];
   const startTime = Date.now();
+  const { checkPermission, auditLog, persona } = governance || {};
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const stepStart = Date.now();
+    const stepName = step.tool_name || step.name || `Step ${i + 1}`;
+
+    // ─── Governance: permission check before execution ───
+    if (checkPermission && persona) {
+      const action = `tool:${step.tool_name || step.name || 'unnamed'}`;
+      const perm = checkPermission(persona, action, step);
+      auditLog?.(action, { chain: chain.name, step: stepName, allowed: perm.allowed });
+      if (!perm.allowed) {
+        stepResults.push({
+          stepIndex: i, stepName, ok: false,
+          error: `Governance: ${perm.reason}`,
+          duration_ms: Date.now() - stepStart,
+          governance_denied: true,
+        });
+        if (broadcastFn) broadcastFn('chain:tool:governance_denied', {
+          chainName: chain.name, stepIndex: i, stepName, reason: perm.reason,
+        });
+        if (!step.continue_on_error) {
+          return { ok: false, error: `Tool step ${i + 1} denied by governance: ${perm.reason}`, step_failed: i, results: stepResults, duration_ms: Date.now() - startTime };
+        }
+        continue;
+      }
+    }
 
     try {
       const resolvedInput = resolveStepInput(step, stepResults, input);
@@ -231,14 +275,14 @@ export async function executeToolChain(chain, input, callToolFn, broadcastFn = n
       if (broadcastFn) broadcastFn('chain:tool:running', {
         chainName: chain.name,
         stepIndex: i,
-        stepName: step.tool_name || step.name || `Step ${i + 1}`,
+        stepName,
       });
 
       const result = await callToolFn(step, resolvedInput);
 
       const stepResult = {
         stepIndex: i,
-        stepName: step.tool_name || step.name || `Step ${i + 1}`,
+        stepName,
         input: resolvedInput,
         output: result,
         ok: !result?.error,

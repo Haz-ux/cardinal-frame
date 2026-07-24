@@ -30,6 +30,7 @@ const SCHEMA = `
     action TEXT NOT NULL,
     target TEXT,
     details TEXT DEFAULT '{}',
+    trace_id TEXT,
     ts TEXT DEFAULT (datetime('now'))
   );
 
@@ -71,9 +72,10 @@ export function initGovernance(db) {
       delete: db.prepare('DELETE FROM personas WHERE id = ?'),
     },
     audit: {
-      insert: db.prepare('INSERT INTO audit_log (actor, action, target, details) VALUES (?, ?, ?, ?)'),
+      insert: db.prepare('INSERT INTO audit_log (actor, action, target, details, trace_id) VALUES (?, ?, ?, ?, ?)'),
       getAll: db.prepare('SELECT * FROM audit_log ORDER BY ts DESC LIMIT ?'),
       getByActor: db.prepare('SELECT * FROM audit_log WHERE actor = ? ORDER BY ts DESC LIMIT ?'),
+      getByTrace: db.prepare('SELECT * FROM audit_log WHERE trace_id = ? ORDER BY ts'),
     },
   };
 }
@@ -116,9 +118,9 @@ export function checkPermission(persona, action, target) {
 /**
  * Log an auditable action
  */
-export function auditLog(stmts, actor, action, target = null, details = {}) {
+export function auditLog(stmts, actor, action, target = null, details = {}, traceId = null) {
   try {
-    stmts.governance.audit.insert.run(actor, action, target, JSON.stringify(details));
+    stmts.governance.audit.insert.run(actor, action, target, JSON.stringify(details), traceId);
   } catch { /* non-critical */ }
 }
 
@@ -202,11 +204,14 @@ export default function governanceRoutes(ctx) {
 
   // ─── Audit Log ───────────────────────────────────────────────────
 
-  // GET /api/governance/audit?limit=100
+  // GET /api/governance/audit?limit=100&actor=username&trace_id=xxx
   router.get('/governance/audit', authMiddleware, requireRole('admin'), (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 100, 500);
     const actor = req.query.actor;
-    if (actor) {
+    const traceId = req.query.trace_id;
+    if (traceId) {
+      res.json(stmts.governance.audit.getByTrace.all(traceId));
+    } else if (actor) {
       res.json(stmts.governance.audit.getByActor.all(actor, limit));
     } else {
       res.json(stmts.governance.audit.getAll.all(limit));

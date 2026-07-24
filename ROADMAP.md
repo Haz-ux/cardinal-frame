@@ -14,23 +14,17 @@
 - [x] 1.3 Shared types — zod schemas in `src/shared/schemas.mjs`, API boundary validation on `/api/graph`
 - [x] 1.4 Doc consolidation — ARCHITECTURE.md updated, ADRs in `docs/adr/`
 
----
+### Phase 2 — Missing infrastructure (Jul 2026)
+- [x] 2.1 LLM provider integration — NVIDIA NIM (z-ai/glm-5.2) via OpenAI-compatible adapter
+- [x] 2.2 Durable job queue — SQLite-backed task/DAG execution, retry + dead-letter (`job-queue.mjs`)
+- [x] 2.3 Observability — trace IDs, per-request timing, structured logs (`traces.mjs`)
+- [x] 2.4 Secrets management — AES-256-GCM encryption with XOR backward-compat (`settings.mjs`)
+- [x] 2.5 LLM cost/token accounting — usage table + pricing table + budget alerts (`costs.mjs`)
 
-## In Progress
-
-### Phase 2 — Missing infrastructure
-
-- [ ] 2.1 LLM provider integration — confirm direct-call vs orchestrate-only, add adapter if needed
-- [ ] 2.2 Durable job queue — task/DAG execution survives restarts, retry + dead-letter
-- [ ] 2.3 Observability — trace IDs threading through agent runs and DAG steps
-- [ ] 2.4 Secrets management — pre-commit hook blocking key patterns
-- [ ] 2.5 LLM cost/token accounting — usage table + dashboard cost-per-agent/per-day
-
-### Phase 3 — Governance layer
-
-- [ ] 3.1 Machine-readable agent identity docs (scope, exit conditions, escalation rules)
-- [ ] 3.2 Enforcement points in DAG/chain executor
-- [ ] 3.3 Audit trail via Phase 2.3 tracing
+### Phase 3 — Governance layer (Jul 2026)
+- [x] 3.1 Persona system, permissions, SOUL docs, audit log (`governance.mjs`)
+- [x] 3.2 Enforcement points in DAG/chain executor (`chains.mjs` governance param)
+- [x] 3.3 Audit trail integration with trace system (trace_id column + query)
 
 ---
 

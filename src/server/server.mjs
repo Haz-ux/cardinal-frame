@@ -1345,7 +1345,7 @@ app.post('/api/jobs/:id/retry', authMiddleware, requireRole('admin'), apiLimiter
 app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
  try {
   const { code, language = 'javascript' } = req.body;
-  auditLog(stmts, req.user.username, 'sandbox:execute', language, { code_length: code.length });
+  auditLog(stmts, req.user.username, 'sandbox:execute', language, { code_length: code.length }, req.id);
   const fs = await import('fs');
   const tmpFile = path.join(os.tmpdir(), `cf_sandbox_${Date.now()}.${language === 'python' ? 'py' : 'mjs'}`);
   await fs.promises.writeFile(tmpFile, code);
@@ -1741,7 +1741,11 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
          if (!skill) throw new Error(`Skill "${step.skill_name}" not found`);
          return await executeSkill(skill, inp);
        };
-       return await executeSkillChain(chain, input, executeSkillFn, broadcast);
+       return await executeSkillChain(chain, input, executeSkillFn, broadcast, {
+         persona: stmts.governance?.personas.getById.get('persona-default') || null,
+         checkPermission,
+         auditLog: (action, details) => auditLog(stmts, 'heartbeat', action, null, details),
+       });
      },
      async (skillName, input) => {
        const skill = stmts.skills.getByName.get(skillName);
