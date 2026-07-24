@@ -1,0 +1,29 @@
+# Gitleaks config — tailored for Cardinal Frame
+# Scans for API keys, tokens, and secrets in commits
+
+title = "Cardinal Frame Secret Scan"
+
+[extend]
+useDefault = true
+
+# Allowlist — these are test/CI-only values that should NOT trigger alerts
+[[allowlists]]
+description = "Test and CI placeholder values"
+regexes = [
+  '''test-secret-for-ci-only''',
+  '''test-encryption-key-for-ci-only''',
+  '''REDACTED''',
+  '''your-api-key-here''',
+  '''YOUR_API_KEY''',
+]
+
+# Custom rules for known provider patterns that gitleaks might miss
+[[rules]]
+id = "nvidia-api-key"
+description = "NVIDIA API Key"
+regex = '''nvapi-[a-zA-Z0-9]{32,}'''
+
+[[rules]]
+id = "groq-api-key"
+description = "Groq API Key"
+regex = '''grod_[a-zA-Z0-9]{40,}'''

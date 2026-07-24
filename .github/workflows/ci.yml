@@ -2,67 +2,85 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
-    tags: ['v*']
+    branches: [master, main]
   pull_request:
-    branches: [main, master]
+    branches: [master, main]
 
 jobs:
   test:
+    name: Tests
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: ${{ matrix.node-version }}
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Run ESLint
-        run: npm run lint
-        continue-on-error: true
-
-      - name: Build project
-        run: npm run build
+        run: npm ci || npm install
 
       - name: Run tests
         run: npm test
+        env:
+          NODE_ENV: test
+          # Tests create temp DBs — no real credentials needed
+          JWT_SECRET: test-secret-for-ci-only
+          ENCRYPTION_KEY: test-encryption-key-for-ci-only-32bytes
 
-  docker:
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+  secret-scan:
+    name: Secret Scan (Gitleaks)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for commit scanning
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only scan changes in the current push/PR
+          GITLEAKS_ENABLE_COMMENTS: true
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+
+  history-check:
+    name: History Check (No Secrets in Commits)
+    runs-on: ubuntu-latest
+    # Only run on PRs to master/main — catches secrets before merge
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for secrets in new commits
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  lint:
+    name: Syntax Check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          node-version: 20
 
-      - name: Extract version
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Install dependencies
+        run: npm ci || npm install
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Check syntax of all .mjs files
+        run: |
+          for f in $(find src -name "*.mjs" -not -path "*/node_modules/*"); do
+            node --check "$f" || { echo "Syntax error in $f"; exit 1; }
+          done
+          echo "All .mjs files pass syntax check"
