@@ -272,4 +272,85 @@ describe('Session Search API', () => {
       expect(res.status).toBe(401);
     });
   });
+
+  describe('GET /api/memory & /api/search — ?summary=true (LLM summarization)', () => {
+    it('should return results with summaries array when ?summary=true on memory list', async () => {
+      await request(app).post('/api/memory').set(adminAuth()).send({ content: 'Summary test memory for list endpoint' });
+
+      const res = await request(app)
+        .get('/api/memory?summary=true')
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('results');
+      expect(res.body).toHaveProperty('summaries');
+      expect(Array.isArray(res.body.results)).toBe(true);
+      expect(Array.isArray(res.body.summaries)).toBe(true);
+      // Without an LLM provider configured in test env, summaries degrade to empty array
+      expect(res.body.summaries.length).toBe(0);
+    });
+
+    it('should return results (not {results,summaries}) when ?summary is not set', async () => {
+      const res = await request(app)
+        .get('/api/memory')
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.body.results).toBeUndefined();
+    });
+
+    it('should return memory with summary field when ?summary=true on single memory', async () => {
+      const createRes = await request(app)
+        .post('/api/memory')
+        .set(adminAuth())
+        .send({ content: 'Summary test for single memory endpoint' });
+
+      const res = await request(app)
+        .get(`/api/memory/${createRes.body.id}?summary=true`)
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(createRes.body.id);
+      expect(res.body).toHaveProperty('summary');
+      // Without LLM provider, summary is null (graceful degradation)
+      expect(res.body.summary).toBeNull();
+    });
+
+    it('should return single memory without summary field when ?summary not set', async () => {
+      const createRes = await request(app)
+        .post('/api/memory')
+        .set(adminAuth())
+        .send({ content: 'No summary requested test' });
+
+      const res = await request(app)
+        .get(`/api/memory/${createRes.body.id}`)
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(res.body.summary).toBeUndefined();
+    });
+
+    it('should return search results with summaries when ?summary=true', async () => {
+      await request(app).post('/api/search/index').set(adminAuth()).send({
+        session_type: 'chat',
+        ref_id: 'summary-search-test-1',
+        title: 'Summary search test',
+        content: 'Testing the summary feature on the search endpoint with LLM',
+      });
+
+      const res = await request(app)
+        .get('/api/search?q=Summary&summary=true')
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('results');
+      expect(res.body).toHaveProperty('summaries');
+      expect(Array.isArray(res.body.summaries)).toBe(true);
+    });
+
+    it('should handle ?summary=true with empty search results gracefully', async () => {
+      const res = await request(app)
+        .get('/api/search?q=ZZNONEXISTENTZZ&summary=true')
+        .set(adminAuth());
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('results');
+      expect(res.body.results.length).toBe(0);
+    });
+  });
 });
