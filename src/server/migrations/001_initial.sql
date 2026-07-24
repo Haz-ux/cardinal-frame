@@ -226,6 +226,21 @@ CREATE TABLE IF NOT EXISTS skills (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS skill_invocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  skill_id TEXT NOT NULL,
+  skill_name TEXT,
+  trace_id TEXT,
+  success INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
+  skill_type TEXT,
+  error TEXT,
+  ts TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_skill ON skill_invocations(skill_id);
+CREATE INDEX IF NOT EXISTS idx_skill_inv_ts ON skill_invocations(ts);
+
 CREATE TABLE IF NOT EXISTS tools (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,

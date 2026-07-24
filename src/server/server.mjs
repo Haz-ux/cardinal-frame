@@ -309,6 +309,21 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 
+  CREATE TABLE IF NOT EXISTS skill_invocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  skill_id TEXT NOT NULL,
+  skill_name TEXT,
+  trace_id TEXT,
+  success INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
+  skill_type TEXT,
+  error TEXT,
+  ts TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_skill_inv_skill ON skill_invocations(skill_id);
+  CREATE INDEX IF NOT EXISTS idx_skill_inv_ts ON skill_invocations(ts);
+
   CREATE TABLE IF NOT EXISTS llm_providers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -857,6 +872,22 @@ const stmts = {
       getAllWithTrigger: db.prepare("SELECT * FROM skills WHERE enabled = 1 AND trigger != '' ORDER BY confidence DESC"),
       updateInvoke: db.prepare("UPDATE skills SET invoke_count = invoke_count + 1, last_invoked = datetime('now') WHERE id = ?"),
       insertFull: db.prepare('INSERT INTO skills (id, name, description, category, handler, parameters, enabled, confidence, auto_proposed, trigger, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+      },
+      skillInvocations: {
+        insert: db.prepare('INSERT INTO skill_invocations (skill_id, skill_name, trace_id, success, duration_ms, skill_type, error) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getBySkill: db.prepare('SELECT * FROM skill_invocations WHERE skill_id = ? ORDER BY ts DESC, id DESC LIMIT ?'),
+        getRecent: db.prepare('SELECT * FROM skill_invocations ORDER BY ts DESC, id DESC LIMIT ?'),
+        getStats: db.prepare(`SELECT
+          skill_id, skill_name,
+          COUNT(*) as total,
+          SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes,
+          SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failures,
+          ROUND(AVG(duration_ms), 1) as avg_duration_ms,
+          MAX(ts) as last_invoked
+          FROM skill_invocations
+          WHERE ts > datetime('now', ?)
+          GROUP BY skill_id, skill_name
+          ORDER BY failures DESC, total DESC`),
       },
       tools: {
       insert: db.prepare('INSERT INTO tools (id, name, description, skill_id, endpoint, method, parameters, requires_auth, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
@@ -1747,7 +1778,7 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
        const executeSkillFn = async (step, inp) => {
          const skill = stmts.skills.getByName.get(step.skill_name);
          if (!skill) throw new Error(`Skill "${step.skill_name}" not found`);
-         return await executeSkill(skill, inp);
+         return await executeSkill(skill, inp, `heartbeat:${Date.now()}`);
        };
        return await executeSkillChain(chain, input, executeSkillFn, broadcast, {
          persona: stmts.governance?.personas.getById.get('persona-default') || null,
@@ -1758,7 +1789,7 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
      async (skillName, input) => {
        const skill = stmts.skills.getByName.get(skillName);
        if (!skill) return { ok: false, error: 'Skill not found' };
-       return await executeSkill(skill, input);
+       return await executeSkill(skill, input, `heartbeat:${Date.now()}`);
      },
      logger
    );

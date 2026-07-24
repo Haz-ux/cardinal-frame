@@ -92,7 +92,7 @@ export default function chainsRoutes(ctx) {
         if (!skill) throw new Error(`Skill "${skillName}" not found`);
         if (!skill.enabled) throw new Error(`Skill "${skillName}" is disabled`);
         stmts.skills.updateInvoke.run(skill.id);
-        return await executeSkill(skill, input);
+        return await executeSkill(skill, input, req.id);
       };
 
       // Governance: build enforcement object

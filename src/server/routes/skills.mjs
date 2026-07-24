@@ -63,10 +63,11 @@ export function collectSkillSecrets(skill) {
  * 2. Template skills: handler starts with "template:" — uses LLM with the template as system prompt
  * 3. Hybrid skills: handler starts with "hybrid:" — runs JS that can call LLM
  */
-export async function executeSkill(skill, input = {}) {
+export async function executeSkill(skill, input = {}, traceId = null) {
   if (!deps) throw new Error('executeSkill: skills route module not initialized (call default export first)');
   const {
     db,
+    stmts,
     callAgentLLM,
     fireHook,
     getDevSetting,
@@ -122,6 +123,22 @@ export async function executeSkill(skill, input = {}) {
     durationMs: result.duration_ms,
   });
 
+  // Log invocation to skill_invocations table for outcome tracking + failure-rate signal
+  try {
+    stmts.skillInvocations.insert.run(
+      skill.id,
+      skill.name,
+      traceId,
+      result.ok ? 1 : 0,
+      result.duration_ms ?? null,
+      result.type || null,
+      result.ok ? null : (result.error || 'unknown error'),
+    );
+  } catch (logErr) {
+    // Non-fatal — don't fail the skill execution if logging fails
+    console.error('[skill-invocations] Failed to log:', logErr.message);
+  }
+
   return result;
 }
 
@@ -170,6 +187,34 @@ export default function skillsRoutes(ctx) {
   };
 
   const router = express.Router();
+
+  // ─── Skill Invocation Stats ──────────────────────────────────
+  // GET /api/skills/stats/invocations — failure-rate signal for dashboard
+  router.get('/skills/stats/invocations', authMiddleware, (req, res) => {
+    const window = req.query.window || '-7 days';
+    try {
+      const stats = stmts.skillInvocations.getStats.all(window);
+      res.json(stats);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/skills/:id/invocations — recent invocations for a skill
+  router.get('/skills/:id/invocations', authMiddleware, (req, res) => {
+    const limit = parseInt(req.query.limit || '20', 10);
+    try {
+      const invocations = stmts.skillInvocations.getBySkill.all(req.params.id, limit);
+      res.json(invocations);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/skills/invocations/recent — recent invocations across all skills
+  router.get('/skills/invocations/recent', authMiddleware, (req, res) => {
+    const limit = parseInt(req.query.limit || '50', 10);
+    try {
+      const invocations = stmts.skillInvocations.getRecent.all(limit);
+      res.json(invocations);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   // ─── Skills CRUD ──────────────────────────────────────────────
   router.get('/skills', optionalAuth, (_req, res) => {
@@ -222,7 +267,7 @@ export default function skillsRoutes(ctx) {
       if (!skill.enabled) return res.status(400).json({ error: 'Skill is disabled' });
 
       const input = req.body.input ?? req.body;
-      const result = await executeSkill(skill, input);
+      const result = await executeSkill(skill, input, req.id);
 
       // Update invoke tracking
       stmts.skills.updateInvoke.run(skill.id);
@@ -245,7 +290,7 @@ export default function skillsRoutes(ctx) {
       const skill = stmts.skills.getByName.get(req.params.name);
       if (!skill) return res.status(404).json({ error: 'Skill not found' });
       const input = req.body.input ?? req.body;
-      const result = await executeSkill(skill, input);
+      const result = await executeSkill(skill, input, req.id);
       stmts.skills.updateInvoke.run(skill.id);
       res.json({ skill_id: skill.id, name: skill.name, ...result });
     } catch (e) { res.status(500).json({ error: e.message }); }
