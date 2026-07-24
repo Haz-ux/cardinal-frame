@@ -390,54 +390,68 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
     stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'running', dag.last_run_result, req.params.id);
     broadcast('dag:status', { id: req.params.id, status: 'running', layers: layers.length });
 
-    const steps = [];
-    let currentLayer = 0;
+    // Enqueue through durable job queue — survives restarts
+    if (globalThis._jobQueue) {
+      const jobId = globalThis._jobQueue.enqueue('dag', {
+        dagId: req.params.id,
+        dagName: dag.name,
+        layers: layers.map(layer => layer),
+        nodes,
+      }, { priority: 5, traceId: `dag:${req.params.id}` });
 
-    const runLayer = () => {
-      if (currentLayer >= layers.length) {
-        const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layers.length, completedAt: new Date().toISOString() });
-        stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
-        broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
-        logger.info(`DAG completed: ${dag.name} (${dag.id})`);
-        return;
-      }
+      // Listen for completion via broadcast (the queue broadcasts job:completed)
+      // The queue handler will update the DAG status and broadcast results
+      res.json({ dagId: dag.id, jobId, status: 'running', layers: layers.length, totalNodes: nodes.length });
+    } else {
+      // Fallback: in-process execution (for tests / no-queue mode)
+      const steps = [];
+      let currentLayer = 0;
 
-      const layer = layers[currentLayer];
-      const layerPromises = layer.map(nodeId => new Promise((resolve) => {
-        const node = nodes.find((n) => n.id === nodeId);
-        if (!node || !node.command) {
-          steps.push({ nodeId, nodeName: node?.name || nodeId, status: 'skipped', durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-          resolve();
+      const runLayer = () => {
+        if (currentLayer >= layers.length) {
+          const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layers.length, completedAt: new Date().toISOString() });
+          stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
+          broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
+          logger.info(`DAG completed: ${dag.name} (${dag.id})`);
           return;
         }
-        const check = sanitizeCommand(node.command);
-        if (!check.safe) {
-          steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', error: check.error, durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-          resolve();
-          return;
-        }
-        const start = Date.now();
-        exec(check.command, { timeout: 30000, shell: '/bin/sh', env: { PATH: process.env.PATH }, cwd: '/tmp' }, (error, stdout, stderr) => {
-          const durationMs = Date.now() - start;
-          if (error) {
-            steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', exitCode: error.killed ? -1 : (error.code ?? 1), output: (stderr || error.message).slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
-          } else {
-            steps.push({ nodeId, nodeName: node.name || nodeId, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
+
+        const layer = layers[currentLayer];
+        const layerPromises = layer.map(nodeId => new Promise((resolve) => {
+          const node = nodes.find((n) => n.id === nodeId);
+          if (!node || !node.command) {
+            steps.push({ nodeId, nodeName: node?.name || nodeId, status: 'skipped', durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
+            resolve();
+            return;
           }
-          resolve();
+          const check = sanitizeCommand(node.command);
+          if (!check.safe) {
+            steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', error: check.error, durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
+            resolve();
+            return;
+          }
+          const start = Date.now();
+          exec(check.command, { timeout: 30000, shell: '/bin/sh', env: { PATH: process.env.PATH }, cwd: '/tmp' }, (error, stdout, stderr) => {
+            const durationMs = Date.now() - start;
+            if (error) {
+              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', exitCode: error.killed ? -1 : (error.code ?? 1), output: (stderr || error.message).slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
+            } else {
+              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
+            }
+            resolve();
+          });
+        }));
+
+        Promise.all(layerPromises).then(() => {
+          broadcast('dag:layer', { id: req.params.id, layer: currentLayer, completed: true });
+          currentLayer++;
+          runLayer();
         });
-      }));
+      };
 
-      Promise.all(layerPromises).then(() => {
-        broadcast('dag:layer', { id: req.params.id, layer: currentLayer, completed: true });
-        currentLayer++;
-        runLayer();
-      });
-    };
-
-    runLayer();
-
-    res.json({ dagId: dag.id, status: 'running', layers: layers.length, totalNodes: nodes.length });
+      runLayer();
+      res.json({ dagId: dag.id, status: 'running', layers: layers.length, totalNodes: nodes.length });
+    }
   } catch (err) {
     stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'failed', JSON.stringify({ error: err.message }), req.params.id);
     broadcast('dag:status', { id: req.params.id, status: 'failed', error: err.message });

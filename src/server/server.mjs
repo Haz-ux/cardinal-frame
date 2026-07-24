@@ -48,6 +48,7 @@ import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './ro
 import llmRoutes, { initOllama } from './routes/llm.mjs';
 import agentRoutes, { callAgentLLM, agentTools } from './routes/agent.mjs';
 import commsRoutes from './routes/comms.mjs';
+import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain } from './chains.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
@@ -1291,6 +1292,38 @@ app.use('/api', llmRoutes(ctx));
 app.use('/api', agentRoutes(ctx));
 app.use('/api', commsRoutes(ctx));
 
+// ─── Job Queue ───────────────────────────────────────────────────
+const jobQueue = createJobQueue(db, {
+  concurrency: parseInt(process.env.JOB_CONCURRENCY || '3'),
+  defaultTimeout: parseInt(process.env.JOB_TIMEOUT_MS || '30000'),
+  maxRetries: parseInt(process.env.JOB_MAX_RETRIES || '3'),
+});
+jobQueue.setBroadcast(broadcast);
+jobQueue.setLogger(logger);
+
+// Job queue API routes
+app.get('/api/jobs/stats', authMiddleware, apiLimiter, (_req, res) => {
+  res.json(jobQueue.getStatus());
+});
+
+app.get('/api/jobs/:id', authMiddleware, apiLimiter, (req, res) => {
+  const job = jobQueue.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json(job);
+});
+
+app.get('/api/jobs/dead', authMiddleware, apiLimiter, (_req, res) => {
+  res.json(jobQueue.getDeadJobs());
+});
+
+app.post('/api/jobs/:id/retry', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  const job = jobQueue.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'dead') return res.status(409).json({ error: 'Only dead jobs can be retried' });
+  db.prepare(`UPDATE jobs SET status = 'pending', attempts = 0, last_error = NULL, scheduled_at = datetime('now') WHERE id = ?`).run(req.params.id);
+  res.json({ retried: true, id: req.params.id });
+});
+
 // ─── Code Execution Sandbox ──────────────────────────────────────
 app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
  try {
@@ -1650,21 +1683,29 @@ export { app, db, stmts, PORT };
 function gracefulShutdown(signal) {
   logger.info(`${signal} received — shutting down gracefully...`);
   fireHook('onServerStop', { signal, port: PORT });
+  // Stop job queue — running jobs will resume on restart
+  if (globalThis._jobQueue) {
+    globalThis._jobQueue.stop();
+  }
   wss.clients.forEach(c => c.close(1001, 'Server shutting down'));
   server.close(() => {
     logger.info('HTTP server closed');
     try { db.close(); logger.info('DB closed'); } catch {}
     process.exit(0);
   });
-  // Force exit after 5s if something hangs
-  setTimeout(() => { logger.warn('Forcing exit after timeout'); process.exit(1); }, 5000);
+  // Force exit after 10s if something hangs (allow job queue drain time)
+  setTimeout(() => { logger.warn('Forcing exit after timeout'); process.exit(1); }, 10000);
 }
 
 // ─── Boot ──────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.argv[1]}`) {
   server.listen(PORT, '0.0.0.0', () => {
-   logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop)`);
+   logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop + job-queue)`);
    fireHook('onServerStart', { port: PORT, version: pkg?.version || 'unknown' });
+
+   // Start job queue — recovers interrupted jobs from restart
+   jobQueue.start();
+   globalThis._jobQueue = jobQueue;
 
    // Start heartbeat daemon
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,
