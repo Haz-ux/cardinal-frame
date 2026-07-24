@@ -28,8 +28,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
 CREATE INDEX IF NOT EXISTS idx_token_usage_conversation_id ON token_usage(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_provider_id ON token_usage(provider_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);
-CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
-CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_session_index_user_id ON session_index(user_id);

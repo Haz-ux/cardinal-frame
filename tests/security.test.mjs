@@ -122,11 +122,12 @@ describe('Security Mechanisms', () => {
     it('should handle path traversal attempt gracefully', async () => {
       // Express normalizes paths — /../../../etc/passwd resolves to /
       // The SPA catch-all serves index.html for unknown routes (200)
-      // Key: the response should NOT contain /etc/passwd file contents
+      // or 404 if no client build is present. Key: no /etc/passwd leak.
       const res = await request(app).get('/../../../etc/passwd');
-      expect(res.status).toBe(200); // Serves SPA HTML
-      // Ensure it's not actual file contents
+      // Must not serve actual /etc/passwd contents
       expect(res.text).not.toContain('root:x:0:0');
+      // Should be either SPA fallback (200) or not-found (404) — both ok
+      expect([200, 404]).toContain(res.status);
     });
   });
 });

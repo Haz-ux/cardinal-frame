@@ -283,15 +283,31 @@ db.exec(`
   loaded_at TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS personas (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  soul TEXT DEFAULT '{}',
+  permissions TEXT DEFAULT '[]',
+  constraints TEXT DEFAULT '[]',
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE SET NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_personas_agent ON personas(agent_id);
+
   CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL,
   action TEXT NOT NULL,
-  resource_type TEXT NOT NULL,
-  resource_id TEXT,
-  user_id TEXT,
+  target TEXT,
   details TEXT DEFAULT '{}',
+  trace_id TEXT,
   ts TEXT DEFAULT (datetime('now'))
   );
+  CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 
   CREATE TABLE IF NOT EXISTS llm_providers (
   id TEXT PRIMARY KEY,
@@ -789,12 +805,6 @@ const stmts = {
       updateEnabled: db.prepare('UPDATE plugins SET enabled = ? WHERE id = ?'),
       delete: db.prepare('DELETE FROM plugins WHERE id = ?'),
       },
-      audit: {
-      insert: db.prepare('INSERT INTO audit_log (action, resource_type, resource_id, user_id, details) VALUES (?, ?, ?, ?, ?)'),
-      getAll: db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 200'),
-      getByResource: db.prepare('SELECT * FROM audit_log WHERE resource_type = ? AND resource_id = ? ORDER BY id DESC LIMIT 50'),
-      getByUser: db.prepare('SELECT * FROM audit_log WHERE user_id = ? ORDER BY id DESC LIMIT 50'),
-      },
       providers: {
       insert: db.prepare('INSERT INTO llm_providers (id, name, type, api_key, base_url, enabled) VALUES (?, ?, ?, ?, ?, ?)'),
       getAll: db.prepare('SELECT id, name, type, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
@@ -1080,8 +1090,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_token_usage_conversation_id ON token_usage(conversation_id);
   CREATE INDEX IF NOT EXISTS idx_token_usage_provider_id ON token_usage(provider_id);
   CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);
-  CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
-  CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
   CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
   CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
   CREATE INDEX IF NOT EXISTS idx_session_index_user_id ON session_index(user_id);

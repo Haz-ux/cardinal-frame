@@ -130,13 +130,29 @@ CREATE TABLE IF NOT EXISTS plugins (
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL,
   action TEXT NOT NULL,
-  resource_type TEXT NOT NULL,
-  resource_id TEXT,
-  user_id TEXT,
+  target TEXT,
   details TEXT DEFAULT '{}',
+  trace_id TEXT,
   ts TEXT DEFAULT (datetime('now'))
 );
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS personas (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  soul TEXT DEFAULT '{}',
+  permissions TEXT DEFAULT '[]',
+  constraints TEXT DEFAULT '[]',
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_personas_agent ON personas(agent_id);
 
 CREATE TABLE IF NOT EXISTS llm_providers (
   id TEXT PRIMARY KEY,
