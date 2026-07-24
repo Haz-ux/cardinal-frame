@@ -30,6 +30,7 @@
 - [x] 4.1 P2 memory summarization — `?summary=true` on memory/search routes (`memory.mjs`)
 - [x] 4.2 Job catalog — reusable task templates + AI-suggested patterns from history (`job-catalog.mjs`)
 - [x] 4.3 Live activity feed — real-time event overlay on Neural Map (`activity.mjs` + `ActivityOverlay.jsx`)
+- [x] 4.4 Cross-node subagent delegation — `delegate_task` agent tool + `/api/delegate` REST API (`delegation.mjs`)
 
 ---
 

@@ -366,6 +366,53 @@ registerAgentTool(
   }
 );
 
+registerAgentTool(
+  'delegate_task',
+  'Delegate a subtask to another agent. Use this to parallelize work or leverage specialized agents. Returns the delegation result if synchronous, or a delegation ID to poll later.',
+  {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Name for the delegated subtask' },
+      command: { type: 'string', description: 'Command to execute on the target agent' },
+      capability: { type: 'string', description: 'Required capability (e.g. "build", "test", "deploy"). Finds a matching agent automatically.' },
+      agentId: { type: 'string', description: 'Specific agent ID to delegate to. If omitted, auto-selects by capability.' },
+      synchronous: { type: 'boolean', description: 'If true, wait for the subtask to complete and return the result. If false, returns immediately with a delegation ID.' },
+      waitTimeout: { type: 'integer', description: 'Max milliseconds to wait if synchronous (default: 30000)' },
+    },
+    required: ['name', 'command'],
+  },
+  async (args) => {
+    try {
+      const response = await fetch(`http://localhost:${process.env.PORT || 8080}/api/delegate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: args.name,
+          command: args.command,
+          capability: args.capability,
+          agentId: args.agentId,
+          synchronous: args.synchronous !== false,
+          wait: args.synchronous !== false,
+          waitTimeout: args.waitTimeout || 30000,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) return { error: result.error || 'Delegation failed' };
+      return {
+        delegationId: result.id,
+        status: result.status,
+        childTaskId: result.childTaskId,
+        agentId: result.agentId,
+        result: result.result,
+        childTask: result.childTask,
+        message: result.message,
+      };
+    } catch (e) {
+      return { error: `Delegation request failed: ${e.message}` };
+    }
+  }
+);
+
 // ─── Execute a tool by name ───────────────────────────────────────
 async function executeAgentTool(toolName, args, ctx) {
   const tool = agentTools.find(t => t.name === toolName);
