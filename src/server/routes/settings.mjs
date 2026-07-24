@@ -1,15 +1,45 @@
 import express from 'express';
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
 
 /**
  * Settings routes: env vars (CRUD + test), dev settings (CRUD + restart).
  * Dependencies: db, wss, server, logger, fireHook, authMiddleware, requireRole, apiLimiter, broadcast, PORT
- * Exports: xorCipher, xorDecipher, getDevSetting, getDevSettings
+ * Exports: encryptSecret, decryptSecret, decryptValue, xorCipher, xorDecipher, getDevSetting, getDevSettings
  */
-const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET || 'cf-default-secret-v1';
 
+// ─── AES-256-GCM encryption for stored secrets ─────────────────────────
+// Key derivation: SHA-256 of ENCRYPT_SECRET env var → 32-byte key.
+// If ENCRYPT_SECRET is unset, generate a random key (secrets won't survive restart).
+const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET || null;
+const KEY_HEX = ENCRYPT_SECRET
+  ? createHash('sha256').update(ENCRYPT_SECRET).digest('hex')
+  : randomBytes(32).toString('hex');
+
+export function encryptSecret(plaintext) {
+  const key = Buffer.from(KEY_HEX, 'hex');
+  const iv = randomBytes(12); // 96-bit IV for GCM
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, enc].map(b => b.toString('base64')).join(':');
+}
+
+export function decryptSecret(packed) {
+  try {
+    const [ivB64, tagB64, encB64] = packed.split(':');
+    if (!ivB64 || !tagB64 || !encB64) return packed;
+    const key = Buffer.from(KEY_HEX, 'hex');
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'));
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+    const dec = Buffer.concat([decipher.update(Buffer.from(encB64, 'base64')), decipher.final()]);
+    return dec.toString('utf8');
+  } catch { return packed; }
+}
+
+// ─── Legacy XOR (backward compat with existing DB rows) ───────────────
 export function xorCipher(text) {
   const buf = Buffer.from(text, 'utf8');
-  const key = Buffer.from(ENCRYPT_SECRET, 'utf8');
+  const key = Buffer.from(ENCRYPT_SECRET || 'cf-default-secret-v1', 'utf8');
   for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
   return buf.toString('base64');
 }
@@ -17,10 +47,17 @@ export function xorCipher(text) {
 export function xorDecipher(b64) {
   try {
     const buf = Buffer.from(b64, 'base64');
-    const key = Buffer.from(ENCRYPT_SECRET, 'utf8');
+    const key = Buffer.from(ENCRYPT_SECRET || 'cf-default-secret-v1', 'utf8');
     for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
     return buf.toString('utf8');
   } catch { return b64; }
+}
+
+// ─── Smart decrypt — AES-GCM first, XOR fallback ──────────────────────
+export function decryptValue(val, isEncrypted) {
+  if (!isEncrypted) return val;
+  if (val.includes(':')) return decryptSecret(val);
+  return xorDecipher(val);
 }
 
 export function getDevSetting(db, key, fallback) {
@@ -57,7 +94,7 @@ export default function settingsRoutes(ctx) {
       const rows = db.prepare('SELECT key, value, encrypted, category, created_at, updated_at FROM env_vars ORDER BY category, key').all();
       const masked = rows.map(r => ({
         ...r,
-        value: r.encrypted ? xorDecipher(r.value) : r.value,
+        value: r.encrypted ? decryptValue(r.value, r.encrypted) : r.value,
         encrypted: Boolean(r.encrypted),
       }));
       res.json(masked);
@@ -68,7 +105,7 @@ export default function settingsRoutes(ctx) {
     try {
       const { key, value, encrypted = 0, category = 'general' } = req.body;
       if (!key || value === undefined) return res.status(400).json({ error: 'key and value required' });
-      const storedVal = encrypted ? xorCipher(String(value)) : String(value);
+      const storedVal = encrypted ? encryptSecret(String(value)) : String(value);
       db.prepare(`INSERT INTO env_vars (key, value, encrypted, category, created_at, updated_at)
         VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
         ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, category=excluded.category, updated_at=datetime('now')`)
@@ -93,7 +130,7 @@ export default function settingsRoutes(ctx) {
       const { key } = req.params;
       const row = db.prepare('SELECT value, encrypted, category FROM env_vars WHERE key = ?').get(key);
       if (!row) return res.status(404).json({ success: false, message: 'Variable not found' });
-      const val = row.encrypted ? xorDecipher(row.value) : row.value;
+      const val = row.encrypted ? decryptValue(row.value, row.encrypted) : row.value;
       if (!val) return res.json({ success: false, message: 'No value set' });
 
       // Map env key → provider test config

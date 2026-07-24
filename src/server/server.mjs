@@ -36,7 +36,7 @@ import costsRoutes, { getModelCost } from './routes/costs.mjs';
 import memoryRoutes from './routes/memory.mjs';
 import systemRoutes from './routes/system.mjs';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './routes/llm-helpers.mjs';
-import settingsRoutes, { getDevSetting, getDevSettings } from './routes/settings.mjs';
+import settingsRoutes, { getDevSetting, getDevSettings, decryptValue } from './routes/settings.mjs';
 import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
@@ -48,6 +48,7 @@ import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './ro
 import llmRoutes, { initOllama } from './routes/llm.mjs';
 import agentRoutes, { callAgentLLM, agentTools } from './routes/agent.mjs';
 import commsRoutes from './routes/comms.mjs';
+import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain } from './chains.mjs';
@@ -862,6 +863,7 @@ const stmts = {
        getSummary: db.prepare("SELECT category, SUM(prompt_tokens) as total_prompt, SUM(completion_tokens) as total_completion, SUM(cost_usd) as total_cost, COUNT(*) as count FROM token_usage WHERE created_at > datetime('now', ?) GROUP BY category"),
        getRecent: db.prepare("SELECT * FROM token_usage ORDER BY created_at DESC LIMIT 50"),
       },
+      traces: initTracing(db),
       fileWatchers: {
        insert: db.prepare('INSERT INTO file_watchers (id, path, recursive, trigger_skill, enabled) VALUES (?, ?, ?, ?, ?)'),
        getAll: db.prepare('SELECT * FROM file_watchers ORDER BY created_at DESC'),
@@ -1268,6 +1270,11 @@ const ctx = {
   get callAgentLLM() { return callAgentLLM; },
 };
 
+// ─── Request Tracing (observability) ───────────────────────────────────
+if (process.env.NODE_ENV !== 'test') {
+  app.use(traceMiddleware(stmts, logger));
+}
+
 // ─── Modularized Routes ─────────────────────────────────────────
 app.use('/api/auth', authRoutes(ctx));
 app.use('/api', dashboardRoutes(ctx));
@@ -1291,6 +1298,7 @@ app.use('/api', aimiRoutes(ctx));
 app.use('/api', llmRoutes(ctx));
 app.use('/api', agentRoutes(ctx));
 app.use('/api', commsRoutes(ctx));
+app.use('/api', tracesRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
@@ -1565,7 +1573,7 @@ autoRegisterSystemTools(stmts, randomUUID, logger);
 try {
   const stored = db.prepare('SELECT key, value, encrypted FROM env_vars').all();
   for (const row of stored) {
-    process.env[row.key] = row.encrypted ? xorDecipher(row.value) : row.value;
+    process.env[row.key] = row.encrypted ? decryptValue(row.value, row.encrypted) : row.value;
   }
   if (stored.length) logger.info(`Loaded ${stored.length} env vars into process.env`);
 } catch {}
@@ -1649,6 +1657,12 @@ setInterval(() => {
     logger.error('Health monitor error:', err);
   }
 }, 15_000);
+
+// ─── Trace cleanup (hourly, 7-day retention) ───────────────────────────
+setInterval(() => {
+  try { stmts.traces.cleanup.run(); }
+  catch { /* non-critical */ }
+}, 3_600_000);
 
 // ─── Global Error Handler (must be last middleware) ──────────────
 app.use((err, req, res, _next) => {
