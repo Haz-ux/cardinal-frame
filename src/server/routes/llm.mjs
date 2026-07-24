@@ -132,6 +132,51 @@ export default function llmRoutes(ctx) {
     res.json({ ok: true });
   });
 
+  // ─── Test provider API key (before saving) ──────────────────
+
+  router.post('/llm/providers/test', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+    try {
+      const { type, api_key, base_url } = req.body;
+      if (!type) return res.status(400).json({ error: 'type required' });
+      if (!PROVIDER_TYPES[type] && !base_url) return res.status(400).json({ error: `Unknown type. Use: ${Object.keys(PROVIDER_TYPES).join(', ')}` });
+
+      const baseUrl = base_url || PROVIDER_TYPES[type]?.baseUrl || '';
+      if (!baseUrl && type !== 'ollama') return res.status(400).json({ error: 'base_url required for custom providers' });
+
+      // Build a minimal test request — just listing models or sending "Hi"
+      const testProvider = { type, api_key: api_key || '', base_url: baseUrl };
+      const testMessages = [{ role: 'user', content: 'Say "ok" and nothing else.' }];
+      const { buildChatUrl, buildChatPayload } = await import('./llm-helpers.mjs');
+      const rawUrl = buildChatUrl(baseUrl, type, PROVIDER_TYPES[type]?.hardcodedModels?.[0] || 'test', false);
+      const { headers, url } = buildProviderAuth(testProvider, rawUrl);
+      const payload = buildChatPayload(type, PROVIDER_TYPES[type]?.hardcodedModels?.[0] || 'test', testMessages, false);
+      if (!payload.max_tokens) payload.max_tokens = 10;
+      else payload.max_tokens = Math.min(payload.max_tokens, 10);
+
+      const resp = await fetch(url, {
+        method: 'POST', headers, body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        return res.json({ ok: false, status: resp.status, error: `${resp.status} ${resp.statusText}`, detail: text.slice(0, 500) });
+      }
+
+      const data = await resp.json();
+      // Extract the actual response text to confirm the model works
+      let reply = '';
+      if (type === 'ollama') reply = data.message?.content || '';
+      else if (type === 'google') reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      else if (type === 'anthropic') reply = data.content?.[0]?.text || '';
+      else reply = data.choices?.[0]?.message?.content || '';
+
+      res.json({ ok: true, reply: reply.slice(0, 100), model_used: payload.model });
+    } catch (e) {
+      res.json({ ok: false, error: e.message?.slice(0, 500) || 'Connection failed' });
+    }
+  });
+
   // ─── Auto-detect models from a provider ──────────────────────
   router.post('/llm/providers/:id/detect', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     const provider = stmts.providers.getById.get(req.params.id);

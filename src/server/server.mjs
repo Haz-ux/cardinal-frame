@@ -43,6 +43,7 @@ import settingsRoutes, { getDevSetting, getDevSettings, decryptValue } from './r
 import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
+import skillHubRoutes from './routes/skill-hub.mjs';
 import chainsRoutes from './routes/chains.mjs';
 import evolutionRoutes from './routes/evolution.mjs';
 import heartbeatRulesRoutes from './routes/heartbeat-rules.mjs';
@@ -1345,6 +1346,7 @@ app.use('/api', settingsRoutes(ctx));
 app.use('/api', chatConvRoutes(ctx));
 app.use('/api', chatCompRoutes(ctx));
 app.use('/api', skillsRoutes(ctx));
+app.use('/api', skillHubRoutes(ctx));
 app.use('/api', chainsRoutes(ctx));
 app.use('/api', evolutionRoutes(ctx));
 app.use('/api', heartbeatRulesRoutes(ctx));

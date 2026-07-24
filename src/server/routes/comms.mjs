@@ -564,6 +564,91 @@ router.get('/comms/status', authMiddleware, (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Register Telegram webhook (one-click setup)
+router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const { channel_id, webhook_url } = req.body;
+    if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+    const channel = stmts.commsChannels.getById.get(channel_id);
+    if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
+    const config = JSON.parse(channel.config);
+    if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
+
+    const baseUrl = webhook_url || req.body.base_url;
+    if (!baseUrl) return res.status(400).json({ error: 'webhook_url or base_url required' });
+    const fullUrl = `${baseUrl.replace(/\/$/, '')}/api/comms/telegram/webhook?channel_id=${channel_id}`;
+
+    // Delete existing webhook, then set new one
+    await telegramApiCall(config.bot_token, 'deleteWebhook', {});
+    const result = await telegramApiCall(config.bot_token, 'setWebhook', { url: fullUrl, allowed_updates: ['message', 'channel_post'] });
+
+    // Stop polling if active, switch to webhook mode
+    stopChannelPoller(channel_id);
+    config.webhook_mode = true;
+    config.webhook_url = fullUrl;
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
+
+    logger.info(`Telegram webhook registered for channel ${channel.name}: ${fullUrl}`);
+    res.json({ ok: true, webhook_url: fullUrl, description: result.description || 'Webhook set' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Unregister Telegram webhook (switch back to polling)
+router.post('/comms/telegram/remove-webhook', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const { channel_id } = req.body;
+    if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+    const channel = stmts.commsChannels.getById.get(channel_id);
+    if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
+    const config = JSON.parse(channel.config);
+    if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
+
+    await telegramApiCall(config.bot_token, 'deleteWebhook', {});
+    config.webhook_mode = false;
+    delete config.webhook_url;
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
+
+    // Restart polling
+    if (channel.enabled) startChannelPoller(channel);
+    logger.info(`Telegram webhook removed for channel ${channel.name}`);
+    res.json({ ok: true, mode: 'polling' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Register Discord slash commands (one-click setup)
+router.post('/comms/discord/setup-commands', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const { channel_id } = req.body;
+    if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+    const channel = stmts.commsChannels.getById.get(channel_id);
+    if (!channel || channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
+    const config = JSON.parse(channel.config);
+    if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
+
+    // Register global slash commands
+    const commands = [
+      { name: 'ask', description: 'Ask the Cardinal Frame agent a question', options: [{ type: 3, name: 'prompt', description: 'Your question', required: true }] },
+      { name: 'status', description: 'Check Cardinal Frame status' },
+      { name: 'tasks', description: 'List active agent tasks' },
+    ];
+
+    const resp = await fetch('https://discord.com/api/v10/applications/' + config.application_id + '/commands', {
+      method: 'PUT',
+      headers: { 'Authorization': `Bot ${config.bot_token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(commands),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      return res.json({ ok: false, error: `${resp.status} ${resp.statusText}`, detail: text.slice(0, 500) });
+    }
+
+    const registered = await resp.json();
+    logger.info(`Discord slash commands registered for channel ${channel.name}: ${registered.length} commands`);
+    res.json({ ok: true, commands: registered.map(c => c.name) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Telegram webhook receiver (alternative to polling)
 router.post('/comms/telegram/webhook', async (req, res) => {
   try {
