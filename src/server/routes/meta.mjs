@@ -461,14 +461,22 @@ router.post('/plugins', authMiddleware, requireRole('admin'), (req, res) => {
 });
 
 // ─── Audit Log API ────────────────────────────────────────────────
-router.get('/audit', authMiddleware, requireRole('admin'), (_req, res) => {
- const rows = stmts.audit.getAll.all();
- res.json(rows.map(r => ({ ...r, details: JSON.parse(r.details) })));
+// Reads from governance audit_log via stmts.governance.audit
+router.get('/audit', authMiddleware, requireRole('admin'), (req, res) => {
+ const limit = parseInt(req.query.limit) || 100;
+ const rows = stmts.governance.audit.getAll.all(limit);
+ res.json(rows.map(r => ({ ...r, details: JSON.parse(r.details || '{}') })));
 });
 
-router.get('/audit/:resourceType/:resourceId', authMiddleware, optionalAuth, (req, res) => {
- const rows = stmts.audit.getByResource.all(req.params.resourceType, req.params.resourceId);
- res.json(rows.map(r => ({ ...r, details: JSON.parse(r.details) })));
+router.get('/audit/actor/:actor', authMiddleware, requireRole('admin'), (req, res) => {
+ const limit = parseInt(req.query.limit) || 100;
+ const rows = stmts.governance.audit.getByActor.all(req.params.actor, limit);
+ res.json(rows.map(r => ({ ...r, details: JSON.parse(r.details || '{}') })));
+});
+
+router.get('/audit/trace/:traceId', authMiddleware, requireRole('admin'), (req, res) => {
+ const rows = stmts.governance.audit.getByTrace.all(req.params.traceId);
+ res.json(rows.map(r => ({ ...r, details: JSON.parse(r.details || '{}') })));
 });
 
 

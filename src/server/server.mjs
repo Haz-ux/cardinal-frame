@@ -1626,9 +1626,13 @@ collectTelemetry();
 // only through real relationships. Edges carry strength so the layout responds
 // proportionally. Each cluster head is the local hub for its domain.
 // ─── Audit Log Helper ──────────────────────────────────────────────
+// Writes to the governance audit_log table via stmts.governance.audit.
+// Column mapping: actor=userId, action=action, target=resourceType:resourceId,
+// details=details, trace_id=null
 function audit(action, resourceType, resourceId, userId, details = {}) {
  try {
-  stmts.audit.insert.run(action, resourceType, resourceId || null, userId || null, JSON.stringify(details));
+  const target = resourceId ? `${resourceType}:${resourceId}` : resourceType;
+  stmts.governance.audit.insert.run(userId || 'system', action, target, JSON.stringify(details), null);
  } catch (err) {
   logger.error(`Audit log write failed: ${err.message}`);
  }
