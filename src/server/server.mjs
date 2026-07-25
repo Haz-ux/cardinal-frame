@@ -33,6 +33,7 @@ import activityRoutes from './routes/activity.mjs';
 import delegationRoutes from './routes/delegation.mjs';
 import metaRoutes from './routes/meta.mjs';
 import { runSandboxed, runSandboxedHybrid } from './routes/sandbox.mjs';
+import { executeInDocker, isDockerAvailable } from './routes/docker-backend.mjs';
 import usersRoutes from './routes/users.mjs';
 import stateRoutes from './routes/state.mjs';
 import costsRoutes, { getModelCost } from './routes/costs.mjs';
@@ -54,10 +55,12 @@ import agentRoutes, { callAgentLLM, agentTools, runAgentLoop } from './routes/ag
 import commsRoutes from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
+import nodesRoutes from './routes/nodes.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { executeSkillChain } from './chains.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
+import { initNodeRegistry } from './node-registry.mjs';
 import { runMigrations } from './migrator.mjs';
 
 dotenv.config();
@@ -755,6 +758,7 @@ db.exec(`
     if (!skillCols2.includes('version')) db.exec("ALTER TABLE skills ADD COLUMN version INTEGER DEFAULT 1");
     if (!skillCols2.includes('last_invoked')) db.exec("ALTER TABLE skills ADD COLUMN last_invoked TEXT");
     if (!skillCols2.includes('invoke_count')) db.exec("ALTER TABLE skills ADD COLUMN invoke_count INTEGER DEFAULT 0");
+    if (!skillCols2.includes('execution_backend')) db.exec("ALTER TABLE skills ADD COLUMN execution_backend TEXT DEFAULT 'local'");
   } catch (e) { logger.warn('Skills migration:', e.message); }
 
   // ─── Prepared Statements ───────────────────────────────────────────
@@ -1357,6 +1361,7 @@ const ctx = {
   matchSkillTrigger,
   getDevSetting, getDevSettings,
   runSandboxed, runSandboxedHybrid,
+  executeInDocker, isDockerAvailable,
   getModelCost, buildAimiSystemPrompt,
   checkPermission, auditLog,
   // These are populated later (declared with const/let below)
@@ -1367,12 +1372,20 @@ const ctx = {
   get sanitizeCommand() { return sanitizeCommand; },
   get callAgentLLM() { return callAgentLLM; },
   get runAgentLoop() { return runAgentLoop; },
+  get nodeRegistry() { return nodeRegistry; },
 };
 
 // ─── Request Tracing (observability) ───────────────────────────────────
 if (process.env.NODE_ENV !== 'test') {
   app.use(traceMiddleware(stmts, logger));
 }
+
+// ─── Node Registry (cross-node delegation liveness) ────────────────────
+const nodeRegistry = initNodeRegistry(db);
+nodeRegistry.setBroadcast(broadcast);
+nodeRegistry.startHeartbeat(parseInt(process.env.NODE_HEARTBEAT_INTERVAL || '30') * 1000);
+globalThis._nodeRegistry = nodeRegistry;
+logger.info('Node registry initialized — heartbeat loop started');
 
 // ─── Modularized Routes ─────────────────────────────────────────
 app.use('/api/auth', authRoutes(ctx));
@@ -1403,6 +1416,7 @@ app.use('/api', agentRoutes(ctx));
 app.use('/api', commsRoutes(ctx));
 app.use('/api', tracesRoutes(ctx));
 app.use('/api', governanceRoutes(ctx));
+app.use('/api', nodesRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {

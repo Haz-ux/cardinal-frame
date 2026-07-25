@@ -25,6 +25,8 @@ const OFFLINE_THRESHOLD_MS = 90_000;  // 3 missed heartbeats = offline
  * @returns {{ registerNode, getNode, getAllNodes, getReachableNode, startHeartbeat, stopHeartbeat, updateNodeStatus }}
  */
 export function initNodeRegistry(db) {
+  let _broadcast = null;
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS nodes (
       id TEXT PRIMARY KEY,              -- cryptographic node_id from Task 0
@@ -132,9 +134,15 @@ export function initNodeRegistry(db) {
 
   /**
    * Mark a node's status (online/offline/unknown).
+   * Broadcasts the change via WS if a broadcast fn is set.
    */
   function updateNodeStatus(nodeId, status) {
+    const prev = stmts.getById.get(nodeId);
+    const prevStatus = prev?.status;
     stmts.updateStatus.run(status, nodeId);
+    if (_broadcast && prevStatus && prevStatus !== status) {
+      _broadcast('node:status', { id: nodeId, name: prev?.name, status, prevStatus });
+    }
   }
 
   /**
@@ -181,7 +189,12 @@ export function initNodeRegistry(db) {
       }
 
       // Signature verified — node is alive and authentic
+      const prev = stmts.getById.get(node.id);
+      const wasOffline = prev && prev.status !== 'online';
       stmts.updateLastSeen.run(node.id);
+      if (_broadcast && wasOffline) {
+        _broadcast('node:status', { id: node.id, name: prev?.name, status: 'online', prevStatus: prev?.status });
+      }
       return true;
     } catch {
       // Network error, timeout, etc.
@@ -246,6 +259,7 @@ export function initNodeRegistry(db) {
     heartbeatCycle,
     startHeartbeat,
     stopHeartbeat,
+    setBroadcast: (fn) => { _broadcast = fn; },
     _stmts: stmts, // exposed for testing
   };
 }

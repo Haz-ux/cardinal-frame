@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { runSandboxed, runSandboxedHybrid } from './sandbox.mjs';
+import { executeInDocker, isDockerAvailable } from './docker-backend.mjs';
 import { checkProposalContent } from '../skill-safety.mjs';
 
 /**
@@ -74,6 +75,9 @@ export async function executeSkill(skill, input = {}, traceId = null) {
     getDevSetting,
     runSandboxed: sb,
     runSandboxedHybrid: sbHybrid,
+    executeInDocker: dockerExec,
+    isDockerAvailable: dockerCheck,
+    logger: log,
   } = deps;
 
   const handlerStr = skill.handler || '';
@@ -107,8 +111,40 @@ export async function executeSkill(skill, input = {}, traceId = null) {
       // Script skill — pure JS function (sandboxed via vm.runInNewContext)
       const secrets = collectSkillSecrets(skill);
       const sandboxTimeoutMs = parseInt(getDevSetting(db, 'sandboxTimeout', '30'), 10) * 1000;
-      const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
-      result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime };
+      const backend = skill.execution_backend || 'local';
+
+      if (backend === 'docker') {
+        // Docker execution backend — isolated container with resource limits
+        if (dockerCheck && dockerCheck()) {
+          log.info(`Skill "${skill.name}" executing in Docker backend`);
+          const dockerResult = await dockerExec({
+            code: handlerStr,
+            input,
+            timeoutMs: sandboxTimeoutMs,
+            env: secrets,
+          });
+          if (dockerResult.ok) {
+            result = { ok: true, type: 'docker', output: dockerResult.output, duration_ms: Date.now() - startTime, execution_backend: 'docker' };
+          } else if (dockerResult.error === 'Docker is not available on this host') {
+            // Docker went away between check and exec — graceful fallback
+            log.warn(`Docker unavailable for "${skill.name}" — falling back to local sandbox`);
+            const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+            result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local (docker fallback)' };
+          } else {
+            // Docker execution failed with a real error (timeout, crash, etc.)
+            result = { ok: false, error: dockerResult.error, duration_ms: Date.now() - startTime, execution_backend: 'docker' };
+          }
+        } else {
+          // Docker not available on this host — graceful fallback to local sandbox
+          log.warn(`Docker backend requested for "${skill.name}" but Docker unavailable — falling back to local sandbox`);
+          const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+          result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local (docker fallback)' };
+        }
+      } else {
+        // Default: local VM sandbox
+        const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+        result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local' };
+      }
     }
   } catch (err) {
     result = { ok: false, error: err.message, duration_ms: Date.now() - startTime };
@@ -185,6 +221,9 @@ export default function skillsRoutes(ctx) {
     getDevSetting,
     runSandboxed: ctx.runSandboxed || runSandboxed,
     runSandboxedHybrid: ctx.runSandboxedHybrid || runSandboxedHybrid,
+    executeInDocker: ctx.executeInDocker || executeInDocker,
+    isDockerAvailable: ctx.isDockerAvailable || isDockerAvailable,
+    logger: ctx.logger || console,
   };
 
   const router = express.Router();
@@ -238,16 +277,21 @@ export default function skillsRoutes(ctx) {
     const existing = stmts.skills.getByName.get(name);
     if (existing) return res.status(409).json({ error: 'Skill already exists' });
     const id = randomUUID();
+    const executionBackend = req.body.execution_backend || 'local';
     stmts.skills.insertWithTrigger.run(id, name, description || '', category || 'general', handler, JSON.stringify(parameters || {}), enabled !== false ? 1 : 0, trigger || '');
-    audit('create', 'skill', id, req.user.id, { name, category });
+    db.prepare('UPDATE skills SET execution_backend = ? WHERE id = ?').run(executionBackend, id);
+    audit('create', 'skill', id, req.user.id, { name, category, execution_backend: executionBackend });
     res.status(201).json({ id, name });
   });
 
   router.put('/skills/:id', authMiddleware, requireRole('admin'), (req, res) => {
     const skill = stmts.skills.getById.get(req.params.id);
     if (!skill) return res.status(404).json({ error: 'Skill not found' });
-    const { description, category, parameters, enabled } = req.body;
+    const { description, category, parameters, enabled, execution_backend } = req.body;
     stmts.skills.update.run(description ?? skill.description, category ?? skill.category, JSON.stringify(parameters ?? JSON.parse(skill.parameters)), enabled !== undefined ? (enabled ? 1 : 0) : skill.enabled, req.params.id);
+    if (execution_backend) {
+      db.prepare('UPDATE skills SET execution_backend = ? WHERE id = ?').run(execution_backend, req.params.id);
+    }
     res.json({ ok: true });
   });
 
