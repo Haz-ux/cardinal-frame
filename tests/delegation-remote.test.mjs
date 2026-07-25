@@ -357,26 +357,13 @@ describe('Remote Delegation — result reporting', () => {
 });
 
 describe('Remote Delegation — self-recovery from local durable queue', () => {
-  it('should recover interrupted remote tasks on restart', () => {
+  it('should recover interrupted remote tasks on restart — exercises real recovery code', async () => {
+    // Build a real DB with delegation routes' actual schema
     const db = new Database(':memory:');
     db.pragma('journal_mode = WAL');
 
-    // Create the same schema as delegation.mjs
+    // Create tasks table (needed by stmts mock)
     db.exec(`
-      CREATE TABLE IF NOT EXISTS delegations (
-        id TEXT PRIMARY KEY, parent_task_id TEXT, parent_session_id TEXT,
-        child_task_id TEXT, agent_id TEXT, node TEXT DEFAULT 'local',
-        status TEXT DEFAULT 'pending', capability TEXT, priority TEXT DEFAULT 'medium',
-        synchronous INTEGER DEFAULT 0, result TEXT, error TEXT, signature TEXT, reported_by TEXT,
-        created_at TEXT DEFAULT (datetime('now')), completed_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS remote_task_queue (
-        id TEXT PRIMARY KEY, delegation_id TEXT NOT NULL, source_node_id TEXT NOT NULL,
-        command TEXT NOT NULL, agent_id TEXT, status TEXT DEFAULT 'pending',
-        attempts INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
-        last_error TEXT, result TEXT,
-        created_at TEXT DEFAULT (datetime('now')), started_at TEXT, completed_at TEXT
-      );
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY, name TEXT, command TEXT, status TEXT DEFAULT 'pending',
         assigned_to TEXT, exit_code INTEGER, result TEXT, completed_at TEXT,
@@ -384,26 +371,163 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
       );
     `);
 
-    // Simulate a task that was interrupted mid-execution (status = 'running')
-    db.prepare(`INSERT INTO remote_task_queue (id, delegation_id, source_node_id, command, status, attempts) VALUES (?, ?, ?, ?, 'running', 1)`)
-      .run('queue-1', 'delegation-1', 'source-node-1', 'echo hello');
+    // Mock executeTask — simulates the task completing after a short delay
+    // by writing directly to the tasks table (mimics child.on('close') callback)
+    let executeTaskCallCount = 0;
+    const executeTask = (taskId, command) => {
+      executeTaskCallCount++;
+      setTimeout(() => {
+        db.prepare("UPDATE tasks SET status = 'done', exit_code = 0, result = 'recovered output', completed_at = datetime('now') WHERE id = ?")
+          .run(taskId);
+      }, 100); // 100ms delay to simulate real execution
+    };
+
+    // Track fetch calls — reject first 2 (coordinator unreachable), then succeed
+    let fetchCallCount = 0;
+    let coordinatorDelegationStatus = null;
+    const mockFetch = async (url, opts) => {
+      fetchCallCount++;
+      if (fetchCallCount <= 2) {
+        throw new Error('ECONNREFUSED — coordinator unreachable');
+      }
+      // Third call succeeds — coordinator accepts the report
+      const body = JSON.parse(opts.body);
+      coordinatorDelegationStatus = body.payload.status;
+      return { ok: true, json: async () => ({ ok: true, status: body.payload.status }) };
+    };
+
+    const stmts = {
+      agents: {
+        getAll: { all: () => [] },
+        getById: { get: () => null },
+      },
+      tasks: {
+        insert: { run: (id, name, cmd, status, user, agent) => { db.prepare('INSERT OR IGNORE INTO tasks (id, name, command, status, assigned_to) VALUES (?, ?, ?, ?, ?)').run(id, name, cmd, status, agent) } },
+        assignAgent: { run: () => {} },
+        updateStatus: { run: () => {} },
+        getById: { get: (id) => db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) },
+        getAll: { all: () => db.prepare('SELECT * FROM tasks').all() },
+      },
+    };
+
+    const ctx = {
+      db, stmts, executeTask,
+      audit: () => {}, broadcast: () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      sanitizeCommand: (cmd) => ({ safe: true, command: cmd }),
+      authMiddleware: (req, res, next) => { req.user = { id: 'test' }; next(); },
+      optionalAuth: (req, res, next) => { req.user = { id: 'test' }; next(); },
+      requireRole: () => (req, res, next) => next(),
+      apiLimiter: (req, res, next) => next(),
+      nodeRegistry: null, // no registry on this node — it's the worker
+    };
+
+    // Mount the real delegation routes — this creates the schema and
+    // runs startup recovery (which should find no stale tasks yet)
+    const delegationRoutes = (await import('../src/server/routes/delegation.mjs')).default;
+    const router = delegationRoutes(ctx);
+
+    // The startup recovery ran with no stale tasks — now simulate a crash
+    // by inserting a 'running' task that was interrupted.
+    // INSERT ORDER MATTERS: tasks before delegations (FK constraint)
+    db.prepare(`INSERT INTO tasks (id, name, command, status) VALUES (?, ?, ?, ?)`)
+      .run('child-test-1', 'recovered task', 'echo hello', 'pending');
 
     db.prepare(`INSERT INTO delegations (id, child_task_id, node, status) VALUES (?, ?, ?, ?)`)
-      .run('delegation-1', 'child-1', 'REMOTE_NODE', 'running');
+      .run('del-test-1', 'child-test-1', 'COORDINATOR', 'running');
 
-    db.prepare(`INSERT INTO tasks (id, name, command, status) VALUES (?, ?, ?, ?)`)
-      .run('child-1', 'test', 'echo hello', 'running');
+    db.prepare(`INSERT INTO remote_task_queue (id, delegation_id, source_node_id, command, status, attempts) VALUES (?, ?, ?, ?, 'running', 1)`)
+      .run('queue-test-1', 'del-test-1', 'coordinator-node-id', 'echo hello');
 
-    // Simulate restart — recoverStale should flip 'running' back to 'pending'
-    const result = db.prepare(`UPDATE remote_task_queue SET status = 'pending', last_error = 'Interrupted by restart' WHERE status = 'running'`).run();
-    expect(result.changes).toBe(1);
+    // Override the report queue's getCoordinatorUrl so it returns a URL
+    // (which will use our mocked fetch)
+    const reportQueue = router._reportQueue;
+    // Monkey-patch getCoordinatorUrl by re-initializing with a mock
+    // Actually, the report queue uses getCoordinatorUrl from closure which
+    // checks nodeRegistry — which is null. Let's verify the report stays queued.
+    // Instead, let's recreate with a working coordinator URL:
+    reportQueue.stop();
 
-    // Verify the task is back in pending state
-    const recovered = db.prepare('SELECT * FROM remote_task_queue WHERE status = ?').all('pending');
-    expect(recovered).toHaveLength(1);
-    expect(recovered[0].last_error).toBe('Interrupted by restart');
-    expect(recovered[0].command).toBe('echo hello');
+    // Create a new report queue with a real coordinator URL
+    const { createReportQueue } = await import('../src/server/report-queue.mjs');
+    const { getOrCreateNodeIdentity } = await import('../src/server/node-identity.mjs');
+    const identity = getOrCreateNodeIdentity(db); // this node's identity
+
+    const newReportQueue = createReportQueue(db, {
+      getCoordinatorUrl: () => 'http://coordinator.local:8080',
+      fetchFn: mockFetch,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    // Replace the report queue's queueOutboundReport by patching the closure ref
+    // Actually, we need to use the report queue that executeAndReport uses.
+    // Since we can't easily swap it, let's call recoverInterruptedTasks directly
+    // and manually call attemptFlush with our mocked fetch.
+
+    // Call the real recovery function — this should:
+    // 1. Flip 'running' queue row to 'pending' via recoverStale
+    // 2. Re-execute the task via executeTask (mocked)
+    // 3. Wait for task completion (polls tasks table)
+    // 4. Record outcome in remote_task_queue
+    // 5. Enqueue outbound report
+
+    // First, manually flush the report queue with our mock
+    // We need to replace the reportQueue reference used inside executeAndReport.
+    // Since that's in a closure, let's just verify the queue row was created
+    // and manually flush it with our mocked fetch.
+
+    await router._recoverInterruptedTasks();
+
+    // Assert: executeTask was called (the recovery path re-ran the task)
+    expect(executeTaskCallCount).toBeGreaterThan(0);
+
+    // Assert: remote_task_queue is now 'completed' (not left at 'running')
+    const queueRow = db.prepare('SELECT * FROM remote_task_queue WHERE id = ?').get('queue-test-1');
+    // recoverStale flips to 'pending', then executeAndReport claims to 'running',
+    // then queueComplete marks as 'completed'
+    expect(['completed', 'running', 'pending']).toContain(queueRow.status);
+
+    // Wait a bit for the async task completion
+    await new Promise(r => setTimeout(r, 300));
+
+    const finalQueueRow = db.prepare('SELECT * FROM remote_task_queue WHERE id = ?').get('queue-test-1');
+    expect(finalQueueRow.status).toBe('completed');
+    const outcome = JSON.parse(finalQueueRow.result);
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.result).toBe('recovered output');
+
+    // Assert: a pending_reports row was created (coordinator was unreachable)
+    const reportRows = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
+    expect(reportRows.length).toBeGreaterThan(0);
+    expect(reportRows[0].status).toBe('completed');
+    expect(reportRows[0].attempts).toBeGreaterThanOrEqual(0);
+
+    // Now flush with the mocked fetch — first 2 calls fail, 3rd succeeds
+    await newReportQueue.attemptFlush();
+    // First attempt fails (coordinator unreachable)
+    const afterFirstFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
+    expect(afterFirstFlush.length).toBeGreaterThan(0); // still there
+
+    await newReportQueue.attemptFlush();
+    // Second attempt also fails
+    const afterSecondFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
+    expect(afterSecondFlush.length).toBeGreaterThan(0); // still there
+
+    await newReportQueue.attemptFlush();
+    // Third attempt should succeed — report delivered, row deleted
+    const afterThirdFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
+    expect(afterThirdFlush.length).toBe(0); // delivered and removed
+
+    // Assert: coordinator received the correct status
+    expect(coordinatorDelegationStatus).toBe('completed');
+
+    // Assert: the task itself was never blocked by coordinator being unreachable
+    const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get('child-test-1');
+    expect(taskRow.status).toBe('done');
+
+    // Assert: fetch was called exactly 3 times (2 failed + 1 success)
+    expect(fetchCallCount).toBe(3);
 
     db.close();
-  });
+  }, 15000);
 });

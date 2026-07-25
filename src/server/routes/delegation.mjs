@@ -2,6 +2,7 @@ import express from 'express';
 import { randomUUID } from 'crypto';
 import { signPayload, verifyPayload, getOrCreateNodeIdentity } from '../node-identity.mjs';
 import { canDelegateToNode } from './governance.mjs';
+import { createReportQueue } from '../report-queue.mjs';
 
 /**
  * Delegation — Cross-node subagent task delegation
@@ -120,7 +121,82 @@ export default function delegationRoutes(ctx) {
     return ctx.nodeRegistry || null;
   }
 
+  // ─── Report Queue (outbound reports to coordinator) ───────────────
+  // Returns coordinator's base_url from the node registry, or null.
+  function getCoordinatorUrl() {
+    const registry = getRegistry();
+    if (!registry) return null;
+    // Find the coordinator by looking for a node that is not us
+    const ourIdentity = getIdentity();
+    const nodes = registry.getAllNodes();
+    const coordinator = nodes.find(n => n.id !== ourIdentity.node_id);
+    return coordinator?.base_url || null;
+  }
+
+  const reportQueue = createReportQueue(db, {
+    getCoordinatorUrl,
+    logger,
+  });
+
   // ─── Helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Wait for a task to reach a terminal state by polling the tasks table.
+   * executeTask is fire-and-forget (spawns child process, result written
+   * asynchronously via child.on('close') callback), so we poll for completion.
+   *
+   * @param {string} taskId
+   * @param {number} timeoutMs — max wait (default 30s)
+   * @returns {Promise<{ status: string, exitCode: number, result: string }>}
+   */
+  function waitForTask(taskId, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+      const pollMs = 200;
+      const deadline = Date.now() + timeoutMs;
+
+      function poll() {
+        const task = stmts.tasks.getById.get(taskId);
+        if (task && (task.status === 'done' || task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')) {
+          resolve({
+            status: task.status === 'done' ? 'completed' : task.status,
+            exitCode: task.exit_code ?? 0,
+            result: task.result || '',
+          });
+          return;
+        }
+        if (Date.now() > deadline) {
+          reject(new Error(`Task ${taskId} did not complete within ${timeoutMs}ms`));
+          return;
+        }
+        setTimeout(poll, pollMs);
+      }
+      poll();
+    });
+  }
+
+  /**
+   * Execute a task, wait for it to finish, record the outcome in the
+   * remote_task_queue, and enqueue an outbound report to the coordinator.
+   * Used by both the fresh-receive path and the startup recovery path.
+   *
+   * @param {object} task — remote_task_queue row
+   * @param {string} childTaskId — the tasks.id to execute
+   * @param {string} command — shell command
+   */
+  async function executeAndReport(task, childTaskId, command) {
+    delStmts.queueClaim.run(task.id);
+    try {
+      executeTask(childTaskId, command);
+      const outcome = await waitForTask(childTaskId);
+      delStmts.queueComplete.run(JSON.stringify(outcome), task.id);
+      reportQueue.queueOutboundReport(task.delegation_id, outcome.status === 'completed' ? 'completed' : 'failed', outcome);
+      logger.info(`[recovery] Task ${childTaskId} completed: status=${outcome.status} exit=${outcome.exitCode}`);
+    } catch (err) {
+      delStmts.queueFail.run(err.message.slice(0, 500), task.id);
+      reportQueue.queueOutboundReport(task.delegation_id, 'failed', { error: err.message });
+      logger.error(`[recovery] Task ${childTaskId} failed: ${err.message}`);
+    }
+  }
 
   function findAgentByCapability(capability) {
     const agents = stmts.agents.getAll.all().filter(a => a.status === 'active');
@@ -445,16 +521,15 @@ export default function delegationRoutes(ctx) {
       );
     }
 
-    // Execute the task locally on this node
-    // The task result will be reported back via /report when complete
-    try {
-      executeTask(childTaskId, payload.command);
-      // Mark queue entry as running
-      delStmts.queueClaim.run(queueId);
-    } catch (err) {
-      delStmts.queueFail.run(err.message.slice(0, 500), queueId);
-      return res.status(500).json({ error: 'Failed to start task execution' });
-    }
+    // Execute the task locally on this node, wait for outcome, and
+    // enqueue an outbound report to the coordinator (best-effort).
+    // executeAndReport is async but we don't await it here — the HTTP
+    // response returns 202 Accepted immediately, and the report goes
+    // out when the task finishes.
+    const queueRow = delStmts.queueGetById.get(queueId);
+    executeAndReport(queueRow, childTaskId, payload.command).catch((err) => {
+      logger.error(`[receive] executeAndReport error: ${err.message}`);
+    });
 
     broadcast('delegation:received', { delegation_id: payload.delegation_id, source: sourceNode.name });
     logger.info(`Delegation received from ${sourceNode.name}: ${payload.delegation_id} → task ${childTaskId}`);
@@ -566,24 +641,38 @@ export default function delegationRoutes(ctx) {
 
   // ─── Remote task queue management (for node-side self-recovery) ───
 
-  // Resume any interrupted remote tasks on startup
-  const stale = delStmts.queueRecoverStale.run();
-  if (stale.changes > 0) {
-    logger.info(`Recovered ${stale.changes} interrupted remote task(s) after restart`);
-    // Re-enqueue recovered tasks for execution
+  /**
+   * Resume interrupted remote tasks after a restart.
+   * Exported on the router so tests can invoke it directly rather than
+   * re-running the factory. Each recovered task is awaited, its real
+   * outcome is recorded in remote_task_queue, and an outbound report
+   * is enqueued for the coordinator.
+   */
+  async function recoverInterruptedTasks() {
+    const stale = delStmts.queueRecoverStale.run();
+    if (stale.changes > 0) {
+      logger.info(`Recovered ${stale.changes} interrupted remote task(s) after restart`);
+    }
     const pending = delStmts.queueGetPending.all('pending');
     for (const task of pending) {
-      try {
-        const delegation = delStmts.getById.get(task.delegation_id);
-        if (delegation && delegation.child_task_id) {
-          executeTask(delegation.child_task_id, task.command);
-          delStmts.queueClaim.run(task.id);
-        }
-      } catch (err) {
-        delStmts.queueFail.run(err.message.slice(0, 500), task.id);
+      const delegation = delStmts.getById.get(task.delegation_id);
+      if (delegation && delegation.child_task_id) {
+        await executeAndReport(task, delegation.child_task_id, task.command);
       }
     }
   }
+
+  // Run recovery on startup (don't block server boot — fire and forget)
+  recoverInterruptedTasks().catch((err) => {
+    logger.error(`[recovery] Startup recovery error: ${err.message}`);
+  });
+
+  // Start the periodic report flusher
+  reportQueue.scheduleReportFlush();
+
+  // Expose recovery function and report queue on the router for testing
+  router._recoverInterruptedTasks = recoverInterruptedTasks;
+  router._reportQueue = reportQueue;
 
   return router;
 }
