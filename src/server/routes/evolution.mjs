@@ -1,11 +1,75 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
+import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
+import path from 'path';
 import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from '../evolution.mjs';
 
 /**
  * Evolution routes: auto-skill distill, chain promotion, skill hub install/export.
  * Dependencies: db, stmts, authMiddleware, requireRole, apiLimiter, broadcast, callAgentLLM
  */
+
+// ─── Source gatherers for distill ───────────────────────────
+
+const MAX_SOURCE_CHARS = 24000; // truncate before it hits the LLM prompt
+
+/** Gather conversation source: observations + messages → text */
+function gatherConversation(stmts, conversationId) {
+  const observations = stmts.observations.getByConversation.all(conversationId);
+  const messages = stmts.messages.getByConversation.all(conversationId);
+  if (observations.length === 0 && messages.length === 0) return null;
+
+  const obs = observations.map(o =>
+    `Input: "${(o.user_input || '').slice(0, 500)}" → Output: "${(o.assistant_output || '').slice(0, 200)}" (intent: ${o.intent || 'unknown'})`
+  ).join('\n');
+  const msgs = messages.map(m =>
+    `${m.role}: ${(m.content || '').slice(0, 300)}`
+  ).join('\n');
+  return `${msgs}\n\n## Observations\n${obs}`.slice(0, MAX_SOURCE_CHARS);
+}
+
+/** Gather directory source: read files, concatenate → text */
+function gatherDirectory(dirPath) {
+  if (!dirPath) return null;
+  const resolved = dirPath.startsWith('/') ? dirPath : path.resolve(dirPath);
+  if (!existsSync(resolved)) return null;
+  const stat = statSync(resolved);
+  if (!stat.isDirectory()) return null;
+
+  const files = readdirSync(resolved)
+    .filter(f => /\.(mjs|js|jsx|ts|tsx|json|md|txt|yaml|yml|sh|py)$/.test(f))
+    .sort()
+    .slice(0, 20); // cap at 20 files to keep prompt bounded
+
+  const parts = [];
+  for (const f of files) {
+    try {
+      const fp = path.join(resolved, f);
+      const content = readFileSync(fp, 'utf8');
+      parts.push(`### ${f}\n${content.slice(0, 2000)}`);
+    } catch { /* skip unreadable files */ }
+  }
+  if (parts.length === 0) return null;
+  return parts.join('\n\n').slice(0, MAX_SOURCE_CHARS);
+}
+
+/** Gather URL source: fetch page, strip HTML → text */
+async function gatherUrl(url) {
+  if (!url) return null;
+  const resp = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(15000) });
+  if (!resp.ok) throw new Error(`Failed to fetch URL: HTTP ${resp.status}`);
+  const raw = await resp.text();
+  // Strip HTML tags, collapse whitespace — minimal but sufficient
+  const text = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return text.slice(0, MAX_SOURCE_CHARS) || null;
+}
+
 export default function evolutionRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, broadcast, callAgentLLM } = ctx;
   const router = express.Router();
@@ -14,21 +78,53 @@ export default function evolutionRoutes(ctx) {
   // ─── Auto-Skill Authoring (Distill) ─────────────────────────────
   // ═════════════════════════════════════════════════════════════════
 
-  // POST /learn/distill — Aimi analyzes a conversation and auto-creates a skill
+  // POST /learn/distill — Aimi analyzes a source and auto-creates a skill
+  // Supports: conversation, directory, url, notes (defaults to conversation)
   router.post('/learn/distill', authMiddleware, apiLimiter, async (req, res) => {
     try {
-      const { conversation_id } = req.body;
-      if (!conversation_id) return res.status(400).json({ error: 'conversation_id required' });
+      const source_type = req.body.source_type || 'conversation';
+      let sourceRef = null;   // identifier for the evolution record (conversation_id, path, url, or 'notes')
+      let sourceContent = null;
 
-      const observations = stmts.observations.getByConversation.all(conversation_id);
-      const messages = stmts.messages.getByConversation.all(conversation_id);
-      if (observations.length === 0 && messages.length === 0)
-        return res.status(404).json({ error: 'No observations or messages found for this conversation' });
+      if (source_type === 'conversation') {
+        const { conversation_id } = req.body;
+        if (!conversation_id) return res.status(400).json({ error: 'conversation_id required' });
+        sourceRef = conversation_id;
+        sourceContent = gatherConversation(stmts, conversation_id);
+        if (!sourceContent) return res.status(404).json({ error: 'No observations or messages found for this conversation' });
 
-      const systemPrompt = buildDistillPrompt(observations, messages);
+      } else if (source_type === 'directory') {
+        const { path: dirPath } = req.body;
+        if (!dirPath) return res.status(400).json({ error: 'path required' });
+        sourceRef = dirPath;
+        sourceContent = gatherDirectory(dirPath);
+        if (!sourceContent) return res.status(404).json({ error: 'Directory not found or contains no readable files' });
+
+      } else if (source_type === 'url') {
+        const { url } = req.body;
+        if (!url) return res.status(400).json({ error: 'url required' });
+        sourceRef = url;
+        try {
+          sourceContent = await gatherUrl(url);
+        } catch (e) {
+          return res.status(502).json({ error: e.message });
+        }
+        if (!sourceContent) return res.status(404).json({ error: 'URL returned no readable content' });
+
+      } else if (source_type === 'notes') {
+        const { notes } = req.body;
+        if (!notes || !notes.trim()) return res.status(400).json({ error: 'notes required' });
+        sourceRef = 'notes';
+        sourceContent = notes.slice(0, MAX_SOURCE_CHARS);
+
+      } else {
+        return res.status(400).json({ error: `Unknown source_type: ${source_type}. Use: conversation, directory, url, or notes` });
+      }
+
+      const systemPrompt = buildDistillPrompt(source_type, sourceContent);
       const result = await callAgentLLM([
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: 'Distill this conversation into a reusable skill.' },
+        { role: 'user', content: 'Distill this into a reusable skill.' },
       ], req.body.model);
 
       let skillDef;
@@ -59,7 +155,7 @@ export default function evolutionRoutes(ctx) {
 
       // Record evolution
       const evoId = randomUUID();
-      stmts.evolution.insert.run(evoId, skillId, null, 1, 'auto-distill', null, conversation_id, `Auto-distilled from conversation ${conversation_id}`);
+      stmts.evolution.insert.run(evoId, skillId, null, 1, 'auto-distill', null, `${source_type}:${sourceRef}`, `Auto-distilled from ${source_type}:${sourceRef}`);
 
       broadcast('skill:distilled', { skillId, name: skillDef.name, confidence: skillDef.confidence });
       res.json({

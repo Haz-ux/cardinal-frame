@@ -142,6 +142,59 @@ describe('Auto-Skill Authoring (Distill) API', () => {
         .send({ skill_name: 'Test Skill', observations: ['do X', 'do Y'] });
       expect(res.status).toBe(401);
     });
+
+    it('should reject unknown source_type (400)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'telepathy' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Unknown source_type');
+    });
+
+    it('should accept notes source_type and return 200/400/500', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'notes', notes: 'When user asks for weather, call /api/weather and format the response as a card.' });
+      expect([200, 400, 500]).toContain(res.status);
+    });
+
+    it('should reject notes source_type with empty notes (400)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'notes', notes: '' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('notes required');
+    });
+
+    it('should reject directory source_type with missing path (400)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'directory' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('path required');
+    });
+
+    it('should reject directory source_type with nonexistent path (404)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'directory', path: '/nonexistent/path/that/does/not/exist' });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('Directory not found');
+    });
+
+    it('should reject url source_type with missing url (400)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('url required');
+    });
   });
 
   describe('GET /api/learn/patterns — list learned patterns (auth)', () => {

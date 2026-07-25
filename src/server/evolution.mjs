@@ -5,28 +5,24 @@
 import crypto from 'crypto';
 
 /**
- * Build the LLM prompt for distilling a conversation into a skill.
- * Aimi observes the input→output trajectory and generates a handler.
+ * Build the LLM prompt for distilling a source into a skill.
+ * Source-agnostic: works with conversations, directories, URLs, or notes.
+ *
+ * @param {string} sourceType - 'conversation' | 'directory' | 'url' | 'notes'
+ * @param {string} sourceContent - the gathered text to feed the LLM
  */
-export function buildDistillPrompt(observations, conversationMessages) {
-  const obs = observations.map(o =>
-    `Input: "${(o.user_input || '').slice(0, 500)}" → Output: "${(o.assistant_output || '').slice(0, 200)}" (intent: ${o.intent || 'unknown'})`
-  ).join('\n');
+export function buildDistillPrompt(sourceType, sourceContent) {
+  const headerLabel = sourceType === 'conversation'
+    ? '## Conversation History'
+    : '## Source Material';
 
-  const msgs = conversationMessages.map(m =>
-    `${m.role}: ${(m.content || '').slice(0, 300)}`
-  ).join('\n');
+  return `You are Aimi, analyzing ${sourceType === 'conversation' ? 'a user conversation' : 'source material'} to auto-author a reusable skill for Cardinal Frame.
 
-  return `You are Aimi, analyzing a user conversation to auto-author a reusable skill for Cardinal Frame.
-
-## Conversation History
-${msgs}
-
-## Observations
-${obs}
+${headerLabel}
+${sourceContent}
 
 ## Task
-Based on this conversation, create a reusable skill that can handle similar requests in the future.
+Based on this ${sourceType === 'conversation' ? 'conversation' : 'material'}, create a reusable skill that can handle similar requests in the future.
 The skill should be a JavaScript function body (no function wrapper) that receives \`input\` and returns a result.
 
 Available in the skill context:
