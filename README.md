@@ -1,8 +1,16 @@
 # Cardinal Frame
 
-A personal-scale AI agent orchestration platform with a cyberpunk/neon dashboard, multi-provider LLM integration, governance layer, and Obsidian-style neural map visualization.
+**Governance-gated execution, multi-node-native delegation, and live visual system state** — a personal-scale AI agent orchestration platform built for the Seraphim Protocol (three-node system: IKARIS / ARIES / Cardinal Frame control plane).
 
-Built for the Seraphim Protocol — a three-node personal system (IKARIS / MINERVA / Cardinal Frame control plane).
+**What makes it different:**
+
+1. **Governance-gated execution** — rules are enforced *before* a step runs, not just logged after. Persona SOUL docs define `node_permissions` that control which agents can delegate to which nodes. The deny floor blocks skill self-edits from touching governance, auth, or identity files — hardcoded, non-configurable, applies even with admin approval.
+
+2. **Multi-node-native** — delegation and node awareness are core architecture, not a plugin. Each node self-generates an Ed25519 identity (sha256 of public key = node_id). Signed heartbeats verify liveness. Delegation payloads are signed and signature-verified on receipt. Self-owned local recovery: each node runs its own durable job queue — if it crashes mid-task, it resumes on restart without the coordinator telling it to.
+
+3. **Visual system state** — the neural map (react-force-graph-2d) shows the live shape of what's running. Nodes pulse with activity, edges highlight on data flow. It shows meaningful file/connection relationships, not exhaustive data lists.
+
+Built with Express + SQLite (WAL) monolith backend, Vite + React 19 SPA frontend with cyberpunk/neon dark UI. 486 tests across 31 files.
 
 ## Features
 
@@ -33,7 +41,7 @@ cardinal-frame/
 │  │  └─ ...
 │  └─ shared/
 │     └─ schemas.mjs        # Shared zod schemas
-├─ tests/                   # Vitest test suite (27 files, 340+ tests)
+├─ tests/                   # Vitest test suite (31 files, 486+ tests)
 ├─ docs/adr/                 # Architecture Decision Records (13 ADRs)
 ├─ .github/workflows/ci.yml # CI pipeline
 ├─ Dockerfile               # 3-stage multi-stage build
