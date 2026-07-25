@@ -3,7 +3,7 @@ import ForceGraph2D from 'react-force-graph-2d';
 import * as d3 from 'd3-force';
 import { cachedFetch } from './dataCache';
 import { useWebSocket } from './useWebSocket';
-import { ActivityFeed, useActivityFeed } from './ActivityOverlay';
+import { ActivityFeed, useActivityFeed, useActivityPulses } from './ActivityOverlay';
 import { usePolling } from './usePolling';
 import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity } from 'lucide-react';
 
@@ -366,6 +366,33 @@ export default function NeuralMap() {
  // Activity feed
  const activity = useActivityFeed();
 
+ // Live execution overlay — pulses on nodes when activity events fire
+ const pulses = useActivityPulses(graphData.nodes);
+ const pulsesRef = useRef([]);
+ useEffect(() => { pulsesRef.current = pulses; }, [pulses]);
+
+ // Edge animation state — map of "srcId→tgtId" → highlight expiry
+ const edgeHighlightRef = useRef(new Map());
+ const { lastMsg } = useWebSocket();
+ useEffect(() => {
+   if (!lastMsg || !lastMsg.type || !graphData.nodes.length) return;
+   // Map activity events to edge highlights (data flow between nodes)
+   const p = lastMsg.payload || {};
+   let srcId = null, tgtId = null;
+   // task:assigned → agent node to task node
+   if (lastMsg.type === 'task:assigned' && p.id && p.agentId) { srcId = p.agentId; tgtId = p.id; }
+   // agent:step → agent to task/chain
+   else if (lastMsg.type === 'agent:step' && p.id && p.sessionId) { srcId = p.sessionId; tgtId = p.id; }
+   // chain:executed → chain to skill
+   else if (lastMsg.type === 'chain:executed' && p.chainId && p.skillId) { srcId = p.chainId; tgtId = p.skillId; }
+   // dag:layer → dag to task
+   else if (lastMsg.type === 'dag:layer' && p.dagId && p.nodeId) { srcId = p.dagId; tgtId = p.nodeId; }
+   if (srcId && tgtId) {
+     const key = `${srcId}→${tgtId}`;
+     edgeHighlightRef.current.set(key, Date.now() + 2000); // 2s highlight
+   }
+ }, [lastMsg, graphData.nodes]);
+
  // Auto-fit graph on data load
  useEffect(() => {
   if (graphData.nodes.length > 0 && fgRef.current) {
@@ -655,6 +682,21 @@ function configureForces(fg, n) {
    ctx.stroke();
   }
 
+  // Live execution overlay — pulse ring from activity events
+  const activePulses = pulsesRef.current.filter(p => p.nodeId === id);
+  for (const ap of activePulses) {
+   const elapsed = Date.now() - ap.startTime;
+   if (elapsed >= ap.duration) continue;
+   const progress = elapsed / ap.duration;
+   const pulseR = r + 4 + progress * 16; // expand outward
+   const pulseAlpha = Math.max(0, 1 - progress) * 0.8;
+   ctx.beginPath();
+   ctx.arc(0, 0, pulseR, 0, 2 * Math.PI);
+   ctx.strokeStyle = (ap.color || NEON.cyan) + Math.floor(pulseAlpha * 255).toString(16).padStart(2, '0');
+   ctx.lineWidth = 2;
+   ctx.stroke();
+  }
+
   // Main circle
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, 2 * Math.PI);
@@ -730,8 +772,30 @@ function configureForces(fg, n) {
    particles = activeTypes.includes(type);
   }
 
+  // Check if this edge is highlighted by a live activity event
+  const edgeKey = `${src.id}→${tgt.id}`;
+  const edgeKeyRev = `${tgt.id}→${src.id}`;
+  const now = Date.now();
+  let edgeBoost = 0;
+  if (edgeHighlightRef.current.has(edgeKey)) {
+    const expiry = edgeHighlightRef.current.get(edgeKey);
+    if (now < expiry) edgeBoost = (expiry - now) / 2000; // 1.0 → 0.0
+    else edgeHighlightRef.current.delete(edgeKey);
+  }
+  if (edgeHighlightRef.current.has(edgeKeyRev)) {
+    const expiry = edgeHighlightRef.current.get(edgeKeyRev);
+    if (now < expiry) edgeBoost = Math.max(edgeBoost, (expiry - now) / 2000);
+    else edgeHighlightRef.current.delete(edgeKeyRev);
+  }
+
+  if (edgeBoost > 0) {
+   alpha = Math.floor(0xa0 * edgeBoost).toString(16).padStart(2, '0');
+   width = 0.5 + edgeBoost * 2.5;
+   particles = true;
+  }
+
   const color = baseColor + alpha;
-  drawRope(ctx, src.x, src.y, tgt.x, tgt.y, ropeLen, color, width, globalScale, alpha === 'a0' || alpha === '48', particles, time);
+  drawRope(ctx, src.x, src.y, tgt.x, tgt.y, ropeLen, color, width, globalScale, alpha === 'a0' || alpha === '48' || edgeBoost > 0.3, particles, time);
  }, [hoverNode]);
 
  const linkCanvasObjectMode = useCallback(() => 'replace', []);
