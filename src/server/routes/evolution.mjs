@@ -69,6 +69,9 @@ async function safeFetch(url, opts = {}) {
   let currentUrl = url;
   let redirectCount = 0;
 
+  // Default 15s timeout — callers must explicitly pass signal: null to disable
+  if (!opts.signal) opts.signal = AbortSignal.timeout(15000);
+
   // Initial validation
   await validateUrlIsSafe(currentUrl);
 
