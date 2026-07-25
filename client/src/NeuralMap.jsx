@@ -29,6 +29,7 @@ const GROUP_STYLE = {
  schedule: { color: '#fb923c', size: 5, glow: false },
  env: { color: '#a3e635', size: 3, glow: false },
  watcher: { color: '#f472b6', size: 4, glow: false },
+ node: { color: '#39ff14', size: 10, glow: true },  // neon green for remote nodes
 };
 
 const LINK_COLORS = {
@@ -37,12 +38,13 @@ const LINK_COLORS = {
  workspace: '#333', imports: NEON.purple, member: '#f59e0b', group: '#f59e0b',
  hosts: '#5eead4', provides: '#f59e0b', uses: NEON.cyan, tool: '#f59e0b',
  task: NEON.yellow, config: '#a3e635', schedule: '#fb923c', plugin: '#38bdf8',
- watcher: '#f472b6',
+ watcher: '#f472b6', delegates: '#39ff14',
 };
 
 const STATUS_COLORS = {
  active: NEON.green, running: NEON.cyan, pending: NEON.yellow,
  completed: '#666', failed: NEON.red, idle: '#444', disconnected: '#333', unknown: '#555',
+ online: NEON.green, offline: NEON.red, stale: NEON.yellow,
 };
 
 // ─── Clustering modes ─────────────────────────────────────────────
@@ -86,6 +88,7 @@ const ROPE_LENGTHS = {
  depends: 30, mcp: 45, workflow: 40, chat: 35, uploaded: 30,
  workspace: 20, imports: 15, member: 35, group: 40, provides: 25,
  tool: 40, task: 35, config: 50, schedule: 40, plugin: 45, watcher: 50,
+ delegates: 55,
 };
 const DEFAULT_ROPE = 35;
 
@@ -359,6 +362,17 @@ export default function NeuralMap() {
  const { lastEvent } = useWebSocket();
  useEffect(() => {
   if (lastEvent && fgRef.current) {
+   // node:status events — update node status in-place (visual only, no reheat)
+   if (lastEvent.type === 'node:status' && lastEvent.payload) {
+    const { nodeId, status } = lastEvent.payload;
+    if (nodeId && status) {
+      const nodes = fgRef.current.graphData().nodes;
+      const node = nodes.find(n => n.id === `node:${nodeId}`);
+      if (node) node.status = status;  // canvas paint picks up new status color
+      // Skip reheat — visual-only update
+      return;
+    }
+   }
    fgRef.current.d3ReheatSimulation();
   }
  }, [lastEvent]);
@@ -387,6 +401,10 @@ export default function NeuralMap() {
    else if (lastMsg.type === 'chain:executed' && p.chainId && p.skillId) { srcId = p.chainId; tgtId = p.skillId; }
    // dag:layer → dag to task
    else if (lastMsg.type === 'dag:layer' && p.dagId && p.nodeId) { srcId = p.dagId; tgtId = p.nodeId; }
+   // delegation:dispatched → agent to node
+   else if (lastMsg.type === 'delegation:dispatched' && p.agentId && p.nodeId) { srcId = p.agentId; tgtId = `node:${p.nodeId}`; }
+   // delegation:reported → node to agent (result coming back)
+   else if (lastMsg.type === 'delegation:reported' && p.nodeId && p.agentId) { srcId = `node:${p.nodeId}`; tgtId = p.agentId; }
    if (srcId && tgtId) {
      const key = `${srcId}→${tgtId}`;
      edgeHighlightRef.current.set(key, Date.now() + 2000); // 2s highlight
@@ -682,6 +700,21 @@ function configureForces(fg, n) {
    ctx.stroke();
   }
 
+  // Node health ring — remote nodes (group 'node') get a colored ring based on status
+  if (group === 'node' && opacity > 0.3) {
+   const healthColor = STATUS_COLORS[status] || '#555';
+   ctx.beginPath();
+   ctx.arc(0, 0, r + 3, 0, 2 * Math.PI);
+   ctx.strokeStyle = healthColor + 'cc';
+   ctx.lineWidth = 2;
+   ctx.stroke();
+   // Inner dot for online/offline indicator
+   ctx.beginPath();
+   ctx.arc(0, 0, 2, 0, 2 * Math.PI);
+   ctx.fillStyle = healthColor;
+   ctx.fill();
+  }
+
   // Live execution overlay — pulse ring from activity events
   const activePulses = pulsesRef.current.filter(p => p.nodeId === id);
   for (const ap of activePulses) {
@@ -725,7 +758,7 @@ function configureForces(fg, n) {
   }
 
   // Label (respect LOD — hide labels at LOD 0)
-  const showLabel = !useLOD && (globalScale > 1.2 || isHovered || isSelected || isPathStart || isOnPath || group === 'system' || group === 'provider' || group === 'user' || group === 'agent');
+  const showLabel = !useLOD && (globalScale > 1.2 || isHovered || isSelected || isPathStart || isOnPath || group === 'system' || group === 'provider' || group === 'user' || group === 'agent' || group === 'node');
   if (showLabel && opacity > 0.2) {
    const fontSize = Math.max(7, 10 / globalScale);
    ctx.font = `${isHovered || isSelected ? 'bold ' : ''}${fontSize}px "Share Tech Mono", "Fira Code", monospace`;
@@ -768,7 +801,7 @@ function configureForces(fg, n) {
    else if (inHighlight){ alpha = '48'; width = 1.0; particles = false; }
    else                 { alpha = '05'; width = 0.2; }
   } else {
-   const activeTypes = ['hosts', 'uses', 'assigned', 'mcp', 'api', 'chat'];
+   const activeTypes = ['hosts', 'uses', 'assigned', 'mcp', 'api', 'chat', 'delegates'];
    particles = activeTypes.includes(type);
   }
 
@@ -1148,6 +1181,10 @@ function configureForces(fg, n) {
       {selectedNode.mime && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">MIME</span><span className="text-xs font-mono font-code" style={{ color: NEON.blue }}>{selectedNode.mime}</span></div>}
       {selectedNode.role && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Role</span><span className="text-xs font-mono font-code" style={{ color: NEON.purple }}>{selectedNode.role}</span></div>}
       {selectedNode.category && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Category</span><span className="text-xs font-mono font-code" style={{ color: NEON.purple }}>{selectedNode.category}</span></div>}
+      {selectedNode.executionBackend && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Backend</span><span className="text-xs font-mono font-code" style={{ color: selectedNode.executionBackend === 'docker' ? NEON.cyan : '#666' }}>{selectedNode.executionBackend === 'docker' ? '🐳 Docker' : '📦 Local'}</span></div>}
+      {selectedNode.baseUrl && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Endpoint</span><span className="text-xs font-mono font-code text-gray-400 truncate">{selectedNode.baseUrl}</span></div>}
+      {selectedNode.lastSeen && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Last Seen</span><span className="text-xs font-mono font-code text-gray-400">{new Date(selectedNode.lastSeen + 'Z').toLocaleString()}</span></div>}
+      {selectedNode.capabilities?.length > 0 && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Capabilities</span><span className="text-xs font-mono font-code flex flex-wrap gap-1">{selectedNode.capabilities.map(c => <span key={c} className="px-1.5 py-0.5 rounded" style={{ background: `${NEON.cyan}10`, color: NEON.cyan, border: `1px solid ${NEON.cyan}20` }}>{c}</span>)}</span></div>}
       {selectedNode.endpoint && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Endpoint</span><span className="text-xs font-mono font-code text-gray-400">{selectedNode.endpoint}</span></div>}
       {selectedNode.path && <div className="rounded-lg p-2" style={{ background: 'rgba(0,0,0,0.3)' }}><span className="text-[10px] text-gray-600 block">Path</span><span className="text-xs font-mono font-code text-gray-400 truncate">{selectedNode.path}</span></div>}
      </div>

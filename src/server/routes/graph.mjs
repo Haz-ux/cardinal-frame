@@ -7,7 +7,7 @@ import { GraphResponseSchema } from '../../shared/schemas.mjs';
  * Dependencies: db, stmts, optionalAuth, logger
  */
 export default function graphRoutes(ctx) {
-  const { db, stmts, optionalAuth, logger } = ctx;
+  const { db, stmts, optionalAuth, logger, nodeRegistry } = ctx;
   const router = express.Router();
 
 router.get('/graph', optionalAuth, async (_req, res) => {
@@ -171,7 +171,8 @@ router.get('/graph', optionalAuth, async (_req, res) => {
      let uses = 0;
      try { uses = stmts.graph.skillUseCount?.get(s.id).c ?? 0; } catch {}
      addNode(`skill:${s.id}`, { name: s.name, group: 'skill', cluster: 'integrate',
-       category: s.category, activity: uses, version: s.version });
+       category: s.category, activity: uses, version: s.version,
+       executionBackend: s.execution_backend || 'local' });
      addLink(`cluster:integrate`, `skill:${s.id}`, 'hosts', 1);
      // Skill ↔ plugin if the plugin hooks this skill
      try {
@@ -247,6 +248,49 @@ router.get('/graph', optionalAuth, async (_req, res) => {
      // env vars don't get edges — they'd create hairball with every entity using them
    }
  } catch {}
+
+ // ─── Remote Nodes (Infra cluster) — from node registry ──────
+ try {
+   if (nodeRegistry && typeof nodeRegistry.getAllNodes === 'function') {
+     const remoteNodes = nodeRegistry.getAllNodes();
+     for (const n of remoteNodes) {
+       addNode(`node:${n.id}`, {
+         name: n.name,
+         group: 'node',
+         cluster: 'infra',
+         status: n.status,
+         capabilities: n.capabilities || [],
+         baseUrl: n.base_url,
+         lastSeen: n.last_seen_at,
+       });
+       addLink(`cluster:infra`, `node:${n.id}`, 'hosts', 1);
+     }
+   }
+ } catch (e) { /* node registry not initialized */ }
+
+ // ─── Delegation Edges — agent→node, task→node ───────────────
+ try {
+   const delegations = db.prepare('SELECT id, parent_task_id, agent_id, node, status, capability FROM delegations ORDER BY created_at DESC LIMIT 50').all();
+   for (const d of delegations) {
+     // Find the node by name (d.node stores the node name, not id)
+     let targetNodeId = null;
+     if (nodeRegistry) {
+       const allNodes = nodeRegistry.getAllNodes();
+       const target = allNodes.find(n => n.name === d.node);
+       if (target) targetNodeId = target.id;
+     }
+     if (targetNodeId && nodeIndex.has(`node:${targetNodeId}`)) {
+       // Edge: agent → node (delegation)
+       if (d.agent_id && nodeIndex.has(`agent:${d.agent_id}`)) {
+         addLink(`agent:${d.agent_id}`, `node:${targetNodeId}`, 'delegates', 2);
+       }
+       // Edge: task → node (if parent task exists)
+       if (d.parent_task_id && nodeIndex.has(`task:${d.parent_task_id}`)) {
+         addLink(`task:${d.parent_task_id}`, `node:${targetNodeId}`, 'delegates', 2);
+       }
+     }
+   }
+ } catch (e) { /* delegations table may not exist */ }
 
  // ─── Conversations (Interface cluster) ──────────────────────
  try {

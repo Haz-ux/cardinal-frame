@@ -30,6 +30,7 @@ export const IsoTimestampSchema = z.string();
 export const NodeGroupSchema = z.enum([
   'cluster', 'user', 'provider', 'agent', 'task', 'dag',
   'skill', 'tool', 'group', 'file', 'conversation', 'plugin', 'schedule',
+  'node', 'env', 'watcher', 'mcp',
 ]);
 
 export const ClusterSchema = z.enum([
@@ -39,6 +40,9 @@ export const ClusterSchema = z.enum([
 export const LinkTypeSchema = z.enum([
   'hosts', 'registered', 'assigned', 'depends_on', 'uses', 'member_of',
   'connects', 'produces', 'owns', 'watches', 'scheduled_by',
+  'delegates', 'api', 'chat', 'uploaded', 'workspace', 'imports',
+  'member', 'group', 'provides', 'tool', 'task', 'config', 'schedule',
+  'plugin', 'watcher', 'workflow', 'mcp', 'depends',
 ]);
 
 /** Graph node — rendered by NeuralMap / DAGEditor */
@@ -56,6 +60,9 @@ export const GraphNodeSchema = z.object({
   modelCount: z.number().optional(),
   memberCount: z.number().optional(),
   capabilities: z.array(z.string()).optional(),
+  executionBackend: z.string().optional(),   // 'local' | 'docker'
+  baseUrl: z.string().optional(),             // node registry URL
+  lastSeen: z.string().nullable().optional(),
   // Runtime layout coords — injected by force simulation, not persisted
   x: z.number().optional(),
   y: z.number().optional(),
