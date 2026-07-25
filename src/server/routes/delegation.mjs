@@ -134,7 +134,8 @@ export default function delegationRoutes(ctx) {
   }
 
   const reportQueue = createReportQueue(db, {
-    getCoordinatorUrl,
+    getCoordinatorUrl: ctx.getCoordinatorUrl || getCoordinatorUrl,
+    fetchFn: ctx.fetchFn,
     logger,
   });
 

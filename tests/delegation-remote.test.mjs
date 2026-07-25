@@ -383,6 +383,11 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
     };
 
     // Track fetch calls — reject first 2 (coordinator unreachable), then succeed
+    // NOTE: recovery's automatic flush-on-enqueue consumes the first failure
+    // before our explicit flushes run. So the sequence is:
+    //   call 1: auto-flush on enqueue → fail (ECONNREFUSED)
+    //   call 2: our 1st explicit attemptFlush → fail
+    //   call 3: our 2nd explicit attemptFlush → succeed
     let fetchCallCount = 0;
     let coordinatorDelegationStatus = null;
     const mockFetch = async (url, opts) => {
@@ -420,10 +425,15 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
       requireRole: () => (req, res, next) => next(),
       apiLimiter: (req, res, next) => next(),
       nodeRegistry: null, // no registry on this node — it's the worker
+      // Inject mock fetch + coordinator URL so router._reportQueue uses the
+      // real single instance with our mock from the start — no second instance
+      fetchFn: mockFetch,
+      getCoordinatorUrl: () => 'http://coordinator.local:8080',
     };
 
-    // Mount the real delegation routes — this creates the schema and
-    // runs startup recovery (which should find no stale tasks yet)
+    // Mount the real delegation routes — this creates the schema, creates the
+    // report queue with our injected mockFetch/getCoordinatorUrl, and runs
+    // startup recovery (which should find no stale tasks yet)
     const delegationRoutes = (await import('../src/server/routes/delegation.mjs')).default;
     const router = delegationRoutes(ctx);
 
@@ -439,43 +449,13 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
     db.prepare(`INSERT INTO remote_task_queue (id, delegation_id, source_node_id, command, status, attempts) VALUES (?, ?, ?, ?, 'running', 1)`)
       .run('queue-test-1', 'del-test-1', 'coordinator-node-id', 'echo hello');
 
-    // Override the report queue's getCoordinatorUrl so it returns a URL
-    // (which will use our mocked fetch)
-    const reportQueue = router._reportQueue;
-    // Monkey-patch getCoordinatorUrl by re-initializing with a mock
-    // Actually, the report queue uses getCoordinatorUrl from closure which
-    // checks nodeRegistry — which is null. Let's verify the report stays queued.
-    // Instead, let's recreate with a working coordinator URL:
-    reportQueue.stop();
-
-    // Create a new report queue with a real coordinator URL
-    const { createReportQueue } = await import('../src/server/report-queue.mjs');
-    const { getOrCreateNodeIdentity } = await import('../src/server/node-identity.mjs');
-    const identity = getOrCreateNodeIdentity(db); // this node's identity
-
-    const newReportQueue = createReportQueue(db, {
-      getCoordinatorUrl: () => 'http://coordinator.local:8080',
-      fetchFn: mockFetch,
-      logger: { info: () => {}, warn: () => {}, error: () => {} },
-    });
-
-    // Replace the report queue's queueOutboundReport by patching the closure ref
-    // Actually, we need to use the report queue that executeAndReport uses.
-    // Since we can't easily swap it, let's call recoverInterruptedTasks directly
-    // and manually call attemptFlush with our mocked fetch.
-
     // Call the real recovery function — this should:
     // 1. Flip 'running' queue row to 'pending' via recoverStale
     // 2. Re-execute the task via executeTask (mocked)
     // 3. Wait for task completion (polls tasks table)
     // 4. Record outcome in remote_task_queue
-    // 5. Enqueue outbound report
-
-    // First, manually flush the report queue with our mock
-    // We need to replace the reportQueue reference used inside executeAndReport.
-    // Since that's in a closure, let's just verify the queue row was created
-    // and manually flush it with our mocked fetch.
-
+    // 5. Enqueue outbound report — auto-flush-on-enqueue fires immediately
+    //    (consumes fetch call 1: ECONNREFUSED)
     await router._recoverInterruptedTasks();
 
     // Assert: executeTask was called (the recovery path re-ran the task)
@@ -502,21 +482,17 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
     expect(reportRows[0].status).toBe('completed');
     expect(reportRows[0].attempts).toBeGreaterThanOrEqual(0);
 
-    // Now flush with the mocked fetch — first 2 calls fail, 3rd succeeds
-    await newReportQueue.attemptFlush();
-    // First attempt fails (coordinator unreachable)
+    // Now flush with the real report queue (router._reportQueue) —
+    // auto-flush-on-enqueue already consumed call 1 (ECONNREFUSED).
+    await router._reportQueue.attemptFlush();
+    // call 2: our 1st explicit attemptFlush → also fails
     const afterFirstFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
     expect(afterFirstFlush.length).toBeGreaterThan(0); // still there
 
-    await newReportQueue.attemptFlush();
-    // Second attempt also fails
+    await router._reportQueue.attemptFlush();
+    // call 3: our 2nd explicit attemptFlush → succeeds, report delivered
     const afterSecondFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
-    expect(afterSecondFlush.length).toBeGreaterThan(0); // still there
-
-    await newReportQueue.attemptFlush();
-    // Third attempt should succeed — report delivered, row deleted
-    const afterThirdFlush = db.prepare('SELECT * FROM pending_reports WHERE delegation_id = ?').all('del-test-1');
-    expect(afterThirdFlush.length).toBe(0); // delivered and removed
+    expect(afterSecondFlush.length).toBe(0); // delivered and removed
 
     // Assert: coordinator received the correct status
     expect(coordinatorDelegationStatus).toBe('completed');
@@ -525,7 +501,8 @@ describe('Remote Delegation — self-recovery from local durable queue', () => {
     const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get('child-test-1');
     expect(taskRow.status).toBe('done');
 
-    // Assert: fetch was called exactly 3 times (2 failed + 1 success)
+    // Assert: fetch was called exactly 3 times
+    // (1 auto-flush on enqueue + 2 explicit flushes = 2 failures + 1 success)
     expect(fetchCallCount).toBe(3);
 
     db.close();
