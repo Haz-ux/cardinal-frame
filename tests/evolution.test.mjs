@@ -195,6 +195,80 @@ describe('Auto-Skill Authoring (Distill) API', () => {
       expect(res.status).toBe(400);
       expect(res.body.error).toContain('url required');
     });
+
+    // ─── Security: directory path allowlist ───────────────────
+
+    it('should reject non-admin user for distill (403)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(userAuth())
+        .send({ source_type: 'notes', notes: 'test' });
+      expect(res.status).toBe(403);
+    });
+
+    it('should reject admin directory source outside ALLOWED_BASE_DIRS (404)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'directory', path: '/etc' });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('Directory not found');
+    });
+
+    it('should reject admin directory source with /etc/passwd path (404)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'directory', path: '/etc/passwd' });
+      expect(res.status).toBe(404);
+    });
+
+    // ─── Security: SSRF protection for URL source ──────────────
+
+    it('should reject file:// scheme (502)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url', url: 'file:///etc/passwd' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain('Blocked scheme');
+    });
+
+    it('should reject localhost URL (502)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url', url: 'http://localhost:8080/api/health' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain('Blocked hostname');
+    });
+
+    it('should reject 169.254.169.254 cloud metadata URL (502)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url', url: 'http://169.254.169.254/latest/meta-data/' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain('Blocked');
+    });
+
+    it('should reject RFC1918 private IP URL (502)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url', url: 'http://10.0.0.1/' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain('Blocked');
+    });
+
+    it('should reject 127.x.x.x loopback URL (502)', async () => {
+      const res = await request(app)
+        .post('/api/learn/distill')
+        .set(adminAuth())
+        .send({ source_type: 'url', url: 'http://127.0.0.1:8080/' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toContain('Blocked');
+    });
   });
 
   describe('GET /api/learn/patterns — list learned patterns (auth)', () => {

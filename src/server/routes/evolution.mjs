@@ -2,6 +2,8 @@ import express from 'express';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
+import { isIP } from 'net';
+import dns from 'dns/promises';
 import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from '../evolution.mjs';
 
 /**
@@ -12,6 +14,48 @@ import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolv
 // ─── Source gatherers for distill ───────────────────────────
 
 const MAX_SOURCE_CHARS = 24000; // truncate before it hits the LLM prompt
+
+// ─── Directory path allowlist (defense in depth) ────────────
+// Only directories under these roots are readable by the distill directory source.
+const ALLOWED_BASE_DIRS = [process.cwd()];
+
+function isPathAllowed(resolved) {
+  return ALLOWED_BASE_DIRS.some(base => {
+    const baseResolved = path.resolve(base);
+    return resolved === baseResolved || resolved.startsWith(baseResolved + path.sep);
+  });
+}
+
+// ─── SSRF protection for URL source ────────────────────────
+const BLOCKED_HOSTNAMES = ['localhost', '169.254.169.254', '0.0.0.0', '[::]'];
+const MAX_REDIRECTS = 3;
+
+function isPrivateIP(ip) {
+  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.)/.test(ip) || ip === '::1' || ip === '::';
+}
+
+/**
+ * Validate that a URL is safe to fetch server-side.
+ * Checks scheme, hostname blocklist, and resolves DNS to catch
+ * hostnames that point to private/internal IPs.
+ */
+async function validateUrlIsSafe(urlStr) {
+  let parsed;
+  try { parsed = new URL(urlStr); } catch { throw new Error('Invalid URL'); }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`Blocked scheme: ${parsed.protocol}`);
+  }
+  if (BLOCKED_HOSTNAMES.includes(parsed.hostname.toLowerCase())) {
+    throw new Error('Blocked hostname');
+  }
+  // Resolve hostname — don't trust the string alone, DNS can bypass a hostname check
+  const ip = isIP(parsed.hostname) ? parsed.hostname : (await dns.lookup(parsed.hostname)).address;
+  if (isPrivateIP(ip)) {
+    throw new Error('Blocked: target resolves to a private/internal address');
+  }
+  return parsed;
+}
 
 /** Gather conversation source: observations + messages → text */
 function gatherConversation(stmts, conversationId) {
@@ -28,10 +72,11 @@ function gatherConversation(stmts, conversationId) {
   return `${msgs}\n\n## Observations\n${obs}`.slice(0, MAX_SOURCE_CHARS);
 }
 
-/** Gather directory source: read files, concatenate → text */
+/** Gather directory source: read files, concatenate → text (admin-only, path-allowlisted) */
 function gatherDirectory(dirPath) {
   if (!dirPath) return null;
-  const resolved = dirPath.startsWith('/') ? dirPath : path.resolve(dirPath);
+  const resolved = path.resolve(dirPath); // normalize, resolve relative to cwd
+  if (!isPathAllowed(resolved)) return null; // blocked — 404
   if (!existsSync(resolved)) return null;
   const stat = statSync(resolved);
   if (!stat.isDirectory()) return null;
@@ -53,21 +98,50 @@ function gatherDirectory(dirPath) {
   return parts.join('\n\n').slice(0, MAX_SOURCE_CHARS);
 }
 
-/** Gather URL source: fetch page, strip HTML → text */
+/**
+ * Gather URL source: fetch page, strip HTML → text
+ * SSRF-protected: validates scheme + resolves DNS before fetching.
+ * Redirects are followed manually with re-validation at each hop.
+ */
 async function gatherUrl(url) {
   if (!url) return null;
-  const resp = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(15000) });
-  if (!resp.ok) throw new Error(`Failed to fetch URL: HTTP ${resp.status}`);
-  const raw = await resp.text();
-  // Strip HTML tags, collapse whitespace — minimal but sufficient
-  const text = raw
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&[a-z]+;/gi, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  return text.slice(0, MAX_SOURCE_CHARS) || null;
+  let currentUrl = url;
+  let redirectCount = 0;
+
+  // Initial validation
+  await validateUrlIsSafe(currentUrl);
+
+  while (redirectCount <= MAX_REDIRECTS) {
+    const resp = await fetch(currentUrl, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
+
+    // Check for redirect — re-validate before following
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const location = resp.headers.get('location');
+      if (!location) throw new Error('Redirect response missing Location header');
+      // Resolve relative redirects against the current URL
+      const nextUrl = new URL(location, currentUrl).href;
+      redirectCount++;
+      if (redirectCount > MAX_REDIRECTS) throw new Error('Too many redirects');
+      // Re-validate the redirect target before following
+      await validateUrlIsSafe(nextUrl);
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (!resp.ok) throw new Error(`Failed to fetch URL: HTTP ${resp.status}`);
+    const raw = await resp.text();
+    // Strip HTML tags, collapse whitespace — minimal but sufficient
+    const text = raw
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return text.slice(0, MAX_SOURCE_CHARS) || null;
+  }
+
+  throw new Error('Too many redirects');
 }
 
 export default function evolutionRoutes(ctx) {
@@ -80,7 +154,8 @@ export default function evolutionRoutes(ctx) {
 
   // POST /learn/distill — Aimi analyzes a source and auto-creates a skill
   // Supports: conversation, directory, url, notes (defaults to conversation)
-  router.post('/learn/distill', authMiddleware, apiLimiter, async (req, res) => {
+  // Admin-only: directory and url sources can access server filesystem/network
+  router.post('/learn/distill', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     try {
       const source_type = req.body.source_type || 'conversation';
       let sourceRef = null;   // identifier for the evolution record (conversation_id, path, url, or 'notes')
