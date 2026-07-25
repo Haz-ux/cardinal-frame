@@ -52,6 +52,9 @@ const DEFAULT_SOUL = {
     require_approval_for: ['rm', 'sudo', 'chmod', 'chown', 'mkfs'],
     auto_approve: ['echo', 'ls', 'cat', 'pwd', 'date', 'grep', 'wc'],
   },
+  // Node delegation permissions — default: local only (most restrictive).
+  // Set to ['any'] to allow delegation to all nodes, or list specific node names.
+  node_permissions: [],
 };
 
 export function initGovernance(db) {
@@ -110,6 +113,48 @@ export function checkPermission(persona, action, target) {
   // If permissions list is non-empty, action must be in the list
   if (perms.length > 0 && !perms.includes(action)) {
     return { allowed: false, reason: `Action '${action}' not in allowed permissions` };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Check if an agent is allowed to delegate work to a specific remote node.
+ * Reads the persona's SOUL doc for a `node_permissions` field:
+ *   - ["any"] or ["*"] → allowed to delegate to any node
+ *   - ["ikaris", "aries"] → allowed only for listed node names (case-insensitive)
+ *   - omitted or [] → local only (most restrictive, default)
+ *
+ * @param {object} persona — persona row from DB (with soul field)
+ * @param {string} targetNodeName — display name of the target node
+ * @returns {{ allowed: boolean, reason?: string }}
+ */
+export function canDelegateToNode(persona, targetNodeName) {
+  if (!persona || !persona.enabled) {
+    // No persona → default restrictive: local only
+    return { allowed: false, reason: 'No persona — default: local only' };
+  }
+
+  const soul = JSON.parse(persona.soul || '{}');
+  const nodePerms = soul.node_permissions || soul.nodePermissions || [];
+
+  // No node_permissions field → most restrictive (local only)
+  if (!Array.isArray(nodePerms) || nodePerms.length === 0) {
+    return { allowed: false, reason: 'No node_permissions in SOUL doc — default: local only' };
+  }
+
+  // Wildcard permissions
+  if (nodePerms.includes('any') || nodePerms.includes('*')) {
+    return { allowed: true };
+  }
+
+  // Check if target node name is in the allowed list (case-insensitive)
+  const allowed = nodePerms.some(
+    perm => perm.toLowerCase() === targetNodeName.toLowerCase()
+  );
+
+  if (!allowed) {
+    return { allowed: false, reason: `Node '${targetNodeName}' not in node_permissions: [${nodePerms.join(', ')}]` };
   }
 
   return { allowed: true };

@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { runSandboxed, runSandboxedHybrid } from './sandbox.mjs';
+import { checkProposalContent } from '../skill-safety.mjs';
 
 /**
  * Skills API routes + shared skill execution engine.
@@ -409,6 +410,22 @@ export default function skillsRoutes(ctx) {
       const proposal = stmts.skillProposals.getById.get(req.params.id);
       if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
       if (proposal.status !== 'pending') return res.status(409).json({ error: `Proposal already ${proposal.status}` });
+
+      // ─── Safety floor: check proposal content against deny-list ───
+      // This check is non-configurable and applies even with admin approval.
+      // Modeled on Hermes's agent/file_safety.py — hardcoded for the same reason.
+      const safetyCheck = checkProposalContent(proposal.proposed_content);
+      if (!safetyCheck.allowed) {
+        audit('skill_revision_blocked', 'skill', proposal.skill_id, req.user?.id, {
+          proposal_id: req.params.id,
+          denied_paths: safetyCheck.deniedPaths,
+          reason: 'Safety floor: proposal targets deny-listed files',
+        });
+        return res.status(403).json({
+          error: 'Proposal content references protected files and cannot be accepted',
+          deniedPaths: safetyCheck.deniedPaths,
+        });
+      }
 
       // Parse the proposed content to extract updated fields
       let updates = {};
