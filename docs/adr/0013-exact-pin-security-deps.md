@@ -24,6 +24,7 @@ Exact-pin (no `^` or `~` prefix) all security-critical dependencies:
 | `dotenv` | 3.0.0 | Loads env vars including API keys |
 | `multer` | 1.4.5-lts.2 | File upload handler (injection surface) |
 | `ws` | 8.21.0 | WebSocket server (connection surface) |
+| `cors` | 2.8.5 | CORS policy enforcement (access control) |
 
 Non-security dependencies remain on semver ranges — this is a targeted hardening, not a full lock-down.
 
