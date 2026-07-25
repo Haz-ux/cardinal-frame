@@ -17,7 +17,7 @@ function healthFromHeartbeat(hb) {
 
 function RegisterModal({ onClose, onCreated }) {
   const [name, setName] = useState('');
-  const [version, setVersion] = useState('1.0');
+  const [version, setVersion] = useState('0.6');
   const [caps, setCaps] = useState('');
   const [loading, setLoading] = useState(false);
   const handleSubmit = async (e) => {

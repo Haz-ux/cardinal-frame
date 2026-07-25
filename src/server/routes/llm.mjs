@@ -332,5 +332,118 @@ export default function llmRoutes(ctx) {
     res.json({ seeded: created, total: seeds.length });
   });
 
+  // ─── Provider Setup Wizard ─────────────────────────────────
+  // One-shot endpoint: adds provider, tests API key, auto-detects models, sets default model
+  router.post('/llm/providers/setup', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+    try {
+      const { type, name, api_key, base_url } = req.body;
+      if (!type || !name) return res.status(400).json({ error: 'type and name required' });
+      const providerInfo = PROVIDER_TYPES[type];
+      if (!providerInfo) return res.status(400).json({ error: `Unknown provider type: ${type}` });
+
+      // Step 1: Create provider (disabled until tested)
+      const existing = stmts.providers.getByName.get(name);
+      if (existing) return res.status(409).json({ error: `Provider "${name}" already exists`, provider_id: existing.id });
+
+      const id = randomUUID();
+      const finalBaseUrl = base_url || providerInfo.baseUrl || '';
+      stmts.providers.insert.run(id, name, type, api_key || '', finalBaseUrl, 0);
+      let provider = stmts.providers.getById.get(id);
+
+      const result = { provider_id: id, steps: [] };
+
+      // Step 2: Test API key (skip for ollama — no key needed)
+      if (type !== 'ollama' && api_key) {
+        try {
+          const { headers, url } = buildProviderAuth(api_key, providerInfo.baseUrl, providerInfo.modelsUrl);
+
+          if (type === 'anthropic') {
+            const testResp = await fetch('https://api.anthropic.com/v1/models', { headers });
+            if (!testResp.ok) {
+              const errText = await testResp.text().catch(() => '');
+              result.steps.push({ step: 'test', status: 'failed', error: `${testResp.status} ${errText.slice(0, 200)}` });
+              res.json(result);
+              return;
+            }
+          } else {
+            const modelsUrl = finalBaseUrl ? `${finalBaseUrl}${providerInfo.modelsUrl || '/models'}` : `${providerInfo.baseUrl}${providerInfo.modelsUrl || '/models'}`;
+            const testResp = await fetch(modelsUrl, { headers });
+            if (!testResp.ok) {
+              const errText = await testResp.text().catch(() => '');
+              result.steps.push({ step: 'test', status: 'failed', error: `${testResp.status} ${errText.slice(0, 200)}` });
+              res.json(result);
+              return;
+            }
+          }
+          result.steps.push({ step: 'test', status: 'passed' });
+        } catch (e) {
+          result.steps.push({ step: 'test', status: 'failed', error: e.message?.slice(0, 300) });
+          res.json(result);
+          return;
+        }
+      } else {
+        result.steps.push({ step: 'test', status: 'skipped', reason: type === 'ollama' ? 'Ollama needs no API key' : 'No API key provided' });
+      }
+
+      // Step 3: Enable provider
+      db.prepare('UPDATE llm_providers SET enabled = 1 WHERE id = ?').run(id);
+      provider = stmts.providers.getById.get(id);
+      result.steps.push({ step: 'enable', status: 'passed' });
+
+      // Step 4: Auto-detect models
+      try {
+        let detectedModels = [];
+        if (type === 'anthropic') {
+          const { headers } = buildProviderAuth(api_key, providerInfo.baseUrl, '/v1/models');
+          const modelsResp = await fetch('https://api.anthropic.com/v1/models', { headers });
+          if (modelsResp.ok) {
+            const modelsData = await modelsResp.json();
+            detectedModels = (modelsData.data || []).map(m => m.id);
+          }
+        } else {
+          const { headers, url: modelsUrl } = buildProviderAuth(api_key, finalBaseUrl || providerInfo.baseUrl, providerInfo.modelsUrl || '/models');
+          const modelsResp = await fetch(modelsUrl, { headers });
+          if (modelsResp.ok) {
+            const modelsData = await modelsResp.json();
+            const dataArr = modelsData.data || modelsData.models || modelsData;
+            detectedModels = Array.isArray(dataArr) ? dataArr.map(m => typeof m === 'string' ? m : m.id || m.name).filter(Boolean) : [];
+          }
+        }
+
+        let added = 0;
+        for (const modelId of detectedModels) {
+          const existingModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(id, modelId);
+          if (!existingModel) {
+            const modelUuid = randomUUID();
+            db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name, enabled) VALUES (?, ?, ?, ?, 1)').run(modelUuid, id, modelId, modelId);
+            added++;
+          }
+        }
+        result.steps.push({ step: 'detect_models', status: 'passed', models_found: detectedModels.length, models_added: added, models: detectedModels.slice(0, 20) });
+
+        // Step 5: Set first detected model as default if no default exists
+        const currentDefault = stmts.llmModels.getDefault.get();
+        if (!currentDefault && detectedModels.length > 0) {
+          const firstModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(id, detectedModels[0]);
+          if (firstModel) {
+            db.prepare('UPDATE llm_models SET is_default = 0').run();
+            db.prepare('UPDATE llm_models SET is_default = 1 WHERE id = ?').run(firstModel.id);
+            result.steps.push({ step: 'set_default', status: 'passed', model: detectedModels[0] });
+          }
+        } else {
+          result.steps.push({ step: 'set_default', status: 'skipped', reason: currentDefault ? 'Default already set' : 'No models detected' });
+        }
+      } catch (e) {
+        result.steps.push({ step: 'detect_models', status: 'failed', error: e.message?.slice(0, 300) });
+      }
+
+      result.provider = { ...provider, config: JSON.parse(provider.config || '{}') };
+      broadcast('llm:provider', { type: 'setup_complete', provider_id: id });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   return router;
 }

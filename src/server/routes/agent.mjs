@@ -1284,4 +1284,4 @@ router.get('/agent/tools', authMiddleware, (_req, res) => {
   return router;
 }
 
-export { callAgentLLM, callAgentLLMWithRetry, agentTools };
+export { callAgentLLM, callAgentLLMWithRetry, agentTools, runAgentLoop };

@@ -1,5 +1,6 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
+import { WebSocket } from 'ws';
 
 /**
  * Comms Engine: Telegram + Discord integration.
@@ -7,7 +8,7 @@ import { randomUUID } from 'crypto';
  */
 
 export default function commsRoutes(ctx) {
-  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook } = ctx;
+  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
   const router = express.Router();
 
 
@@ -335,9 +336,9 @@ async function generateAutoReply(text, channel) {
 
 // ── Trigger an agent session from an incoming comms message ──
 
-async function triggerAgentFromComms(channel, commsMsg) {
+async function triggerAgentFromComms(channel, commsMsg, cfUserId) {
   const config = JSON.parse(channel.config);
-  const userId = config.user_id || 'haz-001'; // default to admin
+  const userId = cfUserId || config.user_id || 'haz-001'; // default to admin
   
   // Find or create a user mapping
   if (!stmts.users.getById) {
@@ -365,6 +366,197 @@ async function triggerAgentFromComms(channel, commsMsg) {
   return sessionId;
 }
 
+// ── Discord WebSocket Gateway ──
+
+const discordGateways = new Map(); // channelId -> { ws, heartbeatTimer, seq, sessionId, stopFlag }
+
+async function connectDiscordGateway(channel) {
+  const config = JSON.parse(channel.config);
+  if (!config.bot_token) return;
+
+  // Stop REST poller if running — gateway replaces it
+  stopChannelPoller(channel.id);
+  if (discordGateways.has(channel.id)) {
+    disconnectDiscordGateway(channel.id);
+  }
+
+  const state = { ws: null, heartbeatTimer: null, seq: null, sessionId: null, stopFlag: false, channelId: channel.id, resumeUrl: null };
+  discordGateways.set(channel.id, state);
+
+  try {
+    // Get gateway URL
+    const gwResp = await fetch('https://discord.com/api/v10/gateway/bot', {
+      headers: { 'Authorization': `Bot ${config.bot_token}` },
+    });
+    if (!gwResp.ok) throw new Error(`Gateway bot endpoint ${gwResp.status}`);
+    const gwData = await gwResp.json();
+    const wsUrl = gwData.url + '?v=10&encoding=json';
+
+    const ws = new WebSocket(wsUrl, { headers: { 'Authorization': `Bot ${config.bot_token}` } });
+    state.ws = ws;
+
+    ws.on('open', () => {
+      logger.info(`Discord gateway WebSocket connected for channel ${channel.name}`);
+    });
+
+    ws.on('message', async (raw) => {
+      try {
+        const payload = JSON.parse(raw.toString());
+        const { op, d, s, t } = payload;
+        if (s !== null) state.seq = s;
+
+        switch (op) {
+          case 10: { // HELLO — start heartbeating
+            const heartbeatInterval = d.heartbeat_interval;
+            state.heartbeatTimer = setInterval(() => {
+              if (state.stopFlag) return;
+              ws.send(JSON.stringify({ op: 1, d: state.seq }));
+            }, heartbeatInterval);
+            // Send IDENTIFY
+            ws.send(JSON.stringify({
+              op: 2,
+              d: {
+                token: config.bot_token,
+                intents: (1 << 9) | (1 << 15), // GUILD_MESSAGES | MESSAGE_CONTENT
+                properties: { os: 'linux', browser: 'cardinal-frame', device: 'cardinal-frame' },
+              },
+            }));
+            break;
+          }
+          case 11: // HEARTBEAT ACK
+            break;
+          case 0: { // DISPATCH
+            if (t === 'READY') {
+              state.sessionId = d.session_id;
+              logger.info(`Discord gateway READY: ${d.user?.username} (${d.user?.id})`);
+              broadcast('comms:gateway', { channel_id: channel.id, type: 'ready', bot_user: d.user });
+            } else if (t === 'MESSAGE_CREATE') {
+              // Ignore bot's own messages
+              if (d.author?.bot) return;
+              // Check channel filter
+              if (config.channel_id && d.channel_id !== config.channel_id) return;
+
+              const commsMsg = storeCommsMessage(channel.id, 'discord', 'inbound', {
+                remote_id: d.author?.id || '',
+                remote_username: d.author?.username || '',
+                content: d.content || '',
+                raw: JSON.stringify(d),
+                status: 'received',
+              });
+
+              logger.info(`Discord WS inbound from ${commsMsg.remote_username}: ${(d.content || '').slice(0, 60)}`);
+
+              // Route to user session
+              const cfUserId = resolveCommsUser('discord', d.author?.id || '', d.author?.username || '', config);
+
+              // Auto-respond if configured
+              if (config.auto_reply) {
+                try {
+                  const reply = await generateAutoReply(d.content, channel);
+                  await fetch(`https://discord.com/api/v10/channels/${d.channel_id}/messages`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bot ${config.bot_token}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: reply }),
+                  });
+                  storeCommsMessage(channel.id, 'discord', 'outbound', {
+                    remote_id: d.author?.id || '',
+                    remote_username: commsMsg.remote_username,
+                    content: reply,
+                    status: 'sent',
+                  });
+                } catch (e) { logger.error(`Discord WS auto-reply failed: ${e.message}`); }
+              }
+
+              // Trigger agent if configured
+              if (config.trigger_agent && d.content) {
+                try {
+                  const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
+                  if (agentSessionId) stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
+                } catch (e) { logger.error(`Agent trigger from Discord WS failed: ${e.message}`); }
+              }
+            } else if (t === 'RESUMED') {
+              logger.info(`Discord gateway RESUMED for channel ${channel.name}`);
+            }
+            break;
+          }
+          case 7: { // RECONNECT requested by Discord
+            logger.info(`Discord gateway RECONNECT requested for ${channel.name}`);
+            ws.close(4000);
+            // Reconnect after 2s
+            setTimeout(() => { if (!state.stopFlag) connectDiscordGateway(channel); }, 2000);
+            break;
+          }
+          case 9: { // INVALID SESSION
+            const resumable = d;
+            if (resumable && state.sessionId) {
+              ws.send(JSON.stringify({ op: 6, d: { token: config.bot_token, session_id: state.sessionId, seq: state.seq } }));
+            } else {
+              // Fresh identify
+              ws.send(JSON.stringify({
+                op: 2,
+                d: { token: config.bot_token, intents: (1 << 9) | (1 << 15), properties: { os: 'linux', browser: 'cardinal-frame', device: 'cardinal-frame' } },
+              }));
+            }
+            break;
+          }
+        }
+      } catch (e) { logger.error(`Discord gateway message parse error: ${e.message}`); }
+    });
+
+    ws.on('close', (code) => {
+      logger.info(`Discord gateway WS closed (${code}) for ${channel.name}`);
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      if (!state.stopFlag && code !== 4000) {
+        // Auto-reconnect after 5s
+        setTimeout(() => { if (!state.stopFlag) connectDiscordGateway(channel); }, 5000);
+      }
+    });
+
+    ws.on('error', (err) => {
+      logger.error(`Discord gateway WS error for ${channel.name}: ${err.message}`);
+    });
+
+  } catch (e) {
+    logger.error(`Discord gateway connection failed for ${channel.name}: ${e.message}`);
+    // Fallback to REST polling after 10s
+    setTimeout(() => {
+      if (!state.stopFlag && !discordPollers.has(channel.id)) {
+        logger.info(`Discord gateway failed — falling back to REST polling for ${channel.name}`);
+        startChannelPoller(channel);
+      }
+    }, 10000);
+  }
+}
+
+function disconnectDiscordGateway(channelId) {
+  const state = discordGateways.get(channelId);
+  if (state) {
+    state.stopFlag = true;
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    if (state.ws) state.ws.close(1000);
+    discordGateways.delete(channelId);
+  }
+}
+
+// ── Session routing: map remote platform users to CF user sessions ──
+
+function resolveCommsUser(platform, remoteId, remoteUsername, channelConfig) {
+  // Check for existing mapping
+  let mapping = stmts.commsUserSessions.getByPlatformRemote.get(platform, remoteId);
+  if (mapping) {
+    // Update last-active + username
+    stmts.commsUserSessions.updateLastActive.run(remoteUsername, platform, remoteId);
+    return mapping.cf_user_id;
+  }
+
+  // Create new mapping — default to admin user or configured user
+  const defaultUserId = channelConfig?.user_id || 'haz-001';
+  const mappingId = randomUUID();
+  stmts.commsUserSessions.insert.run(mappingId, platform, remoteId, remoteUsername, defaultUserId, null);
+  logger.info(`Comms session mapping created: ${platform}/${remoteUsername} → ${defaultUserId}`);
+  return defaultUserId;
+}
+
 // ── Start/stop pollers for enabled channels ──
 
 function startChannelPoller(channel) {
@@ -384,6 +576,7 @@ function stopChannelPoller(channelId) {
   if (tg) { tg.stopFlag = true; clearTimeout(tg.timer); telegramPollers.delete(channelId); }
   const dc = discordPollers.get(channelId);
   if (dc) { dc.stopFlag = true; clearTimeout(dc.timer); discordPollers.delete(channelId); }
+  disconnectDiscordGateway(channelId);
   stmts.commsChannels.updatePolling.run(0, null, channelId);
 }
 
@@ -394,9 +587,15 @@ setTimeout(() => {
     for (const ch of channels) {
       const config = JSON.parse(ch.config);
       if (ch.platform === 'telegram' && config.bot_token) startChannelPoller(ch);
-      if (ch.platform === 'discord' && config.bot_token && config.channel_id) startChannelPoller(ch);
+      if (ch.platform === 'discord' && config.bot_token && config.channel_id) {
+        if (config.gateway_mode) {
+          connectDiscordGateway(ch);
+        } else {
+          startChannelPoller(ch);
+        }
+      }
     }
-    logger.info(`Comms: started ${telegramPollers.size} Telegram + ${discordPollers.size} Discord pollers`);
+    logger.info(`Comms: started ${telegramPollers.size} Telegram pollers, ${discordPollers.size} Discord pollers, ${discordGateways.size} Discord gateways`);
   } catch (e) { logger.error(`Comms boot error: ${e.message}`); }
 }, 3000);
 
@@ -429,7 +628,10 @@ router.post('/comms/channels', authMiddleware, requireRole('admin'), apiLimiter,
     if (enabled) {
       const configParsed = JSON.parse(configStr);
       if (platform === 'telegram' && configParsed.bot_token) startChannelPoller(channel);
-      if (platform === 'discord' && configParsed.bot_token && configParsed.channel_id) startChannelPoller(channel);
+      if (platform === 'discord' && configParsed.bot_token && configParsed.channel_id) {
+        if (configParsed.gateway_mode) connectDiscordGateway(channel);
+        else startChannelPoller(channel);
+      }
     }
     
     broadcast('comms:channel', { type: 'created', channel });
@@ -455,7 +657,10 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     if (newEnabled) {
       const configParsed = JSON.parse(newConfig);
       if (channel.platform === 'telegram' && configParsed.bot_token) startChannelPoller(updated);
-      if (channel.platform === 'discord' && configParsed.bot_token && configParsed.channel_id) startChannelPoller(updated);
+      if (channel.platform === 'discord' && configParsed.bot_token && configParsed.channel_id) {
+        if (configParsed.gateway_mode) connectDiscordGateway(updated);
+        else startChannelPoller(updated);
+      }
     } else {
       stopChannelPoller(channel.id);
     }
@@ -740,6 +945,102 @@ router.post('/comms/discord/webhook', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Get comms gateway status
+router.get('/comms/gateways', authMiddleware, (_req, res) => {
+  try {
+    const gateways = [];
+    for (const [channelId, state] of discordGateways) {
+      gateways.push({
+        channel_id: channelId,
+        connected: !!state.ws && state.ws.readyState === 1,
+        session_id: state.sessionId,
+        seq: state.seq,
+      });
+    }
+    res.json({ gateways, count: gateways.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Start Discord gateway for a channel
+router.post('/comms/discord/:id/start-gateway', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const channel = stmts.commsChannels.getById.get(req.params.id);
+    if (!channel) return res.status(404).json({ error: 'Channel not found' });
+    if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
+    const config = JSON.parse(channel.config);
+    if (!config.bot_token || !config.channel_id) return res.status(400).json({ error: 'bot_token and channel_id required' });
+
+    config.gateway_mode = true;
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel.id);
+    await connectDiscordGateway(stmts.commsChannels.getById.get(channel.id));
+    res.json({ ok: true, mode: 'gateway', message: 'WebSocket gateway started' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Stop Discord gateway (revert to polling)
+router.post('/comms/discord/:id/stop-gateway', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  try {
+    const channel = stmts.commsChannels.getById.get(req.params.id);
+    if (!channel) return res.status(404).json({ error: 'Channel not found' });
+    if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
+
+    disconnectDiscordGateway(channel.id);
+    const config = JSON.parse(channel.config);
+    config.gateway_mode = false;
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel.id);
+
+    // Restart REST polling
+    if (channel.enabled) startChannelPoller(stmts.commsChannels.getById.get(channel.id));
+    res.json({ ok: true, mode: 'polling', message: 'Gateway stopped, switched to polling' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Comms Session Routing ──
+
+// List user session mappings
+router.get('/comms/sessions', authMiddleware, (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const platform = req.query.platform;
+    let sessions;
+    if (platform) {
+      sessions = stmts.commsUserSessions.getAll.all(limit).filter(s => s.platform === platform);
+    } else {
+      sessions = stmts.commsUserSessions.getAll.all(limit);
+    }
+    res.json(sessions);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update session mapping (change which CF user a remote user maps to)
+router.put('/comms/sessions/:id', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  try {
+    const { cf_user_id, agent_session_id } = req.body;
+    const session = stmts.commsUserSessions.getById.get(req.params.id);
+    if (!session) return res.status(404).json({ error: 'Session mapping not found' });
+
+    // We need a custom update since we don't have a generic update stmt
+    if (cf_user_id) {
+      db.prepare('UPDATE comms_user_sessions SET cf_user_id = ?, last_active = datetime(\'now\') WHERE id = ?').run(cf_user_id, req.params.id);
+    }
+    if (agent_session_id !== undefined) {
+      db.prepare('UPDATE comms_user_sessions SET agent_session_id = ?, last_active = datetime(\'now\') WHERE id = ?').run(agent_session_id, req.params.id);
+    }
+    const updated = stmts.commsUserSessions.getById.get(req.params.id);
+    broadcast('comms:session', { type: 'updated', session: updated });
+    res.json(updated);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete session mapping
+router.delete('/comms/sessions/:id', authMiddleware, requireRole('admin'), (req, res) => {
+  try {
+    stmts.commsUserSessions.delete.run(req.params.id);
+    broadcast('comms:session', { type: 'deleted', id: req.params.id });
+    res.json({ deleted: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
   return router;

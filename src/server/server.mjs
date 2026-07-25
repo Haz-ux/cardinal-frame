@@ -50,7 +50,7 @@ import heartbeatRulesRoutes from './routes/heartbeat-rules.mjs';
 import toolsRoutes from './routes/tools.mjs';
 import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './routes/aimi.mjs';
 import llmRoutes, { initOllama } from './routes/llm.mjs';
-import agentRoutes, { callAgentLLM, agentTools } from './routes/agent.mjs';
+import agentRoutes, { callAgentLLM, agentTools, runAgentLoop } from './routes/agent.mjs';
 import commsRoutes from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
@@ -566,6 +566,18 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS comms_user_sessions (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    remote_id TEXT NOT NULL,
+    remote_username TEXT,
+    cf_user_id TEXT NOT NULL,
+    agent_session_id TEXT,
+    last_active TEXT DEFAULT (datetime('now')),
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(platform, remote_id)
+  );
+
   CREATE TABLE IF NOT EXISTS skill_chains (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -1002,6 +1014,15 @@ const stmts = {
         updateAgentSession: db.prepare('UPDATE comms_messages SET agent_session_id = ? WHERE id = ?'),
         getPending: db.prepare(`SELECT * FROM comms_messages WHERE status = 'pending' AND direction = 'inbound' ORDER BY created_at ASC`),
       },
+      commsUserSessions: {
+        getByPlatformRemote: db.prepare('SELECT * FROM comms_user_sessions WHERE platform = ? AND remote_id = ?'),
+        getById: db.prepare('SELECT * FROM comms_user_sessions WHERE id = ?'),
+        getAll: db.prepare('SELECT * FROM comms_user_sessions ORDER BY last_active DESC LIMIT ?'),
+        insert: db.prepare(`INSERT INTO comms_user_sessions (id, platform, remote_id, remote_username, cf_user_id, agent_session_id) VALUES (?, ?, ?, ?, ?, ?)`),
+        updateAgentSession: db.prepare(`UPDATE comms_user_sessions SET agent_session_id = ?, last_active = datetime('now') WHERE platform = ? AND remote_id = ?`),
+        updateLastActive: db.prepare(`UPDATE comms_user_sessions SET last_active = datetime('now'), remote_username = ? WHERE platform = ? AND remote_id = ?`),
+        delete: db.prepare('DELETE FROM comms_user_sessions WHERE id = ?'),
+      },
       // ─── Dashboard & Graph hot-path queries ─────────────────────
       dashboard: {
         agentCount: db.prepare('SELECT COUNT(*) as c FROM agents'),
@@ -1321,6 +1342,7 @@ const ctx = {
   get executeTask() { return executeTask; },
   get sanitizeCommand() { return sanitizeCommand; },
   get callAgentLLM() { return callAgentLLM; },
+  get runAgentLoop() { return runAgentLoop; },
 };
 
 // ─── Request Tracing (observability) ───────────────────────────────────

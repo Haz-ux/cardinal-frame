@@ -10,7 +10,7 @@ const NEON = {
 
 // Cyberpunk boot sequence lines — typed out one by one
 const BOOT_LINES = [
-  { text: 'CARDINAL FRAME v1.0.0', color: NEON.cyan, delay: 0 },
+  { text: 'CARDINAL FRAME v0.6.0', color: NEON.cyan, delay: 0 },
   { text: 'Initializing neural substrate…', color: '#666', delay: 300 },
   { text: '[OK] Quantum bus connected', color: NEON.green, delay: 600 },
   { text: '[OK] Agent runtime loaded', color: NEON.green, delay: 800 },
