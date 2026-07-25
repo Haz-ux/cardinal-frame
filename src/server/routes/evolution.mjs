@@ -57,6 +57,42 @@ async function validateUrlIsSafe(urlStr) {
   return parsed;
 }
 
+/**
+ * SSRF-safe fetch: validates URL before fetching and re-validates
+ * at every redirect hop. Used by gatherUrl, hub scan, and hub install.
+ *
+ * @param {string} url — the URL to fetch
+ * @param {object} opts — fetch options (signal, etc.) — redirect is forced to 'manual'
+ * @returns {Promise<Response>} — the final non-redirect Response
+ */
+async function safeFetch(url, opts = {}) {
+  let currentUrl = url;
+  let redirectCount = 0;
+
+  // Initial validation
+  await validateUrlIsSafe(currentUrl);
+
+  while (redirectCount <= MAX_REDIRECTS) {
+    const resp = await fetch(currentUrl, { ...opts, redirect: 'manual' });
+
+    // Check for redirect — re-validate before following
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const location = resp.headers.get('location');
+      if (!location) throw new Error('Redirect response missing Location header');
+      const nextUrl = new URL(location, currentUrl).href;
+      redirectCount++;
+      if (redirectCount > MAX_REDIRECTS) throw new Error('Too many redirects');
+      await validateUrlIsSafe(nextUrl);
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    return resp; // non-redirect — caller decides what to do with it
+  }
+
+  throw new Error('Too many redirects');
+}
+
 /** Gather conversation source: observations + messages → text */
 function gatherConversation(stmts, conversationId) {
   const observations = stmts.observations.getByConversation.all(conversationId);
@@ -100,48 +136,21 @@ function gatherDirectory(dirPath) {
 
 /**
  * Gather URL source: fetch page, strip HTML → text
- * SSRF-protected: validates scheme + resolves DNS before fetching.
- * Redirects are followed manually with re-validation at each hop.
+ * SSRF-protected via safeFetch (validates scheme + DNS, manual redirects with re-validation).
  */
 async function gatherUrl(url) {
   if (!url) return null;
-  let currentUrl = url;
-  let redirectCount = 0;
-
-  // Initial validation
-  await validateUrlIsSafe(currentUrl);
-
-  while (redirectCount <= MAX_REDIRECTS) {
-    const resp = await fetch(currentUrl, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
-
-    // Check for redirect — re-validate before following
-    if ([301, 302, 303, 307, 308].includes(resp.status)) {
-      const location = resp.headers.get('location');
-      if (!location) throw new Error('Redirect response missing Location header');
-      // Resolve relative redirects against the current URL
-      const nextUrl = new URL(location, currentUrl).href;
-      redirectCount++;
-      if (redirectCount > MAX_REDIRECTS) throw new Error('Too many redirects');
-      // Re-validate the redirect target before following
-      await validateUrlIsSafe(nextUrl);
-      currentUrl = nextUrl;
-      continue;
-    }
-
-    if (!resp.ok) throw new Error(`Failed to fetch URL: HTTP ${resp.status}`);
-    const raw = await resp.text();
-    // Strip HTML tags, collapse whitespace — minimal but sufficient
-    const text = raw
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, '')
-      .replace(/&[a-z]+;/gi, ' ')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    return text.slice(0, MAX_SOURCE_CHARS) || null;
-  }
-
-  throw new Error('Too many redirects');
+  const resp = await safeFetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!resp.ok) throw new Error(`Failed to fetch URL: HTTP ${resp.status}`);
+  const raw = await resp.text();
+  const text = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return text.slice(0, MAX_SOURCE_CHARS) || null;
 }
 
 export default function evolutionRoutes(ctx) {
@@ -408,7 +417,7 @@ export default function evolutionRoutes(ctx) {
         manifestUrl = manifestUrl.replace('github.com', 'raw.githubusercontent.com') + '/main/skill.json';
       }
 
-      const resp = await fetch(manifestUrl, { redirect: 'follow', signal: AbortSignal.timeout(15000) });
+      const resp = await safeFetch(manifestUrl, { signal: AbortSignal.timeout(15000) });
       if (!resp.ok) {
         const err = `HTTP ${resp.status}`.slice(0, 256);
         stmts.skillHub.updateScan.run('failed', err, 0, req.params.id);
@@ -450,7 +459,7 @@ export default function evolutionRoutes(ctx) {
         manifestUrl = manifestUrl.replace('github.com', 'raw.githubusercontent.com') + '/main/skill.json';
       }
 
-      const resp = await fetch(manifestUrl);
+      const resp = await safeFetch(manifestUrl);
       if (!resp.ok) return res.status(502).json({ error: `Failed to fetch: HTTP ${resp.status}` });
 
       const manifest = await resp.json();
