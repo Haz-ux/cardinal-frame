@@ -11,17 +11,27 @@ export default function SkillsTools({ initialTab }) {
   const [skills, setSkills] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAddTool, setShowAddTool] = useState(false);
-  const [showAddSkill, setShowAddSkill] = useState(false);
   const [newTool, setNewTool] = useState({ name: '', description: '', endpoint: '', method: 'GET' });
+  const [showAddSkill, setShowAddSkill] = useState(false);
   const [newSkill, setNewSkill] = useState({ name: '', description: '', category: 'general', handler: 'api' });
+  const [failureRates, setFailureRates] = useState([]);
+  const [proposals, setProposals] = useState([]);
+  const [showProposals, setShowProposals] = useState(false);
   const toast = useToast();
 
   const load = async () => {
     setLoading(true);
     try {
-      const [t, s] = await Promise.all([api('/api/tools'), api('/api/skills')]);
+      const [t, s, fr, pp] = await Promise.all([
+        api('/api/tools'),
+        api('/api/skills'),
+        api('/api/skills/stats/failure-rates?window=-30 days').catch(() => []),
+        api('/api/skills/proposals?status=pending').catch(() => []),
+      ]);
       setTools(Array.isArray(t) ? t : []);
       setSkills(Array.isArray(s) ? s : []);
+      setFailureRates(Array.isArray(fr) ? fr : []);
+      setProposals(Array.isArray(pp) ? pp : []);
     } catch (e) { toast.error('Failed to load skills/tools'); }
     setLoading(false);
   };
@@ -73,6 +83,37 @@ export default function SkillsTools({ initialTab }) {
   };
 
   const categories = [...new Set(skills.map(s => s.category || 'general'))];
+
+  // Helper: get failure rate data for a skill
+  const getFailureRate = (skillId) => failureRates.find(fr => fr.skill_id === skillId);
+
+  // Accept/reject proposal handlers
+  const acceptProposal = async (id) => {
+    try {
+      await api(`/api/skills/proposals/${id}/accept`, { method: 'POST' });
+      toast.success('Proposal accepted — skill updated');
+      load();
+    } catch (e) { toast.error('Failed to accept proposal'); }
+  };
+
+  const rejectProposal = async (id) => {
+    try {
+      await api(`/api/skills/proposals/${id}/reject`, { method: 'POST' });
+      toast.info('Proposal rejected');
+      load();
+    } catch (e) { toast.error('Failed to reject proposal'); }
+  };
+
+  const generateProposal = async (skillId) => {
+    try {
+      const result = await api('/api/skills/proposals/generate', {
+        method: 'POST',
+        body: JSON.stringify({ skill_id: skillId }),
+      });
+      if (result.skipped) toast.info(`Skipped: ${result.reason}`);
+      else { toast.success(`Proposal generated — ${(result.failureRate*100).toFixed(0)}% failure rate`); load(); }
+    } catch (e) { toast.error('Failed to generate proposal'); }
+  };
 
   return (
     <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
@@ -225,7 +266,25 @@ export default function SkillsTools({ initialTab }) {
                       <Sparkles size={12} style={{ color: NEON.purple }} />
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{skill.name}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{skill.name}</span>
+                        {(() => {
+                          const fr = getFailureRate(skill.id);
+                          if (!fr || fr.total < 1) return null;
+                          const pct = (fr.failureRate * 100).toFixed(0);
+                          const color = fr.needsReview ? '#ef4444' : fr.failureRate > 0.15 ? '#eab308' : '#22c55e';
+                          return (
+                            <span style={{
+                              fontSize: 10, fontFamily: 'monospace', padding: '1px 6px',
+                              borderRadius: 8, border: `1px solid ${color}40`, color,
+                              cursor: fr.needsReview ? 'pointer' : 'default',
+                            }} onClick={() => fr.needsReview && generateProposal(skill.id)}>
+                              {pct}% fail ({fr.failures}/{fr.total})
+                              {fr.needsReview && ' ⚠'}
+                            </span>
+                          );
+                        })()}
+                      </div>
                       <div style={{ color: '#666', fontSize: 11 }}>{skill.description}</div>
                     </div>
                     <span style={{ color: '#444', fontSize: 10, fontFamily: 'monospace' }}>{skill.handler}</span>
@@ -241,6 +300,39 @@ export default function SkillsTools({ initialTab }) {
             </div>
           ))}
           {skills.length === 0 && <div style={{ color: '#444', textAlign: 'center', padding: 40 }}>No skills registered yet</div>}
+
+          {/* Pending Proposals */}
+          {proposals.length > 0 && (
+            <div style={{ marginTop: 20, padding: 16, background: `${NEON.cyan}08`, border: `1px solid ${NEON.cyan}20`, borderRadius: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <Zap size={14} style={{ color: NEON.cyan }} />
+                <span style={{ color: NEON.cyan, fontSize: 12, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase' }}>
+                  AI Revision Proposals ({proposals.length})
+                </span>
+              </div>
+              {proposals.map(p => (
+                <div key={p.id} style={{
+                  background: BG.card, border: `1px solid ${NEON.cyan}10`, borderRadius: 10,
+                  padding: 12, marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 8,
+                }}>
+                  <div style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{p.skill_name}</div>
+                  {p.rationale && <div style={{ color: '#888', fontSize: 11 }}>{p.rationale.slice(0, 200)}{p.rationale.length > 200 ? '…' : ''}</div>}
+                  <details>
+                    <summary style={{ color: NEON.cyan, fontSize: 11, cursor: 'pointer' }}>View proposed content</summary>
+                    <pre style={{ color: '#999', fontSize: 10, whiteSpace: 'pre-wrap', padding: 8, maxHeight: 200, overflow: 'auto' }}>{p.proposed_content}</pre>
+                  </details>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => acceptProposal(p.id)} style={{
+                      ...pillBtn, background: `${NEON.green}20`, border: `1px solid ${NEON.green}40`, color: NEON.green,
+                    }}>Accept & Apply</button>
+                    <button onClick={() => rejectProposal(p.id)} style={{
+                      ...pillBtn, background: `${NEON.red}20`, border: `1px solid ${NEON.red}40`, color: NEON.red,
+                    }}>Reject</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

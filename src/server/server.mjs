@@ -635,6 +635,21 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS skill_proposals (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    skill_name TEXT,
+    proposed_content TEXT NOT NULL,
+    rationale TEXT,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected')),
+    created_at TEXT DEFAULT (datetime('now')),
+    reviewed_at TEXT,
+    reviewed_by TEXT,
+    FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_skill_proposals_skill ON skill_proposals(skill_id);
+  CREATE INDEX IF NOT EXISTS idx_skill_proposals_status ON skill_proposals(status);
+
   CREATE TABLE IF NOT EXISTS heartbeat_rules (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -1100,6 +1115,15 @@ const stmts = {
         updateScan: db.prepare("UPDATE skill_hub_sources SET scan_status = ?, scan_result = ?, last_scanned_at = datetime('now'), trust_score = ? WHERE id = ?"),
         updateInstalled: db.prepare("UPDATE skill_hub_sources SET installed_skills = ? WHERE id = ?"),
         delete: db.prepare('DELETE FROM skill_hub_sources WHERE id = ?'),
+      },
+      skillProposals: {
+        insert: db.prepare('INSERT INTO skill_proposals (id, skill_id, skill_name, proposed_content, rationale) VALUES (?, ?, ?, ?, ?)'),
+        getPending: db.prepare("SELECT * FROM skill_proposals WHERE status = 'pending' ORDER BY created_at DESC"),
+        getBySkill: db.prepare('SELECT * FROM skill_proposals WHERE skill_id = ? ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM skill_proposals WHERE id = ?'),
+        getAll: db.prepare('SELECT * FROM skill_proposals ORDER BY created_at DESC'),
+        updateStatus: db.prepare("UPDATE skill_proposals SET status = ?, reviewed_at = datetime('now'), reviewed_by = ? WHERE id = ?"),
+        delete: db.prepare('DELETE FROM skill_proposals WHERE id = ?'),
       },
       heartbeat: {
         insert: db.prepare('INSERT INTO heartbeat_rules (id, name, description, condition, action_type, action_target, action_input, cooldown_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)'),

@@ -296,5 +296,161 @@ export default function skillsRoutes(ctx) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // ─── Skill Self-Improvement (Stage A+B) ──────────────────────────
+
+  // GET /api/skills/stats/failure-rates — computed failureRate per skill
+  router.get('/skills/stats/failure-rates', authMiddleware, (req, res) => {
+    try {
+      const window = req.query.window || '-30 days';
+      const limit = parseInt(req.query.limit || '20', 10);
+      const stats = stmts.skillInvocations.getStats.all(window);
+      const result = stats.map(s => {
+        const total = s.total || 0;
+        const failures = s.failures || 0;
+        const failureRate = total > 0 ? failures / total : 0;
+        return {
+          ...s,
+          failureRate: parseFloat(failureRate.toFixed(4)),
+          total,
+          failures,
+          successes: s.successes || 0,
+          // Flag if above default 30% threshold with at least 5 invocations
+          needsReview: total >= 5 && failureRate >= 0.30,
+        };
+      });
+      res.json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/skills/proposals — list pending proposals
+  router.get('/skills/proposals', authMiddleware, (req, res) => {
+    try {
+      const status = req.query.status || 'pending';
+      if (status === 'pending') {
+        res.json(stmts.skillProposals.getPending.all());
+      } else {
+        res.json(stmts.skillProposals.getAll.all());
+      }
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/skills/proposals/generate — trigger AI revision proposal
+  // Pulls last N failures + current skill def, sends to LLM, stores proposal
+  router.post('/skills/proposals/generate', authMiddleware, apiLimiter, async (req, res) => {
+    try {
+      const { skill_id, threshold = 0.30, minInvocations = 5 } = req.body;
+      if (!skill_id) return res.status(400).json({ error: 'skill_id required' });
+
+      const skill = stmts.skills.getById.get(skill_id);
+      if (!skill) return res.status(404).json({ error: 'Skill not found' });
+
+      // Check failure rate
+      const stats = stmts.skillInvocations.getBySkill.all(skill_id, 50);
+      const recentStats = stats.slice(0, 20);
+      const total = recentStats.length;
+      const failures = recentStats.filter(s => !s.success);
+      const failureRate = total > 0 ? failures.length / total : 0;
+
+      if (total < minInvocations) {
+        return res.json({ skipped: true, reason: `Only ${total} invocations (min: ${minInvocations})` });
+      }
+      if (failureRate < threshold) {
+        return res.json({ skipped: true, reason: `Failure rate ${(failureRate*100).toFixed(1)}% below threshold ${(threshold*100).toFixed(0)}%` });
+      }
+
+      // Build prompt with failure context
+      const failureContext = failures.slice(0, 10).map(f =>
+        `- Input: ${JSON.stringify(f.skill_type === 'sandbox' ? '(sandbox)' : f.error || 'unknown').slice(0, 200)}\n  Error: ${(f.error || 'unknown').slice(0, 300)}`
+      ).join('\n');
+
+      const skillDef = `Name: ${skill.name}\nCategory: ${skill.category}\nHandler: ${skill.handler}\nDescription: ${skill.description}\nParameters: ${skill.parameters}\nEnabled: ${skill.enabled}`;
+
+      const messages = [
+        { role: 'system', content: 'You are a skill revision assistant. Analyze the failure patterns and propose an improved skill definition. Respond with: 1) A revised skill definition in the same format, 2) A plain-language rationale explaining what changed and why. Format your response as JSON: {"proposed_content": "...", "rationale": "..."}' },
+        { role: 'user', content: `Current skill definition:\n${skillDef}\n\nRecent failures (${failures.length}/${total} invocations failed, ${(failureRate*100).toFixed(1)}% failure rate):\n${failureContext}\n\nPropose a revision that addresses the failure patterns.` },
+      ];
+
+      // Use callAgentLLM (which uses the default provider via provider-runtime)
+      const result = await callAgentLLM(messages);
+      let proposed_content = result.content;
+      let rationale = '';
+
+      // Try to parse JSON from the response
+      try {
+        const parsed = JSON.parse(proposed_content);
+        if (parsed.proposed_content) proposed_content = parsed.proposed_content;
+        if (parsed.rationale) rationale = parsed.rationale;
+      } catch {
+        // If not JSON, use the full response as proposed_content
+        rationale = `Generated from ${(failureRate*100).toFixed(1)}% failure rate analysis of ${total} invocations.`;
+      }
+
+      // Store the proposal
+      const proposalId = randomUUID();
+      stmts.skillProposals.insert.run(proposalId, skill_id, skill.name, proposed_content, rationale);
+      broadcast('skill:proposal:created', { id: proposalId, skill_id, skill_name: skill.name });
+      audit('proposal:generated', 'skill', skill_id, req.user?.id, { failureRate: parseFloat(failureRate.toFixed(4)), total, failures: failures.length });
+
+      res.json({
+        id: proposalId,
+        skill_id,
+        skill_name: skill.name,
+        failureRate: parseFloat(failureRate.toFixed(4)),
+        total,
+        failures: failures.length,
+        rationale,
+      });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/skills/proposals/:id/accept — accept a proposal, update the skill
+  router.post('/skills/proposals/:id/accept', authMiddleware, requireRole, (req, res) => {
+    try {
+      const proposal = stmts.skillProposals.getById.get(req.params.id);
+      if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+      if (proposal.status !== 'pending') return res.status(409).json({ error: `Proposal already ${proposal.status}` });
+
+      // Parse the proposed content to extract updated fields
+      let updates = {};
+      try {
+        updates = JSON.parse(proposal.proposed_content);
+      } catch {
+        // If not JSON, treat as updated description
+        updates = { description: proposal.proposed_content.slice(0, 500) };
+      }
+
+      // Apply the revision to the skill
+      const skill = stmts.skills.getById.get(proposal.skill_id);
+      if (skill) {
+        const newDesc = updates.description || skill.description;
+        const newCategory = updates.category || skill.category;
+        const newParams = updates.parameters || skill.parameters;
+        stmts.skills.update.run(newDesc, newCategory, newParams, skill.enabled ? 1 : 0, proposal.skill_id);
+      }
+
+      // Mark proposal as accepted
+      stmts.skillProposals.updateStatus.run('accepted', req.user?.id, req.params.id);
+      broadcast('skill:proposal:accepted', { id: req.params.id, skill_id: proposal.skill_id });
+      audit('skill_revision_accepted', 'skill', proposal.skill_id, req.user?.id, { proposal_id: req.params.id, rationale: proposal.rationale?.slice(0, 200) });
+
+      res.json({ ok: true, status: 'accepted', skill_id: proposal.skill_id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/skills/proposals/:id/reject — reject a proposal
+  router.post('/skills/proposals/:id/reject', authMiddleware, (req, res) => {
+    try {
+      const proposal = stmts.skillProposals.getById.get(req.params.id);
+      if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+      if (proposal.status !== 'pending') return res.status(409).json({ error: `Proposal already ${proposal.status}` });
+
+      stmts.skillProposals.updateStatus.run('rejected', req.user?.id, req.params.id);
+      broadcast('skill:proposal:rejected', { id: req.params.id, skill_id: proposal.skill_id });
+      audit('skill_revision_rejected', 'skill', proposal.skill_id, req.user?.id, { proposal_id: req.params.id });
+
+      res.json({ ok: true, status: 'rejected' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   return router;
 }
