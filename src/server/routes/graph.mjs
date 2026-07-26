@@ -338,38 +338,12 @@ router.get('/graph', optionalAuth, async (_req, res) => {
  // This pulls the clusters into a coherent layout: the agent→provider edges
  // serve as bridges between Runtime and Models naturally.
 
- // ─── Pre-position nodes at cluster sector coordinates ──────────────
- // react-force-graph-2d initializes a new simulation per data update with
- // default forces (center, charge, link). Our custom forceX/forceY are only
- // installed in onEngineTick — too late for warmup. Presetting x/y gives
- // nodes their sector position so the simulation starts from the right
- // layout instead of collapsing to center first.
- const CLUSTER_SECTORS_SRV = { runtime: 0, models: 72, interface: 144, integrate: 216, infra: 288 };
- const CLUSTER_RADIUS_SRV = 220;
- const SATELLITE_RING_SRV = 90;
- const toRadS = deg => (deg * Math.PI) / 180;
- let satCounter = 0;
- for (const node of nodes) {
-   if (node.group === 'system') { node.x = 0; node.y = 0; continue; }
-   const cluster = node.cluster || (node.id?.startsWith('cluster:') ? node.id.split(':')[1] : null);
-   if (node.group === 'cluster' && cluster) {
-     const angle = toRadS(CLUSTER_SECTORS_SRV[cluster] ?? 0);
-     node.x = Math.cos(angle) * CLUSTER_RADIUS_SRV;
-     node.y = Math.sin(angle) * CLUSTER_RADIUS_SRV;
-   } else if (cluster) {
-     const baseAngle = CLUSTER_SECTORS_SRV[cluster] ?? 0;
-     const spread = (satCounter++ * 13 % 60) - 30; // ±30° spread
-     const satAngle = toRadS(baseAngle + (spread * 0.3));
-     const r = CLUSTER_RADIUS_SRV + SATELLITE_RING_SRV + (satCounter % 3) * 10;
-     node.x = Math.cos(satAngle) * r;
-     node.y = Math.sin(satAngle) * r;
-   } else {
-     // unclustered → outer scatter
-     const a = (satCounter++ * 37) % 360;
-     node.x = Math.cos(toRadS(a)) * 300;
-     node.y = Math.sin(toRadS(a)) * 300;
-   }
- }
+   // ── Server no longer assigns x/y to nodes. The client (NeuralMap.jsx)
+   // is the single source of truth for layout — its targetXY() function
+   // uses a deterministic per-node-ID hash and is cluster-size-aware,
+   // avoiding the collision/pile-up regression caused by the old
+   // index-based formula here that had only 180 distinct slots.
+   // See MINERVA_HANDOFF_NEURAL_MAP_PILEUP_FIX.md for full root cause.
 
    // Validate response against shared schema (strips unknown keys, catches drift)
    const payload = { nodes, links, meta: {

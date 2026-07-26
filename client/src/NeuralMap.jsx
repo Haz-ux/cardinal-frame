@@ -321,7 +321,12 @@ export default function NeuralMap() {
   return () => cancelAnimationFrame(raf);
  }, []);
 
- // Load graph — with error handling
+ // Load graph — merge polled data with live positions to prevent pile-up.
+ // On first load, seed positions from targetXY. On subsequent polls, keep
+ // existing nodes' live simulated positions and only refresh their data
+ // fields (status, activity, etc.). Only reheat the simulation when there
+ // are genuinely new nodes — an unchanged graph shouldn't be disturbed.
+ const isFirstLoadRef = useRef(true);
  const load = useCallback(() => {
   setLoading(true);
   setError(null);
@@ -333,23 +338,50 @@ export default function NeuralMap() {
    for (const l of (data.links || [])) {
     l.ropeLen = ROPE_LENGTHS[l.type] || DEFAULT_ROPE;
    }
-   setGraphData({ nodes: data.nodes, links: data.links || [] });
-   // Seed initial positions from targetXY so simulation starts spread at cluster sectors,
-   // not collapsed at origin (important with warmupTicks={0} — no pre-render ticks to spread)
-   requestAnimationFrame(() => {
-     const fg = fgRef.current;
-     if (!fg) return;
-     const nodes = fg.graphData().nodes;
-     recomputeClusterCounts(nodes);
-     for (const n of nodes) {
-       if (n.fx == null && n.fy == null) {
-         const [tx, ty] = targetXY(n);
-         if (typeof n.x !== 'number') n.x = tx;
-         if (typeof n.y !== 'number') n.y = ty;
-       }
-     }
-     fg.d3ReheatSimulation();
+
+   const fg = fgRef.current;
+   const existingNodesById = new Map(
+    (fg?.graphData()?.nodes || []).map(n => [n.id, n])
+   );
+
+   let hasNewNodes = false;
+   const mergedNodes = data.nodes.map(freshNode => {
+    const existing = existingNodesById.get(freshNode.id);
+    if (existing) {
+      // Known node: keep its live simulated position/velocity, just
+      // refresh data fields (status, activity, etc.) from the new fetch.
+      return {
+        ...freshNode,
+        x: existing.x, y: existing.y,
+        vx: existing.vx, vy: existing.vy,
+        fx: existing.fx, fy: existing.fy,
+      };
+    }
+    hasNewNodes = true;
+    return freshNode; // genuinely new — no x/y yet, seeding below handles it
    });
+
+   setGraphData({ nodes: mergedNodes, links: data.links || [] });
+
+   // Only seed + reheat if there's something new to seed. An unchanged
+   // graph shouldn't have its simulation disturbed every poll cycle.
+   if (hasNewNodes || isFirstLoadRef.current) {
+    isFirstLoadRef.current = false;
+    requestAnimationFrame(() => {
+      const fg2 = fgRef.current;
+      if (!fg2) return;
+      const nodes = fg2.graphData().nodes;
+      recomputeClusterCounts(nodes);
+      for (const n of nodes) {
+        if (n.fx == null && n.fy == null && typeof n.x !== 'number') {
+          const [tx, ty] = targetXY(n);
+          n.x = tx;
+          n.y = ty;
+        }
+      }
+      fg2.d3ReheatSimulation();
+    });
+   }
   }).catch(err => {
    console.error('Neural Map load error:', err);
    setError('Failed to load graph data. Check that the server is running and /api/graph responds.');

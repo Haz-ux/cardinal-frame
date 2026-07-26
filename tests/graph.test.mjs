@@ -46,6 +46,18 @@ describe('Graph API', () => {
         expect(link).toHaveProperty('target');
       }
     });
+
+    it('should not include server-assigned x/y coordinates on nodes', async () => {
+      // Regression test: server-side position assignment was removed to fix
+      // the neural map pile-up bug. The client is now the single source of
+      // truth for layout via its targetXY() function.
+      const res = await request(app).get('/api/graph');
+      expect(res.status).toBe(200);
+      for (const node of res.body.nodes) {
+        expect(node).not.toHaveProperty('x');
+        expect(node).not.toHaveProperty('y');
+      }
+    });
   });
 
   describe('GET /api/graph/core', () => {
