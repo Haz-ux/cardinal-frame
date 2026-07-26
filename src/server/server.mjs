@@ -1427,6 +1427,12 @@ const jobQueue = createJobQueue(db, {
 jobQueue.setBroadcast(broadcast);
 jobQueue.setLogger(logger);
 
+// Start job queue eagerly (works in both test and production modes).
+// In test mode, server.listen() is skipped but the queue still processes
+// enqueued jobs via its internal poll timer.
+jobQueue.start();
+globalThis._jobQueue = jobQueue;
+
 // Job queue API routes
 app.get('/api/jobs/stats', authMiddleware, apiLimiter, (_req, res) => {
   res.json(jobQueue.getStatus());
@@ -1838,10 +1844,6 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
   server.listen(PORT, '0.0.0.0', () => {
    logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop + job-queue)`);
    fireHook('onServerStart', { port: PORT, version: pkg?.version || 'unknown' });
-
-   // Start job queue — recovers interrupted jobs from restart
-   jobQueue.start();
-   globalThis._jobQueue = jobQueue;
 
    // Start heartbeat daemon
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,

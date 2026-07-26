@@ -203,11 +203,13 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
   const [type, setType] = useState('task');
   const [command, setCommand] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!name.trim()) return;
     setLoading(true);
+    setError('');
     try {
       const maxX = existingNodes.reduce((mx, n) => Math.max(mx, (n.x || 0) + NODE_W + 40), 40);
       await api('/api/dags', {
@@ -216,8 +218,11 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
         body: JSON.stringify({ name: name.trim(), type, command, edges: [], x: maxX, y: 100 + Math.random() * 200 }),
       });
       onAdded(); onClose();
-    } catch (err) { console.error(err); }
-    setLoading(false);
+    } catch (err) {
+      console.error(err);
+      setError(err.message);
+      setLoading(false); // stay open — let user see error and retry
+    }
   };
 
   return (
@@ -244,6 +249,12 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
             <div>
               <label className="text-xs text-gray-400 mb-1 block">{type === 'transform' ? 'Expression' : type === 'webhook' ? 'Path' : type === 'notify' ? 'Message' : 'Command'}</label>
               <input value={command} onChange={e => setCommand(e.target.value)} placeholder={type === 'transform' ? 'e.g. $.data.map(x => x.id)' : type === 'webhook' ? '/hook/my-dag' : type === 'notify' ? 'DAG completed' : 'python run.py'} className="w-full px-3 py-2 rounded-lg text-sm text-white font-mono" style={{ background: 'rgba(0,0,0,0.4)', border: `1px solid ${NEON.purple}20`, outline: 'none' }} />
+            </div>
+          )}
+          {error && (
+            <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={{ background: `${NEON.red}10`, border: `1px solid ${NEON.red}30` }}>
+              <AlertTriangle size={12} style={{ color: NEON.red, flexShrink: 0 }} />
+              <span className="text-xs" style={{ color: NEON.red }}>{error}</span>
             </div>
           )}
           <div className="flex gap-2 pt-2">
@@ -410,9 +421,29 @@ export default function DAGEditor() {
   const [tempLine, setTempLine] = useState(null);
   const [stacks, setStacks] = useState({});
   const [running, setRunning] = useState(false);
+  const [runStatus, setRunStatus] = useState({}); // { [dagId]: 'running' | 'completed' | 'failed' }
   const [showInspector, setShowInspector] = useState(false);
 
   const { lastEvent } = useWebSocket();
+
+  // Subscribe to dag:status WS events for live run updates
+  useEffect(() => {
+    if (!lastEvent || lastEvent.type !== 'dag:status') return;
+    const { id, status } = lastEvent.data;
+    if (status === 'running') {
+      setRunStatus(prev => ({ ...prev, [id]: 'running' }));
+      setRunning(true);
+    } else if (status === 'completed') {
+      setRunStatus(prev => ({ ...prev, [id]: 'completed' }));
+      setRunning(false);
+      // Update node statuses from the broadcast
+      setNodes(prev => prev.map(n => n.id === id ? { ...n, status: 'completed' } : n));
+    } else if (status === 'failed') {
+      setRunStatus(prev => ({ ...prev, [id]: 'failed' }));
+      setRunning(false);
+      setValidation({ valid: false, issues: [`DAG run failed: ${lastEvent.data.error || 'Unknown error'}`] });
+    }
+  }, [lastEvent]);
 
   useEffect(() => {
     const obs = new ResizeObserver(entries => {
@@ -434,7 +465,10 @@ export default function DAGEditor() {
         }
       });
       setEdges(e);
-    }).catch(() => {});
+    }).catch(err => {
+      console.error('Failed to load DAGs:', err);
+      setValidation({ valid: false, issues: [`Failed to load DAGs: ${err.message}`] });
+    });
   }, []);
 
   usePolling(load, 30000);
@@ -482,17 +516,36 @@ export default function DAGEditor() {
   }, [nodes, edges, validateDAG]);
 
   const deleteNode = useCallback(async (id) => {
-    await api(`/api/dags/${id}`, { method: 'DELETE' });
-    setEdges(prev => prev.filter(e => e.from !== id && e.to !== id));
-    setStacks(prev => {
-      const next = {};
-      for (const [gid, nids] of Object.entries(prev)) {
-        const filtered = nids.filter(nid => nid !== id);
-        if (filtered.length > 0) next[gid] = filtered;
-      }
-      return next;
-    });
-    load(); setSelectedId(null);
+    try {
+      await api(`/api/dags/${id}`, { method: 'DELETE' });
+      setEdges(prev => prev.filter(e => e.from !== id && e.to !== id));
+      setStacks(prev => {
+        const next = {};
+        for (const [gid, nids] of Object.entries(prev)) {
+          const filtered = nids.filter(nid => nid !== id);
+          if (filtered.length > 0) next[gid] = filtered;
+        }
+        return next;
+      });
+      load(); setSelectedId(null);
+    } catch (err) {
+      setValidation({ valid: false, issues: [`Delete error: ${err.message}`] });
+    }
+  }, [load]);
+
+  const runDag = useCallback(async (id) => {
+    setRunStatus(prev => ({ ...prev, [id]: 'running' }));
+    setRunning(true);
+    try {
+      await api(`/api/dags/${id}/run`, { method: 'POST' });
+      // WS event will update runStatus to 'completed' or 'failed' live
+      // But also poll load() to refresh node statuses
+      load();
+    } catch (err) {
+      setRunStatus(prev => ({ ...prev, [id]: 'failed' }));
+      setRunning(false);
+      setValidation({ valid: false, issues: [`Run error: ${err.message}`] });
+    }
   }, [load]);
 
   const handleStack = useCallback((nodeId) => {
@@ -784,6 +837,29 @@ export default function DAGEditor() {
               <span className="px-2 py-0.5 rounded text-[10px]" style={{ background: `${selectedCfg.color}15`, color: selectedCfg.color, border: `1px solid ${selectedCfg.color}30` }}>{selectedNode.type}</span>
             </div>
             <div className="flex items-center gap-2">
+              {/* Run button with inline status indicator */}
+              <button
+                onClick={() => runDag(selectedNode.id)}
+                disabled={runStatus[selectedNode.id] === 'running'}
+                className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold transition-all"
+                style={{
+                  background: runStatus[selectedNode.id] === 'running' ? `${NEON.green}10` : runStatus[selectedNode.id] === 'completed' ? `${NEON.cyan}15` : runStatus[selectedNode.id] === 'failed' ? `${NEON.red}15` : `${NEON.green}15`,
+                  border: `1px solid ${runStatus[selectedNode.id] === 'failed' ? NEON.red + '40' : NEON.green + '30'}`,
+                  color: runStatus[selectedNode.id] === 'failed' ? NEON.red : NEON.green,
+                  opacity: runStatus[selectedNode.id] === 'running' ? 0.6 : 1,
+                }}
+                title="Run this DAG"
+              >
+                {runStatus[selectedNode.id] === 'running' ? (
+                  <><RefreshCw size={12} className="animate-spin" /> Running…</>
+                ) : runStatus[selectedNode.id] === 'completed' ? (
+                  <><CheckCircle size={12} /> Ran</>
+                ) : runStatus[selectedNode.id] === 'failed' ? (
+                  <><AlertTriangle size={12} /> Failed</>
+                ) : (
+                  <><Play size={12} /> Run</>
+                )}
+              </button>
               <button onClick={() => deleteNode(selectedNode.id)} className="p-1 rounded text-gray-600 hover:text-red-400 transition-colors"><Trash2 size={14} /></button>
               <button onClick={() => setSelectedId(null)} className="p-1 text-gray-600 hover:text-gray-400"><X size={14} /></button>
             </div>

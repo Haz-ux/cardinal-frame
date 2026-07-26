@@ -144,40 +144,59 @@ export function createJobQueue(db, opts = {}) {
   registerHandler('dag', async (job, ctx) => {
     const { payload, id: jobId } = job;
     const { dagId, layers, nodes } = JSON.parse(payload);
+    const { db, broadcast } = ctx;
     const steps = [];
 
-    for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-      const layer = layers[layerIdx];
-      const layerResults = await Promise.all(layer.map(async (nodeId, nodeIdx) => {
-        const node = nodes.find(n => n.id === nodeId);
-        if (!node || !node.command) return { nodeId, status: 'skipped' };
+    // Prepared statement to update DAG status in the dags table
+    // (wrapped in try — the dags table may not exist in isolated queue tests)
+    let updateDagStatus = null;
+    try {
+      updateDagStatus = db.prepare('UPDATE dags SET status = ?, last_run_result = ? WHERE id = ?');
+    } catch {}
 
-        const stepId = randomUUID();
-        stmts.insertStep.run(stepId, jobId, layerIdx * 100 + nodeIdx, 'node', JSON.stringify({ nodeId, command: node.command }));
-        stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
+    try {
+      for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
+        const layer = layers[layerIdx];
+        const layerResults = await Promise.all(layer.map(async (nodeId, nodeIdx) => {
+          const node = nodes.find(n => n.id === nodeId);
+          if (!node || !node.command) return { nodeId, status: 'skipped' };
 
-        try {
-          const start = Date.now();
-          const { stdout } = await execAsync(node.command, {
-            timeout: job.timeout_ms,
-            shell: '/bin/sh',
-            env: { PATH: process.env.PATH },
-            cwd: '/tmp',
-          });
-          const durationMs = Date.now() - start;
-          const result = { nodeId, nodeName: node.name, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs };
-          stmts.updateStep.run('completed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), null, stepId);
-          return result;
-        } catch (err) {
-          const result = { nodeId, nodeName: node.name, status: 'failed', exitCode: err.code ?? 1, error: (err.stderr || err.message).slice(0, 500), durationMs: 0 };
-          stmts.updateStep.run('failed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), err.message, stepId);
-          return result;
-        }
-      }));
-      steps.push({ layer: layerIdx, results: layerResults });
+          const stepId = randomUUID();
+          stmts.insertStep.run(stepId, jobId, layerIdx * 100 + nodeIdx, 'node', JSON.stringify({ nodeId, command: node.command }));
+          stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
+
+          try {
+            const start = Date.now();
+            const { stdout } = await execAsync(node.command, {
+              timeout: job.timeout_ms,
+              shell: '/bin/sh',
+              env: { PATH: process.env.PATH },
+              cwd: '/tmp',
+            });
+            const durationMs = Date.now() - start;
+            const result = { nodeId, nodeName: node.name, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs };
+            stmts.updateStep.run('completed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), null, stepId);
+            return result;
+          } catch (err) {
+            const result = { nodeId, nodeName: node.name, status: 'failed', exitCode: err.code ?? 1, error: (err.stderr || err.message).slice(0, 500), durationMs: 0 };
+            stmts.updateStep.run('failed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), err.message, stepId);
+            return result;
+          }
+        }));
+        steps.push({ layer: layerIdx, results: layerResults });
+      }
+
+      // Update dags table + broadcast dag:status so the UI's WS subscription can react
+      const result = { steps, totalLayers: layers.length, completedAt: new Date().toISOString() };
+      try { updateDagStatus.run('completed', JSON.stringify(result), dagId); } catch {} // dags table may not exist in isolated queue tests
+      broadcast?.('dag:status', { id: dagId, status: 'completed', steps });
+
+      return result;
+    } catch (err) {
+      try { updateDagStatus.run('failed', JSON.stringify({ error: err.message }), dagId); } catch {}
+      broadcast?.('dag:status', { id: dagId, status: 'failed', error: err.message });
+      throw err; // re-throw so processJob's retry/dead-letter logic still fires
     }
-
-    return { steps, totalLayers: layers.length, completedAt: new Date().toISOString() };
   });
 
   // Default task handler

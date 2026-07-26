@@ -33,6 +33,11 @@ export async function getTestServer() {
 }
 
 export function cleanupTestServer() {
+  // Stop the job queue poll timer to prevent post-teardown errors
+  if (globalThis._jobQueue) {
+    try { globalThis._jobQueue.stop(); } catch {}
+    globalThis._jobQueue = null;
+  }
   if (_db) {
     try { _db.close(); } catch {}
   }

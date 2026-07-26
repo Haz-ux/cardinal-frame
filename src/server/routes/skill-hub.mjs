@@ -9,6 +9,7 @@
  */
 
 import express from 'express';
+import { safeFetch } from '../safe-fetch.mjs';
 
 export default function skillHubRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, randomUUID } = ctx;
@@ -123,7 +124,7 @@ export default function skillHubRoutes(ctx) {
       let skillContent = skill.content || '';
       if (skill.url && !skillContent) {
         try {
-          const resp = await fetch(skill.url, { signal: AbortSignal.timeout(15000) });
+          const resp = await safeFetch(skill.url, { signal: AbortSignal.timeout(15000) });
           if (resp.ok) skillContent = await resp.text();
         } catch (e) {
           return res.status(502).json({ error: `Failed to fetch skill from ${skill.url}: ${e.message}` });
@@ -197,7 +198,7 @@ export default function skillHubRoutes(ctx) {
       let skillContent = skill.content || '';
       if (skill.url && !skillContent) {
         try {
-          const resp = await fetch(skill.url, { signal: AbortSignal.timeout(15000) });
+          const resp = await safeFetch(skill.url, { signal: AbortSignal.timeout(15000) });
           if (resp.ok) skillContent = await resp.text();
         } catch (e) {
           return res.status(502).json({ error: `Failed to fetch skill from ${skill.url}: ${e.message}` });
@@ -261,7 +262,7 @@ export default function skillHubRoutes(ctx) {
         const rawUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
         const indexUrl = rawUrl.endsWith('/') ? `${rawUrl}skills-index.json` : `${rawUrl}/main/skills-index.json`;
 
-        const resp = await fetch(indexUrl, { signal: AbortSignal.timeout(20000) });
+        const resp = await safeFetch(indexUrl, { signal: AbortSignal.timeout(20000) });
         if (resp.ok) {
           const data = await resp.json();
           skills = data.skills || [];
@@ -272,7 +273,7 @@ export default function skillHubRoutes(ctx) {
         }
       } else if (type === 'url') {
         // Direct JSON API endpoint
-        const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+        const resp = await safeFetch(url, { signal: AbortSignal.timeout(15000) });
         if (resp.ok) {
           const data = await resp.json();
           skills = data.skills || data || [];
