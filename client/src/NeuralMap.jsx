@@ -92,8 +92,8 @@ const ROPE_LENGTHS = {
 };
 const DEFAULT_ROPE = 35;
 
-// ─── Draw a catenary/rope curve ────────────
-function drawRope(ctx, x1, y1, x2, y2, ropeLen, color, width, globalScale, isHighlighted, showParticles, time) {
+// ─── Draw a catenary/rope curve with directional arrow + optional label ───
+function drawRope(ctx, x1, y1, x2, y2, ropeLen, color, width, globalScale, isHighlighted, showParticles, time, label) {
  const dx = x2 - x1;
  const dy = y2 - y1;
  const dist = Math.sqrt(dx * dx + dy * dy);
@@ -105,6 +105,16 @@ function drawRope(ctx, x1, y1, x2, y2, ropeLen, color, width, globalScale, isHig
  const my = (y1 + y2) / 2;
  const nx = -dy / (dist || 1);
  const ny = dx / (dist || 1);
+
+ // Compute the endpoint of the curve at t=1 for arrowhead placement.
+ // For sag curves the endpoint is exactly (x2,y2); the curve only sags in the middle.
+ // We pull the arrowhead back slightly so it doesn't overlap the target node.
+ const arrowSize = Math.max(4, 6 / (globalScale || 1));
+ const arrowBackDist = arrowSize + 2;
+ const ux = dx / (dist || 1);
+ const uy = dy / (dist || 1);
+ const ax = x2 - ux * arrowBackDist;
+ const ay = y2 - uy * arrowBackDist;
 
  ctx.beginPath();
  ctx.moveTo(x1, y1);
@@ -121,11 +131,47 @@ function drawRope(ctx, x1, y1, x2, y2, ropeLen, color, width, globalScale, isHig
   }
  } else {
   const tinySag = Math.max(0, slack) * 0.1;
-  ctx.quadraticCurveTo(mx, my + tinySag, x2, y2);
+  ctx.quadraticCurveTo(mx, my + tinySag, ax, ay);
+  // Straight line from arrow base to target to complete the edge
  }
  ctx.strokeStyle = color;
  ctx.lineWidth = width;
  ctx.stroke();
+
+ // ── Directional arrowhead at target end ──
+ if (dist > 12) {
+  ctx.save();
+  ctx.fillStyle = ctx.strokeStyle;
+  const angle = Math.atan2(uy, ux);
+  ctx.translate(ax, ay);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(arrowSize, 0);
+  ctx.lineTo(-arrowSize * 0.6, -arrowSize * 0.5);
+  ctx.lineTo(-arrowSize * 0.6, arrowSize * 0.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+ }
+
+ // ── Edge type label at midpoint ──
+ // Only render labels at reasonable zoom levels and when highlighted/active
+ if (label && globalScale > 1.2 && (isHighlighted || width >= 1.0)) {
+  ctx.save();
+  ctx.font = `${Math.max(8, 10 / (globalScale || 1))}px ui-monospace, monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  // Position label slightly above the curve midpoint
+  const labelY = my + ny * (sag * 0.3 + 3) - 2;
+  const labelX = mx + nx * 3;
+  // Subtle background for readability
+  const textW = ctx.measureText(label).width;
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(labelX - textW / 2 - 3, labelY - 6, textW + 6, 12);
+  ctx.fillStyle = isHighlighted ? '#cfcfff' : '#888';
+  ctx.fillText(label, labelX, labelY);
+  ctx.restore();
+ }
 
  if (showParticles && dist > 5) {
   const particleCount = isHighlighted ? 3 : 1;
@@ -890,7 +936,7 @@ function configureForces(fg, n) {
   }
 
   const color = baseColor + alpha;
-  drawRope(ctx, src.x, src.y, tgt.x, tgt.y, ropeLen, color, width, globalScale, alpha === 'a0' || alpha === '48' || edgeBoost > 0.3, particles, time);
+  drawRope(ctx, src.x, src.y, tgt.x, tgt.y, ropeLen, color, width, globalScale, alpha === 'a0' || alpha === '48' || edgeBoost > 0.3, particles, time, type);
  }, [hoverNode]);
 
  const linkCanvasObjectMode = useCallback(() => 'replace', []);
@@ -1131,7 +1177,7 @@ function configureForces(fg, n) {
       onBackgroundClick={() => setSelectedNode(null)}
       backgroundColor={BG.base}
       warmupTicks={0}
-      cooldownTicks={300}
+      cooldownTicks={1000}
       cooldownTime={15000}
       d3AlphaDecay={0.008}
       d3VelocityDecay={0.3}
