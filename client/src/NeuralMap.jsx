@@ -484,8 +484,12 @@ const targetXY = (d) => {
   if (d.group === 'system') return [0, 0];
   const cluster = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
   if (!cluster) {
-    const a = Math.random() * 2 * Math.PI;
-    const r = 320 + Math.random() * 60;
+    // Deterministic scatter for unclustered nodes — hash-based, not random.
+    // This function is only called for initial seeding (first load / new node),
+    // never as a continuous force target, so determinism matters for stability.
+    const hash = d.id ? d.id.split('').reduce((a, c) => a + ((a * 31) + c.charCodeAt(0)) | 0, 0) : 0;
+    const a = toRad(hash % 360);
+    const r = 320 + (hash % 60);
     return [Math.cos(a) * r, Math.sin(a) * r];
   }
   const angle = CLUSTER_SECTORS[cluster] ?? 0;
@@ -497,7 +501,6 @@ const targetXY = (d) => {
   // Use deterministic hash for angle, plus radius proportional to cluster size.
   const hash = d.id ? d.id.split('').reduce((a, c) => a + ((a * 31) + c.charCodeAt(0)) | 0, 0) : 0;
   const nodeCount = _clusterCounts[cluster] || 1;
-  // Spread across full 360° but bias toward the cluster's outward direction
   const spreadAngle = toRad(angle + (hash % 360));
   const ringR = clusterRadius + 50 + (hash % 7) * 15;
   return [Math.cos(spreadAngle) * ringR, Math.sin(spreadAngle) * ringR];
@@ -507,50 +510,77 @@ function configureForces(fg, n) {
   // Recompute cluster sizes for dynamic radius
   recomputeClusterCounts(fg.graphData().nodes);
 
+  // ── Obsidian-style forces: repulsion + link springs + gentle center gravity.
+  // No forceX/forceY pulling nodes to predetermined coordinates — that fights
+  // the physics and causes pile-up when positions are recomputed each tick.
+  // The layout emerges naturally from the force simulation instead.
+
   const sim = fg.d3Force('link');
   if (sim) {
    sim.distance(l => l.ropeLen || DEFAULT_ROPE);
    sim.strength(0.15);  // weaker link pull so clusters can spread
   }
   fg.d3Force('center', d3.forceCenter().strength(0.005));
-  // Stronger charge for more nodes — they need more room
-  const chargeStrength = n > 150 ? -400 : n > 80 ? -320 : n > 40 ? -260 : -200;
+
+  // Stronger charge — scales with node count so dense graphs still spread.
+  // This is the primary force that prevents pile-up (like Obsidian's Repel slider).
+  const chargeStrength = n > 150 ? -500 : n > 80 ? -380 : n > 40 ? -300 : -240;
   fg.d3Force('charge', d3.forceManyBody()
    .strength(d => {
     const base = (GROUP_STYLE[d.group] || GROUP_STYLE.system).size;
-    const mul = d.group === 'system' ? 3 : d.group === 'cluster' ? 2 : 1;
+    const mul = d.group === 'system' ? 4 : d.group === 'cluster' ? 2.5 : 1;
     return chargeStrength * mul * (base / 6);
    })
-   .distanceMax(800)
+   .distanceMax(900)
    .theta(0.9)
   );
-  // Bigger collision radius — nodes need more breathing room
+
+  // Collision detection — the hard floor that prevents overlap.
+  // Bigger radius per node so repulsion + collision work together.
   fg.d3Force('collision', d3.forceCollide()
-   .radius(d => (GROUP_STYLE[d.group] || GROUP_STYLE.system).size * 4 + 6)
+   .radius(d => (GROUP_STYLE[d.group] || GROUP_STYLE.system).size * 5 + 8)
    .strength(1)
    .iterations(4)
   );
-  // Stronger positional forces so clusters actually separate
-  fg.d3Force('x', d3.forceX()
-   .x(d => targetXY(d)[0])
-   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.8 : 0.45)
+
+  // Gentle radial force pulls cluster heads toward their sector angle.
+  // Low strength (0.04) so it nudges rather than yanks — physics still dominates.
+  // This replaces the old forceX/forceY that were too aggressive (0.45-0.8 strength)
+  // and continuously fought the repulsion/collision forces.
+  fg.d3Force('x', null);
+  fg.d3Force('y', null);
+  fg.d3Force('radial',
+    d3.forceRadial(
+      d => {
+        if (d.group === 'system') return 0;
+        const cluster = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
+        if (!cluster) return 350;
+        const cr = _clusterRadii[cluster] || 200;
+        return d.group === 'cluster' ? cr : cr + 60;
+      },
+      0, 0
+    ).strength(d => {
+      if (d.group === 'system') return 1;
+      if (d.group === 'cluster') return 0.12;
+      return 0.04;  // very gentle for satellites — physics does the rest
+    })
   );
-  fg.d3Force('y', d3.forceY()
-   .y(d => targetXY(d)[1])
-   .strength(d => d.group === 'system' ? 1 : d.group === 'cluster' ? 0.8 : 0.45)
-  );
-  fg.d3Force('radial', null);
+
   fg.d3AlphaDecay(0.008);   // slower cooldown = more time to settle
   fg.d3VelocityDecay(0.3);  // less friction = nodes travel further apart
 }
 
-// Configure d3 forces — strong repulsion so nodes spread out, not pile up
+// Reconfigure forces on data updates — but do NOT reheat the simulation.
+// The library already calls alpha(1) internally when graphData prop changes.
+// Reheating here too was causing a double-reset that destroyed stable positions
+// every poll cycle. Just update the force parameters quietly.
  useEffect(() => {
   if (graphData.nodes.length > 0 && fgRef.current && fgRef.current.__forcesConfigured) {
-   // Reconfigure on subsequent data updates (refresh/poll)
+   // Recompute cluster radii + force strengths for new node counts, but
+   // don't disturb the simulation energy — nodes stay where physics put them.
    try {
     configureForces(fgRef.current, graphData.nodes.length);
-    fgRef.current.d3ReheatSimulation();
+    // No d3ReheatSimulation() here — let the library's own alpha decay handle it.
    } catch (e) { console.warn('Force reconfig error:', e); }
   }
  }, [graphData]);
