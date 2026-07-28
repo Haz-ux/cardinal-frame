@@ -1025,17 +1025,36 @@ useEffect(() => {
       onEngineTick={() => {
         // Copy engine positions into the graph nodes every tick.
         // ForceGraph2D reads node.x/node.y for rendering.
+        //
+        // VALIDATION: Never overwrite valid coordinates with 0, null, undefined, or NaN.
+        // Missing coordinates are treated as an upstream error — we log a warning
+        // and leave the existing position intact rather than substituting (0,0).
         const engine = engineRef.current;
         if (!engine) return;
         const nodes = graphDataRef.current.nodes;
+        let missingCount = 0;
         for (const node of nodes) {
           const pos = engine.getPosition(node.id);
-          if (pos) {
-            node.x = pos.x;
-            node.y = pos.y;
-            node.vx = pos.vx || 0;
-            node.vy = pos.vy || 0;
+          if (!pos) continue;
+          const px = typeof pos.x === 'number' && Number.isFinite(pos.x) ? pos.x : null;
+          const py = typeof pos.y === 'number' && Number.isFinite(pos.y) ? pos.y : null;
+          if (px !== null) {
+            node.x = px;
+          } else if (typeof node.x !== 'number' || !Number.isFinite(node.x)) {
+            missingCount++;
+            node.x = undefined; // force re-seed by LayoutEngine on next tick
           }
+          if (py !== null) {
+            node.y = py;
+          } else if (typeof node.y !== 'number' || !Number.isFinite(node.y)) {
+            missingCount++;
+            node.y = undefined;
+          }
+          node.vx = (typeof pos.vx === 'number' && Number.isFinite(pos.vx)) ? pos.vx : (node.vx || 0);
+          node.vy = (typeof pos.vy === 'number' && Number.isFinite(pos.vy)) ? pos.vy : (node.vy || 0);
+        }
+        if (missingCount > 0) {
+          console.warn(`%c[NeuralMap] ${missingCount} nodes have missing coordinates — flagged for re-seed`, 'color: #eab308');
         }
         const fg = fgRef.current;
         if (fg) fg.pauseAnimation?.();

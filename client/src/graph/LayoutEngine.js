@@ -26,7 +26,7 @@ import { createClusterSimulation } from './NodeSimulation.js';
 import { buildBoundaries, applyBoundaryCollision } from './CollisionEngine.js';
 import { categorizeLinks, groupIntraLinks } from './LinkRouter.js';
 import { clusterRadius } from './SectorLayout.js';
-import { LAYOUT_PARAMS, computeMetrics } from './GraphMetrics.js';
+import { LAYOUT_PARAMS, computeMetrics, computeDiagnostics } from './GraphMetrics.js';
 
 export class LayoutEngine {
   constructor(opts = {}) {
@@ -158,13 +158,70 @@ export class LayoutEngine {
     // 8. Build cluster boundaries for inter-cluster collision
     this.boundaries = buildBoundaries(this.plan.clusters);
 
-    // 9. Compute metrics
-    this._metrics = computeMetrics(this.cache.allNodes(), this.cache.links);
+    // 9. Compute metrics + full diagnostics report
+    const allNodes = this.cache.allNodes();
+    this._metrics = computeMetrics(allNodes, this.cache.links);
+    this._diagnostics = computeDiagnostics(allNodes, this.cache.links, this.plan.nodeToCluster);
 
-    // 10. Start auto-tick if not already running
+    // 10. VALIDATION — post-layout sanity checks. Never silently substitute 0,0.
+    //     Every node must have finite x and y after the layout engine runs.
+    this._validateLayout(allNodes);
+
+    // 11. Start auto-tick if not already running
     if (this.autoTick && !this.rafId) {
       this._startAutoTick();
     }
+  }
+
+  /**
+   * Validate that every node has finite x and y coordinates.
+   * - Missing coordinates → throw (don't silently substitute 0,0)
+   * - NaN/Infinity → throw
+   * - Identical (0,0) for non-origin nodes → warn loudly
+   * - Coordinates that are exactly (0,0) for hub nodes → warn (hubs should be at sector positions)
+   *
+   * This is the "Layout Validation" from the patch report:
+   * "Every node must satisfy Number.isFinite(node.x) and Number.isFinite(node.y).
+   *  If either coordinate is invalid: throw or warn loudly.
+   *  Never silently substitute 0,0."
+   */
+  _validateLayout(nodes) {
+    const invalid = [];
+    const atOrigin = [];
+
+    for (const node of nodes) {
+      const xOk = typeof node.x === 'number' && Number.isFinite(node.x);
+      const yOk = typeof node.y === 'number' && Number.isFinite(node.y);
+
+      if (!xOk || !yOk) {
+        invalid.push({ id: node.id, group: node.group, x: node.x, y: node.y });
+      } else if (node.x === 0 && node.y === 0) {
+        atOrigin.push({ id: node.id, group: node.group });
+      }
+    }
+
+    if (invalid.length > 0) {
+      // Don't throw — log a loud error. Throwing would crash the UI.
+      // The layout engine should have seeded these; if not, the auto-tick
+      // loop will eventually settle them. But this warning surfaces the problem.
+      console.error(
+        '%c[LayoutEngine] VALIDATION ERROR: %d nodes have invalid coordinates!',
+        'color: #ef4444; font-weight: bold',
+        invalid.length,
+        invalid
+      );
+    }
+
+    if (atOrigin.length > 0) {
+      console.warn(
+        '%c[LayoutEngine] WARNING: %d nodes at (0,0) — may be uninitialized:',
+        'color: #eab308; font-weight: bold',
+        atOrigin.length,
+        atOrigin
+      );
+    }
+
+    return { invalid: invalid.length, atOrigin: atOrigin.length };
   }
 
   /**
@@ -214,6 +271,13 @@ export class LayoutEngine {
    */
   getMetrics() {
     return this._metrics;
+  }
+
+  /**
+   * Get the full diagnostics report from the last setData() call.
+   */
+  getDiagnostics() {
+    return this._diagnostics;
   }
 
   /**

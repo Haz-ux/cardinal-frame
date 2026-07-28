@@ -119,6 +119,162 @@ export function computeMetrics(nodes, links) {
 }
 
 /**
+ * Full diagnostics report — called after every graph build.
+ *
+ * Computes:
+ * - Node count, link count, cluster count
+ * - Unclustered count + every unclustered node printed
+ * - Nodes missing x, nodes missing y
+ * - Nodes at (0,0) — these are suspect and should never happen
+ * - Duplicate positions (pile-up detection)
+ * - Largest/smallest/average cluster size
+ * - Per-cluster breakdown
+ *
+ * Silent failures are not allowed — all issues are logged loudly.
+ *
+ * @param {Array} nodes
+ * @param {Map<string, string>} nodeToCluster - nodeId → clusterId (from ClusterPlanner)
+ * @returns {{ nodes, links, clusters, unclustered, missingX, missingY, atOrigin, duplicates, largest, smallest, avg }}
+ */
+export function computeDiagnostics(nodes, links, nodeToCluster) {
+  const nodeCount = nodes.length;
+  const linkCount = links.length;
+
+  // Build cluster map
+  const clusters = new Map();
+  const unclustered = [];
+
+  for (const n of nodes) {
+    const cid = nodeToCluster?.get(n.id) ||
+      n.cluster ||
+      (n.id?.startsWith('cluster:') ? n.id.split(':')[1] : null) ||
+      'unclustered';
+
+    if (cid === 'unclustered') {
+      unclustered.push({ id: n.id, group: n.group, name: n.name || n.label || '' });
+    }
+
+    if (!clusters.has(cid)) clusters.set(cid, []);
+    clusters.get(cid).push(n);
+  }
+
+  // Missing coordinates
+  const missingX = [];
+  const missingY = [];
+  const atOrigin = [];
+
+  for (const n of nodes) {
+    const hasX = typeof n.x === 'number' && Number.isFinite(n.x);
+    const hasY = typeof n.y === 'number' && Number.isFinite(n.y);
+
+    if (!hasX) missingX.push({ id: n.id, group: n.group, x: n.x });
+    if (!hasY) missingY.push({ id: n.id, group: n.group, y: n.y });
+
+    // (0,0) is a suspect position — it means "uninitialized" not "center"
+    if (hasX && hasY && n.x === 0 && n.y === 0) {
+      atOrigin.push({ id: n.id, group: n.group });
+    }
+  }
+
+  // Duplicate positions (pile-up detection)
+  const posMap = new Map(); // "x,y" → [nodeIds]
+  for (const n of nodes) {
+    if (typeof n.x !== 'number' || typeof n.y !== 'number') continue;
+    const key = `${Math.round(n.x)},${Math.round(n.y)}`;
+    if (!posMap.has(key)) posMap.set(key, []);
+    posMap.get(key).push(n);
+  }
+  const duplicates = [];
+  for (const [pos, ns] of posMap) {
+    if (ns.length > 1) {
+      // Only flag as pile-up if 3+ nodes at exact same rounded position,
+      // or 2+ nodes that are not a hub+satellite pair
+      if (ns.length >= 3) {
+        duplicates.push({ position: pos, count: ns.length, nodes: ns.map(n => ({ id: n.id, group: n.group })) });
+      }
+    }
+  }
+
+  // Cluster size statistics
+  const clusterSizes = [];
+  for (const [cid, ns] of clusters) {
+    clusterSizes.push({ cluster: cid, count: ns.length });
+  }
+  clusterSizes.sort((a, b) => b.count - a.count);
+
+  const largest = clusterSizes[0] || { cluster: 'none', count: 0 };
+  const smallest = clusterSizes[clusterSizes.length - 1] || { cluster: 'none', count: 0 };
+  const avg = clusterSizes.length > 0
+    ? Math.round(clusterSizes.reduce((sum, c) => sum + c.count, 0) / clusterSizes.length * 10) / 10
+    : 0;
+
+  // Log summary
+  if (typeof console !== 'undefined') {
+    const fmt = 'color: #00f0ff';
+    console.groupCollapsed('%c[Graph Diagnostics]', fmt, `${nodeCount} nodes, ${linkCount} links, ${clusters.size} clusters`);
+    console.log('%c  Nodes:', fmt, nodeCount);
+    console.log('%c  Links:', fmt, linkCount);
+    console.log('%c  Clusters:', fmt, clusters.size);
+    console.log('%c  Unclustered:', fmt, unclustered.length,
+      unclustered.length > 0 ? unclustered : '');
+    console.log('%c  Missing X:', fmt, missingX.length,
+      missingX.length > 0 ? missingX : '');
+    console.log('%c  Missing Y:', fmt, missingY.length,
+      missingY.length > 0 ? missingY : '');
+    console.log('%c  At (0,0):', fmt, atOrigin.length,
+      atOrigin.length > 0 ? atOrigin : '');
+    console.log('%c  Duplicates (pile-ups):', fmt, duplicates.length,
+      duplicates.length > 0 ? duplicates : '');
+
+    // Per-cluster breakdown
+    console.groupCollapsed('%c  Per-cluster sizes:', fmt);
+    for (const c of clusterSizes) {
+      console.log(`    ${c.cluster}: ${c.count} nodes`);
+    }
+    console.groupEnd();
+
+    console.log('%c  Largest cluster:', fmt, largest.cluster, largest.count);
+    console.log('%c  Smallest cluster:', fmt, smallest.cluster, smallest.count);
+    console.log('%c  Average cluster size:', fmt, avg);
+
+    // For every unclustered node, print neighbors + resolved cluster + reason
+    if (unclustered.length > 0) {
+      console.group('%c  Unclustered node details:', 'color: #ef4444');
+      for (const u of unclustered) {
+        const node = nodes.find(n => n.id === u.id);
+        const neighbors = [];
+        for (const l of links) {
+          const s = typeof l.source === 'object' ? l.source.id : l.source;
+          const t = typeof l.target === 'object' ? l.target.id : l.target;
+          if (s === u.id) neighbors.push({ target: t, type: l.type });
+          if (t === u.id) neighbors.push({ target: s, type: l.type });
+        }
+        console.warn(`    ${u.group} ${u.id}: ${neighbors.length} neighbors`,
+          neighbors.map(n => n.target));
+      }
+      console.groupEnd();
+    }
+
+    console.groupEnd();
+  }
+
+  return {
+    nodes: nodeCount,
+    links: linkCount,
+    clusters: clusters.size,
+    unclustered: unclustered.length,
+    missingX: missingX.length,
+    missingY: missingY.length,
+    atOrigin: atOrigin.length,
+    duplicates: duplicates.length,
+    largest,
+    smallest,
+    avg,
+    clusterSizes,
+  };
+}
+
+/**
  * Determine the LOD (Level of Detail) based on node count and zoom.
  *
  * @param {number} nodeCount

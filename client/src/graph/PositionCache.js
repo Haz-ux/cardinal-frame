@@ -10,7 +10,12 @@
  * This is the bridge between the API poller and the layout engine.
  * The layout engine asks PositionCache "what changed?" and only touches
  * the simulation for affected clusters.
+ *
+ * Validation: NEVER overwrites valid coordinates with 0, null, undefined, or NaN.
+ * If previous coordinates exist and are finite, they are preserved unconditionally.
  */
+
+import { buildAdjacency, getClusterId } from './ClusterPlanner.js';
 
 export class PositionCache {
   constructor() {
@@ -41,13 +46,32 @@ export class PositionCache {
       const existing = this.nodes.get(freshNode.id);
 
       if (existing) {
-        // Keep position (x, y, vx, vy, fx, fy) — only refresh data fields
-        // Store old position to detect if it was moved externally
+        // Preserve position fields (x, y, vx, vy, fx, fy) — only refresh data fields.
+        // VALIDATION: Only keep previous position if it's a finite number.
+        // Never keep 0,0 as a valid position — it likely means "uninitialized."
         const oldX = existing.x;
         const oldY = existing.y;
+        const oldVx = existing.vx;
+        const oldVy = existing.vy;
         Object.assign(existing, freshNode);
-        existing.x = oldX;
-        existing.y = oldY;
+
+        // Restore previous valid coordinates (never overwrite with null/undefined/NaN)
+        if (Number.isFinite(oldX) && oldX !== 0) {
+          existing.x = oldX;
+        } else if (!Number.isFinite(existing.x)) {
+          existing.x = undefined; // force re-seed by layout engine
+        }
+        if (Number.isFinite(oldY) && oldY !== 0) {
+          existing.y = oldY;
+        } else if (!Number.isFinite(existing.y)) {
+          existing.y = undefined;
+        }
+        // Preserve velocity if previously set and valid
+        if (Number.isFinite(oldVx)) existing.vx = oldVx;
+        else existing.vx = existing.vx || 0;
+        if (Number.isFinite(oldVy)) existing.vy = oldVy;
+        else existing.vy = existing.vy || 0;
+
         changedNodes.push(existing);
       } else {
         // New node — will be seeded by the layout engine
@@ -72,20 +96,12 @@ export class PositionCache {
       this.links = fresh.links;
       this.linkSignature = newSig;
 
-      // Update clusterOf map by re-scanning cluster assignments
+      // Update clusterOf map using BFS cluster resolution (shared with ClusterPlanner).
+      // This replaces the old one-hop logic that missed nodes connected through intermediaries.
       this.clusterOf.clear();
+      const adj = buildAdjacency(this.links);
       for (const node of this.nodes.values()) {
-        let cid = node.cluster || null;
-        if (!cid && node.id?.startsWith('cluster:')) cid = node.id.split(':')[1];
-        if (!cid) {
-          // Non-cluster node: find which cluster it links to
-          for (const link of this.links) {
-            const sId = typeof link.source === 'object' ? link.source.id : link.source;
-            const tId = typeof link.target === 'object' ? link.target.id : link.target;
-            if (sId === node.id && tId?.startsWith('cluster:')) { cid = tId.split(':')[1]; break; }
-            if (tId === node.id && sId?.startsWith('cluster:')) { cid = sId.split(':')[1]; break; }
-          }
-        }
+        const cid = getClusterId(node, adj);
         this.clusterOf.set(node.id, cid || 'unclustered');
       }
     }

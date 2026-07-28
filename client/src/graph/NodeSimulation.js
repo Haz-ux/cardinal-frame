@@ -52,13 +52,23 @@ export function createClusterSimulation(plan, intraLinks, hubPosition, clusterRa
   }
 
   // Seed satellite positions around the hub with golden-angle distribution.
+  // VALIDATION: Never initialize at origin. If a satellite has no coords,
+  // seed it via satelliteTarget(). If a satellite somehow has (0,0) that's not
+  // the hub position, treat it as missing and re-seed.
   const minRingRadius = Math.max(clusterRadius + 50, 80);
-  // Assign each satellite a sequential index within the cluster so
-  // satelliteTarget can apply index-based golden-angle spread.
   let satIndex = 0;
   for (const node of simNodes) {
     if (node === plan.hubNode) continue;
-    if (typeof node.x !== 'number' || (node.x === hubPosition.x && node.y === hubPosition.y)) {
+
+    const hasValidX = typeof node.x === 'number' && Number.isFinite(node.x);
+    const hasValidY = typeof node.y === 'number' && Number.isFinite(node.y);
+
+    // Re-seed if: no coords, or coords are (0,0) which likely means "uninitialized"
+    // BUT don't re-seed if coords match hub position (hub was just set to its sector)
+    const atOrigin = hasValidX && hasValidY && node.x === 0 && node.y === 0;
+    const atHub = hasValidX && hasValidY && node.x === hubPosition.x && node.y === hubPosition.y;
+
+    if (!hasValidX || !hasValidY || atOrigin || atHub) {
       const idx = satIndex++;
       const target = satelliteTarget(node.id, hubPosition.x, hubPosition.y, minRingRadius, idx);
       node.x = target.x + (Math.random() - 0.5) * 8;

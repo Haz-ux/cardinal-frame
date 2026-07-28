@@ -18,26 +18,56 @@
 import { clusterRadius } from './SectorLayout.js';
 
 /**
- * Extract cluster ID from a node.
- * - Nodes with explicit `cluster` field use that.
- * - Nodes with id `cluster:xxx` ARE the cluster hub.
- * - Other nodes (user, task, tool, plugin) inherit cluster from their links
- *   — they're linked to a cluster hub, so they belong to that cluster.
- * - Falls back to 'unclustered' if no link to a cluster is found.
+ * Build an undirected adjacency map from the link list.
+ * Exported so PositionCache can reuse the same BFS logic.
  */
-function getClusterId(node, links) {
+export function buildAdjacency(links) {
+  const adj = new Map(); // nodeId → Set<neighborId>
+  for (const link of links) {
+    const sId = typeof link.source === 'object' ? link.source.id : link.source;
+    const tId = typeof link.target === 'object' ? link.target.id : link.target;
+    if (!sId || !tId) continue;
+    if (!adj.has(sId)) adj.set(sId, new Set());
+    if (!adj.has(tId)) adj.set(tId, new Set());
+    adj.get(sId).add(tId);
+    adj.get(tId).add(sId);
+  }
+  return adj;
+}
+
+/**
+ * Extract cluster ID from a node using BFS traversal.
+ *
+ * Resolution order:
+ * 1. If node.cluster exists, use it.
+ * 2. If node IS a cluster hub (id starts with 'cluster:'), extract from id.
+ * 3. BFS through the graph from this node — the first reachable cluster hub wins.
+ *    Traversal depth is unlimited. Do NOT stop after one hop.
+ * 4. Only return 'unclustered' if absolutely no cluster is reachable.
+ *
+ * This replaces the previous one-hop lookup that missed nodes connected
+ * through intermediaries (e.g., tool → model → provider → cluster:xxx).
+ *
+ * Results are cached per-planner-call via the adjacency map.
+ */
+export function getClusterId(node, adj) {
   if (node.cluster) return node.cluster;
   if (node.id && node.id.startsWith('cluster:')) return node.id.split(':')[1];
   if (node.group === 'cluster' && node.id) return node.id.split(':')[1] || node.group;
-  // Non-cluster nodes: find which cluster they're linked to
-  if (links) {
-    for (const link of links) {
-      const sId = typeof link.source === 'object' ? link.source.id : link.source;
-      const tId = typeof link.target === 'object' ? link.target.id : link.target;
-      // This node links TO a cluster hub
-      if (sId === node.id && tId?.startsWith('cluster:')) return tId.split(':')[1];
-      // A cluster hub links TO this node
-      if (tId === node.id && sId?.startsWith('cluster:')) return sId.split(':')[1];
+  // BFS — first reachable cluster hub wins
+  if (adj && adj.has(node.id)) {
+    const visited = new Set([node.id]);
+    const queue = [node.id];
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      const neighbors = adj.get(cur);
+      if (!neighbors) continue;
+      for (const n of neighbors) {
+        if (visited.has(n)) continue;
+        visited.add(n);
+        if (n.startsWith('cluster:')) return n.split(':')[1];
+        queue.push(n);
+      }
     }
   }
   return 'unclustered';
@@ -52,9 +82,13 @@ export function planClusters(graphData) {
   const nodeToCluster = new Map();
   const clusters = new Map();
 
-  // Pass 1: group nodes by cluster
+  // Build adjacency map once — used by BFS cluster resolution for all nodes.
+  // This is O(links) to build and O(nodes + links) to traverse for all BFS calls.
+  const adj = buildAdjacency(links || []);
+
+  // Pass 1: group nodes by cluster (BFS resolution)
   for (const node of nodes) {
-    const cid = getClusterId(node, links);
+    const cid = getClusterId(node, adj);
     nodeToCluster.set(node.id, cid);
 
     if (!clusters.has(cid)) {
