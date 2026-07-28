@@ -1,51 +1,15 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
-import * as d3 from 'd3-force';
 import { cachedFetch } from './dataCache';
 import { useWebSocket } from './useWebSocket';
 import { ActivityFeed, useActivityFeed, useActivityPulses } from './ActivityOverlay';
 import { usePolling } from './usePolling';
 import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity } from 'lucide-react';
-
-const NEON = { cyan:'#00f0ff', magenta:'#ff00ff', blue:'#3b82f6', purple:'#a855f7', green:'#22c55e', yellow:'#eab308', red:'#ef4444', pink:'#ec4899', orange:'#f97316', teal:'#14b8a6' };
-const BG = { base:'#050510', card:'#0f0f23' };
-
-// ─── Group Styles ─────────────────────────────────────────────────
-const GROUP_STYLE = {
- system: { color: NEON.magenta, size: 16, glow: true },
- provider: { color: NEON.cyan, size: 9, glow: false },
- model: { color: '#5eead4', size: 4, glow: false },
- agent: { color: NEON.green, size: 8, glow: false },
- task: { color: NEON.yellow, size: 5, glow: false },
- skill: { color: NEON.purple, size: 6, glow: false },
- tool: { color: '#f59e0b', size: 5, glow: false },
- file: { color: NEON.blue, size: 4, glow: false },
- mcp: { color: NEON.orange, size: 7, glow: false },
- dag: { color: NEON.pink, size: 6, glow: false },
- conversation:{ color: NEON.teal, size: 4, glow: false },
- group: { color: '#f59e0b', size: 6, glow: false },
- user: { color: '#c084fc', size: 6, glow: false },
- plugin: { color: '#38bdf8', size: 5, glow: false },
- schedule: { color: '#fb923c', size: 5, glow: false },
- env: { color: '#a3e635', size: 3, glow: false },
- watcher: { color: '#f472b6', size: 4, glow: false },
- node: { color: '#39ff14', size: 10, glow: true },  // neon green for remote nodes
-};
-
-const LINK_COLORS = {
- api: NEON.cyan, registered: '#444', assigned: NEON.green, depends: NEON.yellow,
- mcp: NEON.orange, workflow: NEON.pink, chat: NEON.teal, uploaded: NEON.blue,
- workspace: '#333', imports: NEON.purple, member: '#f59e0b', group: '#f59e0b',
- hosts: '#5eead4', provides: '#f59e0b', uses: NEON.cyan, tool: '#f59e0b',
- task: NEON.yellow, config: '#a3e635', schedule: '#fb923c', plugin: '#38bdf8',
- watcher: '#f472b6', delegates: '#39ff14',
-};
-
-const STATUS_COLORS = {
- active: NEON.green, running: NEON.cyan, pending: NEON.yellow,
- completed: '#666', failed: NEON.red, idle: '#444', disconnected: '#333', unknown: '#555',
- online: NEON.green, offline: NEON.red, stale: NEON.yellow,
-};
+import { LayoutEngine } from './graph/LayoutEngine.js';
+import {
+  NEON, BG, GROUP_STYLE, LINK_COLORS, STATUS_COLORS,
+  ROPE_LENGTHS, DEFAULT_ROPE, computeLOD, computeMetrics,
+} from './graph/GraphMetrics.js';
 
 // ─── Clustering modes ─────────────────────────────────────────────
 const CLUSTER_MODES = {
@@ -82,17 +46,7 @@ function drawHullPath(ctx, hull) {
  ctx.closePath();
 }
 
-// ─── Rope length by link type ────────────
-const ROPE_LENGTHS = {
- hosts: 25, uses: 30, api: 50, registered: 40, assigned: 35,
- depends: 30, mcp: 45, workflow: 40, chat: 35, uploaded: 30,
- workspace: 20, imports: 15, member: 35, group: 40, provides: 25,
- tool: 40, task: 35, config: 50, schedule: 40, plugin: 45, watcher: 50,
- delegates: 55,
-};
-const DEFAULT_ROPE = 35;
-
-// ─── Draw a catenary/rope curve with directional arrow + optional label ───
+// ─── Draw a catenary/rope curve
 function drawRope(ctx, x1, y1, x2, y2, ropeLen, color, width, globalScale, isHighlighted, showParticles, time, label) {
  const dx = x2 - x1;
  const dy = y2 - y1;
@@ -209,7 +163,7 @@ const Minimap = memo(function Minimap({ fgRef, graphData, dim }) {
    const fg = fgRef.current;
    if (fg) {
     const t = fg.zoom();          // current zoom level (k)
-    const center = fg.getCenter?.() ?? { x: 0, y: 0 };
+    const center = fg.centerAt() ?? { x: 0, y: 0 };
     setViewport({ x: center.x, y: center.y, k: t });
    }
    raf = requestAnimationFrame(tick);
@@ -329,6 +283,12 @@ function useAnimationFrame(cb) {
 export default function NeuralMap() {
  const fgRef = useRef();
  const [graphData, setGraphData] = useState({ nodes: [], links: [] });
+ // Mirror graphData into a ref so call sites can read live node positions
+ // without calling fgRef.current.graphData() — that method is NOT exposed
+ // by react-force-graph-2d's fromKapsule methodNames allowlist, so it throws.
+ // d3-force mutates node objects in place, so this ref always has current data.
+ const graphDataRef = useRef(graphData);
+ useEffect(() => { graphDataRef.current = graphData; }, [graphData]);
  const [loading, setLoading] = useState(true);
  const [error, setError] = useState(null);
  const [search, setSearch] = useState('');
@@ -346,6 +306,22 @@ export default function NeuralMap() {
  const [lodLevel, setLodLevel] = useState(2); // 0=minimal, 1=basic, 2=full
  const containerRef = useRef();
  const animTimeRef = useRef(0);
+
+ // ─── Layout Engine ──────────────────────────────────────────────
+ // The engine runs its own internal RAF loop and manages ALL layout:
+ // cluster hub positions, per-cluster node simulations, collisions.
+ // NeuralMap just reads positions from it and renders.
+ const engineRef = useRef(null);
+ const [, setTick] = useState(0);  // force re-render when engine ticks
+ const tickRef = useRef(0);
+
+ if (!engineRef.current) {
+   engineRef.current = new LayoutEngine();
+   engineRef.current.onTick = () => {
+     tickRef.current++;
+     setTick(tickRef.current);
+   };
+ }
 
  // Responsive canvas
  useEffect(() => {
@@ -367,92 +343,67 @@ export default function NeuralMap() {
   return () => cancelAnimationFrame(raf);
  }, []);
 
- // Load graph — merge polled data with live positions to prevent pile-up.
- // On first load, seed positions from targetXY. On subsequent polls, keep
- // existing nodes' live simulated positions and only refresh their data
- // fields (status, activity, etc.). Only reheat the simulation when there
- // are genuinely new nodes — an unchanged graph shouldn't be disturbed.
- const isFirstLoadRef = useRef(true);
+ // Load graph — feed data into the LayoutEngine. The engine handles
+ // all position seeding, cluster simulation, and per-cluster node
+ // layout. React just stores the data reference for rendering.
  const load = useCallback(() => {
-  setLoading(true);
-  setError(null);
-  cachedFetch('/api/graph').then(data => {
-   if (!data || !data.nodes || !Array.isArray(data.nodes)) {
-    setError('Invalid graph data received');
-    return;
-   }
-   for (const l of (data.links || [])) {
-    l.ropeLen = ROPE_LENGTHS[l.type] || DEFAULT_ROPE;
-   }
-
-   const fg = fgRef.current;
-   const existingNodesById = new Map(
-    (fg?.graphData()?.nodes || []).map(n => [n.id, n])
-   );
-
-   let hasNewNodes = false;
-   const mergedNodes = data.nodes.map(freshNode => {
-    const existing = existingNodesById.get(freshNode.id);
-    if (existing) {
-      // Known node: keep its live simulated position/velocity, just
-      // refresh data fields (status, activity, etc.) from the new fetch.
-      return {
-        ...freshNode,
-        x: existing.x, y: existing.y,
-        vx: existing.vx, vy: existing.vy,
-        fx: existing.fx, fy: existing.fy,
-      };
+   setLoading(true);
+   setError(null);
+   cachedFetch('/api/graph').then(data => {
+    if (!data || !data.nodes || !Array.isArray(data.nodes)) {
+     setError('Invalid graph data received');
+     return;
     }
-    hasNewNodes = true;
-    return freshNode; // genuinely new — no x/y yet, seeding below handles it
-   });
+    for (const l of (data.links || [])) {
+     l.ropeLen = ROPE_LENGTHS[l.type] || DEFAULT_ROPE;
+    }
 
-   setGraphData({ nodes: mergedNodes, links: data.links || [] });
+    // Feed data to the engine — it manages ALL layout.
+    engineRef.current.setData(data.nodes, data.links);
 
-   // Only seed + reheat if there's something new to seed. An unchanged
-   // graph shouldn't have its simulation disturbed every poll cycle.
-   if (hasNewNodes || isFirstLoadRef.current) {
-    isFirstLoadRef.current = false;
-    requestAnimationFrame(() => {
-      const fg2 = fgRef.current;
-      if (!fg2) return;
-      const nodes = fg2.graphData().nodes;
-      recomputeClusterCounts(nodes);
-      for (const n of nodes) {
-        if (n.fx == null && n.fy == null && typeof n.x !== 'number') {
-          const [tx, ty] = targetXY(n);
-          n.x = tx;
-          n.y = ty;
-        }
-      }
-      fg2.d3ReheatSimulation();
-    });
-   }
-  }).catch(err => {
-   console.error('Neural Map load error:', err);
-   setError('Failed to load graph data. Check that the server is running and /api/graph responds.');
-  }).finally(() => setLoading(false));
+    // Pre-emptively null out react-force-graph-2d's internal forces BEFORE
+    // setGraphData triggers its prop-change handler. The library reheats its
+    // own forceSimulation to alpha=1 when graphData changes; if the default
+    // forces (link, charge, center) are still active, that 1 tick yanks nodes
+    // toward center, overriding LayoutEngine positions. Nulling here ensures
+    // the reheat is a no-op.
+    const fg = fgRef.current;
+    if (fg && typeof fg.d3Force === 'function') {
+      fg.d3Force('link', null);
+      fg.d3Force('charge', null);
+      fg.d3Force('center', null);
+      fg.d3Force('dagRadial', null);
+      fg.d3Force('collide', null);
+      fg.d3Force('x', null);
+      fg.d3Force('y', null);
+      fg.d3Force('radial', null);
+    }
+
+    // Store for rendering (positions come from engine via onTick).
+    setGraphData({ nodes: data.nodes, links: data.links });
+   }).catch(err => {
+    console.error('Neural Map load error:', err);
+    setError('Failed to load graph data. Check that the server is running and /api/graph responds.');
+   }).finally(() => setLoading(false));
  }, []);
 
  usePolling(load, 60000);
 
- // WS live updates
+ // WS live updates — engine handles layout; just nudge the engine
  const { lastEvent } = useWebSocket();
  useEffect(() => {
-  if (lastEvent && fgRef.current) {
-   // node:status events — update node status in-place (visual only, no reheat)
-   if (lastEvent.type === 'node:status' && lastEvent.payload) {
-    const { nodeId, status } = lastEvent.payload;
-    if (nodeId && status) {
-      const nodes = fgRef.current.graphData().nodes;
-      const node = nodes.find(n => n.id === `node:${nodeId}`);
-      if (node) node.status = status;  // canvas paint picks up new status color
-      // Skip reheat — visual-only update
-      return;
+   if (lastEvent && engineRef.current) {
+    if (lastEvent.type === 'node:status' && lastEvent.payload) {
+     const { nodeId, status } = lastEvent.payload;
+     if (nodeId && status) {
+       const nodes = graphDataRef.current.nodes;
+       const node = nodes.find(n => n.id === `node:${nodeId}`);
+       if (node) node.status = status;
+       return;
+     }
     }
+    engineRef.current.poke();
    }
-   fgRef.current.d3ReheatSimulation();
-  }
  }, [lastEvent]);
 
  // Activity feed
@@ -498,138 +449,26 @@ export default function NeuralMap() {
   }
  }, [graphData.nodes.length]);
 
- // ─── Force configuration (standalone — called from onEngineTick) ─────
-// Must run inside the first engine tick, NOT a useEffect, because
-// useEffect fires AFTER the simulation's first tick — default forces
-// would already have pulled all nodes to center.
-const CLUSTER_SECTORS = { runtime: 0, models: 72, interface: 144, integrate: 216, infra: 288 };
-const toRad = deg => (deg * Math.PI) / 180;
-
-// Precompute per-cluster node count so we can scale cluster radius dynamically.
-// Updated on each data load — see configureForces.
-let _clusterCounts = {};
-let _clusterRadii = {};
-
-function recomputeClusterCounts(nodes) {
-  _clusterCounts = {};
-  for (const n of nodes) {
-    const c = n.cluster || (n.id && n.id.startsWith('cluster:') ? n.id.split(':')[1] : null) || 'unclustered';
-    _clusterCounts[c] = (_clusterCounts[c] || 0) + 1;
-  }
-  // Each node needs ~40px of ring circumference to avoid overlap.
-  // radius = max(120, count * 40 / (2π)) + padding
-  _clusterRadii = {};
-  for (const [c, count] of Object.entries(_clusterCounts)) {
-    const ringCircumference = count * 44;
-    const radius = Math.max(140, ringCircumference / (2 * Math.PI) + 30);
-    _clusterRadii[c] = radius;
-  }
-}
-
-const targetXY = (d) => {
-  if (d.group === 'system') return [0, 0];
-  const cluster = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
-  if (!cluster) {
-    // Deterministic scatter for unclustered nodes — hash-based, not random.
-    // This function is only called for initial seeding (first load / new node),
-    // never as a continuous force target, so determinism matters for stability.
-    const hash = d.id ? d.id.split('').reduce((a, c) => a + ((a * 31) + c.charCodeAt(0)) | 0, 0) : 0;
-    const a = toRad(hash % 360);
-    const r = 320 + (hash % 60);
-    return [Math.cos(a) * r, Math.sin(a) * r];
-  }
-  const angle = CLUSTER_SECTORS[cluster] ?? 0;
-  const clusterRadius = _clusterRadii[cluster] || 200;
-  if (d.group === 'cluster') {
-    return [Math.cos(toRad(angle)) * clusterRadius, Math.sin(toRad(angle)) * clusterRadius];
-  }
-  // Spread satellites in a ring around their cluster center.
-  // Use deterministic hash for angle, plus radius proportional to cluster size.
-  const hash = d.id ? d.id.split('').reduce((a, c) => a + ((a * 31) + c.charCodeAt(0)) | 0, 0) : 0;
-  const nodeCount = _clusterCounts[cluster] || 1;
-  const spreadAngle = toRad(angle + (hash % 360));
-  const ringR = clusterRadius + 50 + (hash % 7) * 15;
-  return [Math.cos(spreadAngle) * ringR, Math.sin(spreadAngle) * ringR];
-};
-
-function configureForces(fg, n) {
-  // Recompute cluster sizes for dynamic radius
-  recomputeClusterCounts(fg.graphData().nodes);
-
-  // ── Obsidian-style forces: repulsion + link springs + gentle center gravity.
-  // No forceX/forceY pulling nodes to predetermined coordinates — that fights
-  // the physics and causes pile-up when positions are recomputed each tick.
-  // The layout emerges naturally from the force simulation instead.
-
-  const sim = fg.d3Force('link');
-  if (sim) {
-   sim.distance(l => l.ropeLen || DEFAULT_ROPE);
-   sim.strength(0.15);  // weaker link pull so clusters can spread
-  }
-  fg.d3Force('center', d3.forceCenter().strength(0.005));
-
-  // Stronger charge — scales with node count so dense graphs still spread.
-  // This is the primary force that prevents pile-up (like Obsidian's Repel slider).
-  const chargeStrength = n > 150 ? -500 : n > 80 ? -380 : n > 40 ? -300 : -240;
-  fg.d3Force('charge', d3.forceManyBody()
-   .strength(d => {
-    const base = (GROUP_STYLE[d.group] || GROUP_STYLE.system).size;
-    const mul = d.group === 'system' ? 4 : d.group === 'cluster' ? 2.5 : 1;
-    return chargeStrength * mul * (base / 6);
-   })
-   .distanceMax(900)
-   .theta(0.9)
-  );
-
-  // Collision detection — the hard floor that prevents overlap.
-  // Bigger radius per node so repulsion + collision work together.
-  fg.d3Force('collision', d3.forceCollide()
-   .radius(d => (GROUP_STYLE[d.group] || GROUP_STYLE.system).size * 5 + 8)
-   .strength(1)
-   .iterations(4)
-  );
-
-  // Gentle radial force pulls cluster heads toward their sector angle.
-  // Low strength (0.04) so it nudges rather than yanks — physics still dominates.
-  // This replaces the old forceX/forceY that were too aggressive (0.45-0.8 strength)
-  // and continuously fought the repulsion/collision forces.
+ // Neutralize react-force-graph-2d's internal D3 forces.
+// The library always creates forceSimulation() with default link, charge, and
+// center forces. When graphData prop changes, it reheats to alpha=1 and ticks
+// once before cooldownTicks=0 stops it. That single tick yanks nodes toward the
+// center via forceCenter and toward each other via forceLink/forceManyBody,
+// overriding the LayoutEngine's computed positions.
+// Fix: null out all internal forces so that tick is a no-op.
+useEffect(() => {
+  const fg = fgRef.current;
+  if (!fg) return;
+  // Remove all internal forces — LayoutEngine is the sole position authority
+  fg.d3Force('link', null);
+  fg.d3Force('charge', null);
+  fg.d3Force('center', null);
+  fg.d3Force('dagRadial', null);
+  fg.d3Force('collide', null);
   fg.d3Force('x', null);
   fg.d3Force('y', null);
-  fg.d3Force('radial',
-    d3.forceRadial(
-      d => {
-        if (d.group === 'system') return 0;
-        const cluster = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
-        if (!cluster) return 350;
-        const cr = _clusterRadii[cluster] || 200;
-        return d.group === 'cluster' ? cr : cr + 60;
-      },
-      0, 0
-    ).strength(d => {
-      if (d.group === 'system') return 1;
-      if (d.group === 'cluster') return 0.12;
-      return 0.04;  // very gentle for satellites — physics does the rest
-    })
-  );
-
-  fg.d3AlphaDecay(0.008);   // slower cooldown = more time to settle
-  fg.d3VelocityDecay(0.3);  // less friction = nodes travel further apart
-}
-
-// Reconfigure forces on data updates — but do NOT reheat the simulation.
-// The library already calls alpha(1) internally when graphData prop changes.
-// Reheating here too was causing a double-reset that destroyed stable positions
-// every poll cycle. Just update the force parameters quietly.
- useEffect(() => {
-  if (graphData.nodes.length > 0 && fgRef.current && fgRef.current.__forcesConfigured) {
-   // Recompute cluster radii + force strengths for new node counts, but
-   // don't disturb the simulation energy — nodes stay where physics put them.
-   try {
-    configureForces(fgRef.current, graphData.nodes.length);
-    // No d3ReheatSimulation() here — let the library's own alpha decay handle it.
-   } catch (e) { console.warn('Force reconfig error:', e); }
-  }
- }, [graphData]);
+  fg.d3Force('radial', null);
+}, [graphData.nodes.length]);
 
  // Filter by search + active groups
  const filteredData = useMemo(() => {
@@ -725,7 +564,7 @@ function configureForces(fg, n) {
  const exportPNG = useCallback(() => {
   const fg = fgRef.current;
   if (!fg) return;
-  const canvas = fg.container?.querySelector('canvas');
+  const canvas = containerRef.current?.querySelector('canvas');
   if (!canvas) return;
   const link = document.createElement('a');
   link.download = 'neural-map.png';
@@ -978,30 +817,26 @@ function configureForces(fg, n) {
   if (containerRef.current) containerRef.current.style.cursor = node ? 'grab' : 'default';
  }, []);
 
- // Drag handlers
+ // Drag handlers — delegate pinning to the engine
  const handleNodeDrag = useCallback(node => {
-  node.fx = node.x;
-  node.fy = node.y;
-  if (fgRef.current) fgRef.current.d3ReheatSimulation();
+   engineRef.current?.setFixed(node.id, node.x, node.y);
  }, []);
 
  const handleNodeDragEnd = useCallback(node => {
-  if (pinMode) { node.fx = node.x; node.fy = node.y; }
-  else { node.fx = null; node.fy = null; }
+   if (pinMode) {
+     engineRef.current?.pin(node.id, node.x, node.y);
+   } else {
+     engineRef.current?.unpin(node.id);
+   }
  }, [pinMode]);
 
  const handleNodeDoubleClick = useCallback(node => {
-  node.fx = null; node.fy = null;
-  if (fgRef.current) fgRef.current.d3ReheatSimulation();
+   engineRef.current?.unpin(node.id);
  }, []);
 
  const unpinAll = useCallback(() => {
-  if (!fgRef.current) return;
-  const { nodes } = fgRef.current.graphData();
-  for (const n of nodes) { n.fx = null; n.fy = null; }
-  fgRef.current.d3ReheatSimulation();
+    engineRef.current?.unpinAll();
  }, []);
-
  const toggleGroup = (g) => {
   setActiveGroups(prev => {
    const next = new Set(prev);
@@ -1176,31 +1011,35 @@ function configureForces(fg, n) {
       onNodeDoubleClick={handleNodeDoubleClick}
       onBackgroundClick={() => setSelectedNode(null)}
       backgroundColor={BG.base}
-      warmupTicks={0}
-      cooldownTicks={1000}
-      cooldownTime={15000}
-      d3AlphaDecay={0.008}
-      d3VelocityDecay={0.3}
-      onEngineTick={() => {
-        // One-shot force configuration on the very first tick.
-        // Custom forces must be installed here because useEffect runs
-        // AFTER the simulation has already had its first tick — which
-        // means default forces have already pulled everything to center.
-        const fg = fgRef.current;
-        if (!fg || fg.__forcesConfigured) return;
-        fg.__forcesConfigured = true;
-        try {
-          configureForces(fg, filteredData.nodes.length);
-          fg.d3ReheatSimulation();
-        } catch (e) {
-          console.warn('Force config error:', e);
-        }
-      }}
       enableNodeDrag={true}
       enableZoomInteraction={true}
       enablePanInteraction={true}
       minZoom={0.2}
       maxZoom={12}
+      // Passive mode — LayoutEngine ownes all positions.
+      // Tell ForceGraph2D not to run its own simulation.
+      warmupTicks={0}
+      cooldownTicks={0}
+      d3AlphaDecay={1}
+      d3VelocityDecay={1}
+      onEngineTick={() => {
+        // Copy engine positions into the graph nodes every tick.
+        // ForceGraph2D reads node.x/node.y for rendering.
+        const engine = engineRef.current;
+        if (!engine) return;
+        const nodes = graphDataRef.current.nodes;
+        for (const node of nodes) {
+          const pos = engine.getPosition(node.id);
+          if (pos) {
+            node.x = pos.x;
+            node.y = pos.y;
+            node.vx = pos.vx || 0;
+            node.vy = pos.vy || 0;
+          }
+        }
+        const fg = fgRef.current;
+        if (fg) fg.pauseAnimation?.();
+      }}
      />
     )}
 
@@ -1271,7 +1110,7 @@ function configureForces(fg, n) {
       </div>
       <div className="flex items-center gap-2">
        {selectedNode.fx != null && (
-        <button onClick={() => { selectedNode.fx = null; selectedNode.fy = null; fgRef.current?.d3ReheatSimulation(); setSelectedNode({...selectedNode, fx: null, fy: null}); }}
+        <button onClick={() => { engineRef.current?.unpin(selectedNode.id); setSelectedNode({...selectedNode, fx: null, fy: null}); }}
          className="text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors" style={{ color: NEON.cyan }}>
          <Unlock size={11} className="inline mr-1" />Unpin
         </button>

@@ -35,6 +35,16 @@ router.get('/graph', optionalAuth, async (_req, res) => {
  };
  for (const [id, props] of Object.entries(CLUSTERS)) addNode(`cluster:${id}`, props);
 
+// Cluster hub ring — weak links between adjacent cluster heads so the
+// clusters don't float independently when they have no satellites.
+// Without this, empty clusters (runtime, models, interface) drift and
+// pile up at the center because forceRadial alone can't separate them.
+const clusterIds = Object.keys(CLUSTERS);
+for (let i = 0; i < clusterIds.length; i++) {
+  const next = (i + 1) % clusterIds.length;
+  addLink(`cluster:${clusterIds[i]}`, `cluster:${clusterIds[next]}`, 'bridge', 0.3);
+}
+
  // ─── Users (Interface cluster) — exclude test-pattern users ──
  const users = db.prepare(`SELECT id, username, role FROM users
    WHERE username NOT LIKE 'boot_%' AND username NOT LIKE 'noboot_%'
@@ -45,6 +55,7 @@ router.get('/graph', optionalAuth, async (_req, res) => {
      AND username NOT LIKE 'test%' AND username NOT LIKE 'auth%'`).all();
  for (const u of users) {
    addNode(`user:${u.id}`, { name: u.username, group: 'user', cluster: 'interface', role: u.role });
+   addLink(`cluster:interface`, `user:${u.id}`, 'hosts', 2);
  }
 
  // ─── Providers (Models cluster) ─────────────────────────────
