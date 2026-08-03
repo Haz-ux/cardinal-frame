@@ -23,11 +23,18 @@ export function buildBoundaries(clusters) {
   const boundaries = [];
   for (const plan of clusters.values()) {
     if (!plan.hubNode) continue;
+    // Boundary = the cluster's satellite ring radius, NOT ring + padding.
+    // Satellites orbit at clusterRadius+50; padding used to inflate the
+    // boundary far beyond the ring, so every orbiting satellite sat inside
+    // its neighbor's boundary circle and got shoved back toward its own hub
+    // every frame — crushing the orbit into a pile. The boundary now marks
+    // the actual ring so satellites orbit freely, and inter-cluster
+    // separation is handled by hub positions + the world-sim collide force.
     boundaries.push({
       id: plan.id,
       x: plan.hubNode.x || 0,
       y: plan.hubNode.y || 0,
-      r: plan.radius + 120, // padding for satellite ring + inter-cluster gap
+      r: plan.radius + 60, // ring radius + small margin for node size
     });
   }
   return boundaries;
@@ -40,6 +47,11 @@ export function buildBoundaries(clusters) {
  *
  * This is a soft constraint — it applies a velocity correction, not a
  * hard position snap, so the simulation can settle naturally.
+ *
+ * A node is only pushed when it has genuinely crossed deep into a foreign
+ * cluster — specifically, when it is closer to the foreign hub than to its
+ * own hub. Satellites orbiting at their ring radius are naturally closer to
+ * their own hub, so they orbit freely; only drifters get corrected.
  *
  * @param {Array} nodes - all nodes across all clusters
  * @param {Map<string, string>} nodeToCluster - nodeId → clusterId
@@ -56,6 +68,13 @@ export function applyBoundaryCollision(nodes, nodeToCluster, boundaries, strengt
     const myCluster = nodeToCluster.get(node.id);
     if (!myCluster) continue;
 
+    // Own hub position — used to decide "which side of the gap am I on?"
+    let ownHubX = 0, ownHubY = 0;
+    for (const b of boundaries) {
+      if (b.id === myCluster) { ownHubX = b.x; ownHubY = b.y; break; }
+    }
+    const distToOwn = Math.hypot(node.x - ownHubX, node.y - ownHubY);
+
     for (const b of boundaries) {
       if (b.id === myCluster) continue; // skip own cluster
 
@@ -63,8 +82,10 @@ export function applyBoundaryCollision(nodes, nodeToCluster, boundaries, strengt
       const dy = node.y - b.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
 
-      // If node is inside another cluster's boundary, snap it outside
-      if (dist < b.r && dist > 0.1) {
+      // Only correct a node that is (a) inside the foreign boundary AND
+      // (b) closer to the foreign hub than to its own hub. Otherwise we'd
+      // crush satellites back onto their hubs on every tick.
+      if (dist < b.r && dist > 0.1 && dist < distToOwn) {
         const push = (b.r - dist) * strength;
         // Direct position correction + velocity nudge for sim still running
         node.x += (dx / dist) * push;

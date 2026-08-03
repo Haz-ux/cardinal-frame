@@ -52,6 +52,7 @@ export function buildAdjacency(links) {
  */
 export function getClusterId(node, adj) {
   if (node.cluster) return node.cluster;
+  if (node.group === 'system') return 'system'; // central hub is its own cluster
   if (node.id && node.id.startsWith('cluster:')) return node.id.split(':')[1];
   if (node.group === 'cluster' && node.id) return node.id.split(':')[1] || node.group;
   // BFS — first reachable cluster hub wins

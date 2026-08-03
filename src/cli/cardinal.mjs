@@ -111,6 +111,121 @@ async function chat(args) {
   }
 }
 
+const CF_DIR = process.env.CF_DIR || '/home/cardinal-frame';
+const HEALTH_URL = 'http://localhost:8080/api/health';
+const PID_FILE = '/tmp/cardinal.pid';
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/** Check whether the API is up. Returns true if a 2xx health response arrives. */
+async function isUp() {
+  try {
+    const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// `cardinal run` — start the server and client, wait until healthy
+async function run(args) {
+  const { spawn } = await import('node:child_process');
+  const { writeFileSync, appendFileSync } = await import('node:fs');
+
+  console.log('Starting Cardinal Frame...');
+
+  if (await isUp()) {
+    console.log('Server is already running on http://localhost:8080');
+    console.log('Dashboard: http://localhost:5173');
+    return;
+  }
+
+  // Start the server (stable entrypoint — no file watcher)
+  const serverProc = spawn('node', ['src/server/server.mjs'], {
+    cwd: CF_DIR,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const serverPid = serverProc.pid;
+  writeFileSync(PID_FILE, String(serverPid));
+
+  // Pipe server output to stdout + a log file
+  const logStream = (chunk) => {
+    const out = chunk.toString();
+    process.stdout.write(`Server: ${out}`);
+    try { appendFileSync('/tmp/cardinal-server.log', out); } catch {}
+  };
+  serverProc.stdout?.on('data', logStream);
+  serverProc.stderr?.on('data', logStream);
+  serverProc.on('exit', (code, signal) => {
+    console.log(`Server exited (code=${code}, signal=${signal})`);
+    try { appendFileSync('/tmp/cardinal-server.log', `\nServer exited (code=${code})\n`); } catch {}
+  });
+
+  // Wait for the API to come up (max ~30s), then report clearly
+  console.log('Waiting for server to come up...');
+  const deadline = Date.now() + 30000;
+  let up = false;
+  while (Date.now() < deadline) {
+    if (serverProc.exitCode !== null) break;          // died during boot
+    if (await isUp()) { up = true; break; }
+    await sleep(1000);
+  }
+
+  if (!up) {
+    console.error('Server did not come up within 30s. Check /tmp/cardinal-server.log');
+    process.exit(1);
+  }
+
+  console.log('Server is up: http://localhost:8080 (PID ' + serverPid + ')');
+
+  // Start client unless disabled
+  let clientProc = null;
+  if (!args.includes('--no-client') && !args.includes('--server-only')) {
+    console.log('Starting dashboard...');
+    clientProc = spawn('npm', ['run', 'dev'], {
+      cwd: CF_DIR + '/client',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    clientProc.stdout?.on('data', (d) => process.stdout.write(`Client: ${d}`));
+    clientProc.stderr?.on('data', (d) => process.stdout.write(`Client: ${d}`));
+    clientProc.on('exit', (code) => console.log(`Dashboard exited (code=${code})`));
+    console.log('Dashboard: http://localhost:5173');
+  }
+
+  console.log('Cardinal Frame is running. Press Ctrl+C to stop.');
+
+  const shutdown = () => {
+    console.log('\nStopping Cardinal Frame...');
+    if (clientProc) { try { clientProc.kill('SIGTERM'); } catch {} }
+    if (serverPid) { try { process.kill(serverPid, 'SIGTERM'); } catch {} }
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  await new Promise(() => {});
+}
+
+// `cardinal stop` — stop server + dashboard started by `cardinal run`
+async function stop() {
+  const fs = await import('node:fs');
+  const pids = [];
+  try { pids.push(Number(fs.readFileSync(PID_FILE, 'utf8'))); } catch {}
+  // Also sweep for any stray server/dashboard processes
+  for (const pat of ['src/server/server.mjs', 'client/node_modules/.bin/vite']) {
+    try {
+      const { execSync } = await import('node:child_process');
+      const out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim();
+      for (const pid of out.split('\n')) { if (pid) pids.push(Number(pid)); }
+    } catch {}
+  }
+  if (pids.length === 0) { console.log('Nothing is running.'); return; }
+  for (const pid of new Set(pids)) {
+    try { process.kill(pid, 'SIGTERM'); console.log('Stopped PID ' + pid); } catch {}
+  }
+  console.log('Cardinal Frame stopped.');
+}
+
 // ─── Main ────────────────────────────────────────────────────
 const cmd = process.argv[2];
 const sub = process.argv[3]; // subcommand or primary arg
@@ -130,10 +245,13 @@ Commands:
   port                         Show current dev port (GET /api/settings/dev)
   port:set <port>              Set the dev port (PUT /api/settings/dev)
   chat <message>               Send a chat message (POST /api/chat)
+  run [args]                   Start server + dashboard (--no-client, --server-only)
+  stop                         Stop server + dashboard
 
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
+  CF_LOG_FILE  Path to log file (default: /tmp/cardinal-start.log)
 
 Run 'cardinal' (no args) or 'cardinal help' for this message.
 `;
@@ -166,6 +284,12 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         break;
       case 'chat':
         await chat(sub !== undefined ? process.argv.slice(3) : []);
+        break;
+      case 'run':
+        await run(process.argv.slice(3));
+        break;
+      case 'stop':
+        await stop();
         break;
       default:
         console.error(`Unknown command: ${cmd}\nRun 'cardinal help' for usage.`);

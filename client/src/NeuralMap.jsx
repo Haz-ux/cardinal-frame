@@ -611,8 +611,8 @@ useEffect(() => {
  }, [filteredData, showHulls]);
 
  // ─── Custom Canvas Renderer ─────────────────────────────────────
- const nodePaint = useCallback(({ id, name, group, status, isDefault, modelCount }, ctx, globalScale) => {
-  const style = GROUP_STYLE[group] || GROUP_STYLE.system;
+  const nodePaint = useCallback(({ id, name, group, status, isDefault, modelCount, x, y }, ctx, globalScale) => {
+   const style = GROUP_STYLE[group] || GROUP_STYLE.system;
   const isHovered = hoverNode?.id === id;
   const isNeighbor = hoverNode ? hoverNeighbors.has(id) : true;
   const isSelected = selectedNode?.id === id;
@@ -621,10 +621,15 @@ useEffect(() => {
   const opacity = hoverNode ? (isNeighbor ? 1 : 0.06) : 1;
   const useLOD = computedLOD === 0;
 
-  const baseR = style.size;
-  const r = baseR * (isHovered ? 1.8 : isDefault ? 1.3 : 1);
+   const baseR = style.size;
+   const r = baseR * (isHovered ? 1.8 : isDefault ? 1.3 : 1);
 
-  // Outer glow (skip at LOD 0 for performance)
+   // The library paints in world coordinates (no per-node translate),
+   // so we translate to the node position and draw relative to (0,0).
+   ctx.save();
+   ctx.translate(x || 0, y || 0);
+
+   // Outer glow (skip at LOD 0 for performance)
   if (!useLOD && ((style.glow || isHovered || isSelected || isOnPath) && opacity > 0.3)) {
    const glowR = r + (style.glow ? 14 : 10) + (isOnPath ? 6 : 0);
    const gradient = ctx.createRadialGradient(0, 0, r, 0, 0, glowR);
@@ -718,6 +723,7 @@ useEffect(() => {
    if (group === 'provider' && modelCount) label += ` (${modelCount})`;
    ctx.fillText(label, 0, r + 4);
   }
+  ctx.restore();
  }, [hoverNode, hoverNeighbors, selectedNode, pathStart, pathResult, computedLOD]);
 
  // ─── Custom Link Renderer ────────────────

@@ -19,6 +19,8 @@ import { assignSectors, hubTarget } from './SectorLayout.js';
 const HUB_FREEZE_ALPHA = 0.001;
 const HUB_MAX_TICKS = 300;
 const HUB_WARMUP_TICKS = 50;
+const MIN_HUB_RADIUS = 180;
+const MIN_HUB_COLLISION = 120;
 
 /**
  * Angular constraint force — pulls each hub toward its assigned sector angle.
@@ -40,7 +42,7 @@ function angularForce(sectors, clusters) {
       if (!sector) continue;
 
       const plan = clusters.get(cid);
-      const r = plan ? plan.radius : 200;
+      const r = plan ? Math.max(MIN_HUB_RADIUS, plan.radius) : MIN_HUB_RADIUS;
       const targetX = Math.cos(sector.angleRad) * r;
       const targetY = Math.sin(sector.angleRad) * r;
 
@@ -68,18 +70,32 @@ export function simulateClusters(clusters, clusterOrder, bridgeLinks) {
   // Assign sectors
   const sectors = assignSectors(clusterOrder);
 
-  // Build hub nodes for the world simulation
+  // Build hub nodes for the world simulation — store cluster radii for distance calcs
   const hubNodes = [];
   const hubByCluster = new Map();
+  const clusterRadii = {}; // cid → safe radius for collision/distance
 
   for (const cid of clusterOrder) {
     const plan = clusters.get(cid);
     if (!plan || !plan.hubNode) continue;
 
-    const sector = sectors.get(cid) || { angleRad: 0 };
-    const target = hubTarget(sector, plan.radius);
-
     const hub = plan.hubNode;
+
+    // Central Cardinal hub — pinned at origin, never on a sector ring.
+    if (hub.group === 'system') {
+      clusterRadii[cid] = 30; // small collide radius — keep it compact
+      hub.x = 0;
+      hub.y = 0;
+      hubNodes.push(hub);
+      hubByCluster.set(cid, hub);
+      continue;
+    }
+
+    const sector = sectors.get(cid) || { angleRad: 0 };
+    const safeRadius = Math.max(MIN_HUB_RADIUS, plan.radius);
+    clusterRadii[cid] = safeRadius;
+    const target = hubTarget(sector, safeRadius);
+
     // Always seed at sector target if no position or if it's a fresh node
     if (typeof hub.x !== 'number' || hub.fx == null) {
       hub.x = target.x;
@@ -92,17 +108,23 @@ export function simulateClusters(clusters, clusterOrder, bridgeLinks) {
 
   if (hubNodes.length === 0) return;
 
-  // Build bridge link objects for the hub simulation
+  // Build bridge link objects — distance must be >= sum of both cluster radii
+  // or the spring will collapse them inward to satisfy the link constraint.
   const simLinks = [];
   for (const bl of bridgeLinks) {
     const src = hubByCluster.get(bl.srcCluster);
     const tgt = hubByCluster.get(bl.tgtCluster);
     if (src && tgt) {
+      const rSrc = clusterRadii[bl.srcCluster] || MIN_HUB_RADIUS;
+      const rTgt = clusterRadii[bl.tgtCluster] || MIN_HUB_RADIUS;
+      // Rope length = combined radii + gap, so springs don't pull clusters
+      // below their minimum separation. This prevents center collapse.
+      const distance = Math.max(rSrc + rTgt + 100, 400);
       simLinks.push({
         source: src.id,
         target: tgt.id,
-        ropeLen: 200,
-        strength: 0.05, // very weak — sector force dominates
+        ropeLen: distance,
+        strength: 0.02, // extremely weak — angular force must dominate
       });
     }
   }
@@ -115,24 +137,26 @@ export function simulateClusters(clusters, clusterOrder, bridgeLinks) {
       .strength(l => l.strength)
     )
     .force('charge', d3.forceManyBody()
-      .strength(d => d.group === 'system' ? -1200 : -600)
-      .distanceMax(600)
+      // Zero charge — angular + radial forces provide positioning.
+      // Negative charge pulls toward center, counteracting radial force.
+      .strength(0)
     )
     .force('radial', d3.forceRadial(d => {
       if (d.group === 'system') return 0;
       const cid = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
-      const plan = clusters.get(cid);
-      return plan ? plan.radius : 200;
-    }, 0, 0).strength(d => d.group === 'system' ? 1 : 0.3))
+      return clusterRadii[cid] || MIN_HUB_RADIUS;
+    }, 0, 0).strength(d => d.group === 'system' ? 1 : 0.5))
     .force('angle', angularForce(sectors, clusters))
     .force('collide', d3.forceCollide()
-      .radius(d => d.group === 'system' ? 30 : 25)
-      .strength(0.8)
-      .iterations(2)
+      .radius(d => {
+        if (d.group === 'system') return 30;
+        const cid = d.cluster || (d.id && d.id.startsWith('cluster:') ? d.id.split(':')[1] : null);
+        // Use the actual cluster radius + padding as collision radius
+        return (clusterRadii[cid] || MIN_HUB_COLLISION) * 0.85;
+      })
+      .strength(1.0)
+      .iterations(4)
     )
-    .alpha(1.0)
-    .alphaDecay(0.05)
-    .velocityDecay(0.4);
 
   // Warmup + run until settled
   sim.tick(HUB_WARMUP_TICKS);
@@ -158,18 +182,69 @@ export function simulateClusters(clusters, clusterOrder, bridgeLinks) {
  * just adjusts the anchor point.
  */
 export function relocateHubs(clusters, clusterOrder, sectors) {
+  const hubs = [];
+
   for (const cid of clusterOrder) {
     const plan = clusters.get(cid);
     if (!plan || !plan.hubNode) continue;
 
+    const hub = plan.hubNode;
+
+    // Central Cardinal hub is always pinned at the origin — never relocated.
+    if (hub.group === 'system') {
+      hub.x = 0;
+      hub.y = 0;
+      hubs.push({ node: hub, radius: 30, cid });
+      continue;
+    }
+
     const sector = sectors.get(cid);
     if (!sector) continue;
 
-    const target = hubTarget(sector, plan.radius);
-    plan.hubNode.fx = target.x;
-    plan.hubNode.fy = target.y;
+    const r = Math.max(MIN_HUB_RADIUS, plan.radius);
+    const target = hubTarget(sector, r);
     plan.hubNode.x = target.x;
     plan.hubNode.y = target.y;
+
+    hubs.push({ node: plan.hubNode, radius: r, cid });
+  }
+
+  // Resolve hub overlaps — when cluster radii grow but world sim isn't re-run,
+  // hubs can overlap. Iteratively push overlapping hubs outward along their
+  // radial direction until minimum separation is reached.
+  const MAX_ITER = 60;
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    let anyOverlap = false;
+
+    for (let i = 0; i < hubs.length; i++) {
+      for (let j = i + 1; j < hubs.length; j++) {
+        const a = hubs[i];
+        const b = hubs[j];
+        const dx = b.node.x - a.node.x;
+        const dy = b.node.y - a.node.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const minDist = a.radius + b.radius + 60;
+
+        if (dist < minDist && dist > 0.001) {
+          anyOverlap = true;
+          const overlap = (minDist - dist) / 2;
+          const nx = dx / dist;
+          const ny = dy / dist;
+
+          b.node.x += nx * overlap;
+          b.node.y += ny * overlap;
+          a.node.x -= nx * overlap;
+          a.node.y -= ny * overlap;
+        }
+      }
+    }
+
+    if (!anyOverlap) break;
+  }
+
+  for (const { node } of hubs) {
+    node.fx = node.x;
+    node.fy = node.y;
   }
 }
 

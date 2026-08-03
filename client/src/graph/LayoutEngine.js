@@ -68,13 +68,30 @@ export class LayoutEngine {
     // 3. Assign sectors (or reuse if same cluster set)
     this.sectors = assignSectors(clusterOrder);
 
-    // 4. World sim: run on first load, when cluster set changes, or when
-    //    new nodes appear (cluster radii may have changed)
-    if (!this._initialLayoutDone || diff.linksChanged || diff.newNodes.length > 0) {
+    // 4. World sim: run on first load, when cluster set or radii change, or when
+    //    new nodes appear. We track the previous plan's cluster radii to detect
+    //    growth that would cause overlapping hub positions.
+    const prevRadii = this._prevRadii || new Map();
+    let radiiChanged = false;
+    for (const [cid, plan] of this.plan.clusters) {
+      const prevR = prevRadii.get(cid);
+      const currR = Math.max(180, plan.radius);
+      if (prevR !== undefined && Math.abs(prevR - currR) > 20) {
+        radiiChanged = true;
+        break;
+      }
+      if (prevR === undefined) radiiChanged = true;
+    }
+    this._prevRadii = new Map();
+    for (const [cid, plan] of this.plan.clusters) {
+      this._prevRadii.set(cid, Math.max(180, plan.radius));
+    }
+
+    if (!this._initialLayoutDone || diff.linksChanged ||
+        diff.newNodes.length > 0 || radiiChanged) {
       simulateClusters(this.plan.clusters, clusterOrder, this.plan.bridgeLinks);
       this._initialLayoutDone = true;
     } else {
-      // Just relocate hubs to new radii (cluster sizes may have changed)
       relocateHubs(this.plan.clusters, clusterOrder, this.sectors);
     }
 
@@ -196,6 +213,8 @@ export class LayoutEngine {
       if (!xOk || !yOk) {
         invalid.push({ id: node.id, group: node.group, x: node.x, y: node.y });
       } else if (node.x === 0 && node.y === 0) {
+        // The central Cardinal hub is intentionally pinned at the origin.
+        if (node.group === 'system') continue;
         atOrigin.push({ id: node.id, group: node.group });
       }
     }
@@ -238,8 +257,11 @@ export class LayoutEngine {
       }
     }
 
-    // Apply inter-cluster boundary collision
-    if (anyActive || this._initialLayoutDone) {
+    // Apply inter-cluster boundary collision only while sims are actively
+    // settling. Once settled, satellites hold their orbit rings via the
+    // radial force — running this every frame fights the radial force and
+    // crushes satellites onto their hubs (see CollisionEngine notes).
+    if (anyActive) {
       applyBoundaryCollision(
         this.cache.allNodes(),
         this.plan?.nodeToCluster,

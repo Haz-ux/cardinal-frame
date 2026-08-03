@@ -35,6 +35,20 @@ router.get('/graph', optionalAuth, async (_req, res) => {
  };
  for (const [id, props] of Object.entries(CLUSTERS)) addNode(`cluster:${id}`, props);
 
+ // ─── Central hub — the "Cardinal" main node ───────────────────
+ // This is the anchor every cluster and satellite orbits. The layout
+ // engine special-cases group 'system': radial force pins it at (0,0),
+ // angular force ignores it, collide keeps it small, and it freezes
+ // last. Everything else is positioned relative to it.
+ addNode('system', {
+  name: 'Cardinal',
+  group: 'system',
+  cluster: 'system',
+  status: 'active',
+  activity: 0,
+  isCore: true,
+ });
+
 // Cluster hub ring — weak links between adjacent cluster heads so the
 // clusters don't float independently when they have no satellites.
 // Without this, empty clusters (runtime, models, interface) drift and
@@ -44,6 +58,10 @@ for (let i = 0; i < clusterIds.length; i++) {
   const next = (i + 1) % clusterIds.length;
   addLink(`cluster:${clusterIds[i]}`, `cluster:${clusterIds[next]}`, 'bridge', 0.3);
 }
+ // ─── Cardinal → cluster bridges ───────────────────────────────
+ // Hub links that anchor each cluster to the central node, so clusters
+ // orbit Cardinal instead of floating as a disconnected ring.
+ for (const id of clusterIds) addLink('system', `cluster:${id}`, 'bridge', 0.5);
 
  // ─── Users (Interface cluster) — exclude test-pattern users ──
  const users = db.prepare(`SELECT id, username, role FROM users

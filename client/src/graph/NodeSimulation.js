@@ -56,6 +56,7 @@ export function createClusterSimulation(plan, intraLinks, hubPosition, clusterRa
   // seed it via satelliteTarget(). If a satellite somehow has (0,0) that's not
   // the hub position, treat it as missing and re-seed.
   const minRingRadius = Math.max(clusterRadius + 50, 80);
+  const ringRadius = minRingRadius;
   let satIndex = 0;
   for (const node of simNodes) {
     if (node === plan.hubNode) continue;
@@ -100,10 +101,15 @@ export function createClusterSimulation(plan, intraLinks, hubPosition, clusterRa
         const tBase = GROUP_SIZE[l.target?.group] || 8;
         const sSize = sBase * 10 + 30;
         const tSize = tBase * 10 + 30;
-        // Hub nodes get extra collision
-        const sMul = l.source?.group === 'cluster' || l.source?.group === 'system' ? 2.5 : 1;
-        const tMul = l.target?.group === 'cluster' || l.target?.group === 'system' ? 2.5 : 1;
-        const minDist = (sSize * sMul + tSize * tMul);
+        // Hub links (hub → satellite) should NOT inflate to the huge
+        // cluster size — the radial force owns that distance. Use the
+        // satellite's own size so the ring isn't blown out past clusterRadius.
+        const isHubLink = l.source === plan.hubNode || l.target === plan.hubNode;
+        if (isHubLink) {
+          const satSize = l.source === plan.hubNode ? tSize : sSize;
+          return Math.max(ropeLen, satSize + 40);
+        }
+        const minDist = (sSize + tSize);
         return Math.max(ropeLen, minDist);
       })
       .strength(0.1)
@@ -112,21 +118,28 @@ export function createClusterSimulation(plan, intraLinks, hubPosition, clusterRa
       .strength(d => {
         const base = GROUP_SIZE[d.group] || 8;
         const mul = d.group === 'system' ? 4 : d.group === 'cluster' ? 2.5 : 1;
-        const raw = -600 * mul * (base / 6);
-        return Math.min(raw, -300);
+        const raw = -400 * mul * (base / 6);
+        return Math.max(raw, -240);
       })
-      .distanceMax(1000)
+      .distanceMax(900)
       .theta(0.9)
     )
     .force('collide', d3.forceCollide()
       .radius(d => {
         const base = GROUP_SIZE[d.group] || 8;
         const mul = d.group === 'cluster' ? 2.5 : d.group === 'system' ? 1.5 : 1;
-        return base * 10 * mul + 30;
+        return base * 6 + 14;
       })
       .strength(1)
       .iterations(8)
     )
+    .force('radial', d3.forceRadial(d => {
+      // Satellites orbit the hub at the cluster ring radius.
+      // The hub itself is frozen (fx/fy) so this force is a no-op on it.
+      if (d === plan.hubNode) return 0;
+      return ringRadius;
+    }, hubPosition.x, hubPosition.y)
+      .strength(d => d === plan.hubNode ? 0 : 0.08))
     .force('center', d3.forceCenter(hubPosition.x, hubPosition.y).strength(0.005))
     .alpha(NODE_ALPHA)
     .alphaDecay(NODE_ALPHA_DECAY)

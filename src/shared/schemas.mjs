@@ -28,13 +28,13 @@ export const IsoTimestampSchema = z.string();
 // ─── Graph ────────────────────────────────────────────────────────────
 
 export const NodeGroupSchema = z.enum([
-  'cluster', 'user', 'provider', 'agent', 'task', 'dag',
+  'system', 'cluster', 'user', 'provider', 'agent', 'task', 'dag',
   'skill', 'tool', 'group', 'file', 'conversation', 'plugin', 'schedule',
   'node', 'env', 'watcher', 'mcp',
 ]);
 
 export const ClusterSchema = z.enum([
-  'runtime', 'models', 'interface', 'integrate', 'infra',
+  'system', 'runtime', 'models', 'interface', 'integrate', 'infra',
 ]);
 
 export const LinkTypeSchema = z.enum([
