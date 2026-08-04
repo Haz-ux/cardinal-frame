@@ -1,6 +1,6 @@
 {
   "name": "cardinal-frame",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "build:client": "cd client && npm run build",
     "dev": "node src/server/server.mjs & cd client && npm run dev",
     "cli": "node src/cli/cardinal.mjs",
+    "hooks:install": "bash scripts/setup-hooks.sh",
     "test": "vitest run",
     "test:watch": "vitest watch",
     "test:coverage": "vitest run --coverage"
@@ -28,6 +29,7 @@
     "compression": "^1.8.1",
     "cors": "2.8.5",
     "cron-parser": "^4.9.0",
+    "d3-force": "^3.0.0",
     "dotenv": "3.0.0",
     "express": "^4.18.0",
     "express-rate-limit": "8.5.2",
@@ -39,10 +41,9 @@
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "react-force-graph-2d": "^1.29.1",
-    "react-router-dom": "^7.16.0",
     "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14",
+    "vite": "^8.2.0",
     "winston": "^3.13.0",
     "ws": "8.21.0",
     "zod": "^4.4.3"
@@ -54,5 +55,9 @@
     "@types/ws": "^8.18.1",
     "supertest": "^7.2.2",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5",
+    "sharp": "0.35.3"
   }
 }

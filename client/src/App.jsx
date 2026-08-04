@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useState, useCallback, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, NavLink, Navigate, useNavigate } from 'react-router';
 import { AuthProvider, useAuth } from './AuthContext';
 import { prewarm } from './dataCache';
 import Login from './Login';

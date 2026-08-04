@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { signPayload, verifyPayload, getOrCreateNodeIdentity } from '../node-identity.mjs';
 import { canDelegateToNode } from './governance.mjs';
 import { createReportQueue } from '../report-queue.mjs';
+import { scoreCommand } from '../warden.mjs';
 
 /**
  * Delegation — Cross-node subagent task delegation
@@ -289,6 +290,24 @@ export default function delegationRoutes(ctx) {
 
     const check = sanitizeCommand(command);
     if (!check.safe) return res.status(400).json({ error: check.error });
+
+    // WARDEN risk gate — block high-risk, require explicit approval for medium-risk
+    const warden = scoreCommand(command);
+    audit('delegate', 'warden:command', command, req.user?.id, { score: warden.score, level: warden.level, verdict: warden.verdict, reasons: warden.reasons });
+    if (warden.verdict === 'block') {
+      return res.status(403).json({ error: 'WARDEN: high-risk command blocked', warden });
+    }
+    if (warden.verdict === 'approve' && req.body?.warden_approve !== true) {
+      const approvalId = randomUUID();
+      stmts.warden.insert.run(approvalId, 'delegate', 'execute', JSON.stringify({ command }), JSON.stringify(warden), 'pending', req.user?.username || null);
+      broadcast('warden:approval_required', { approval_id: approvalId, scope: 'delegate', warden });
+      return res.status(403).json({
+        error: 'WARDEN: command requires explicit approval',
+        needs_approval: true,
+        approval_id: approvalId,
+        warden,
+      });
+    }
 
     // Find or assign agent
     const agent = agentId

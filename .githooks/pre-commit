@@ -1,0 +1,27 @@
+#!/bin/sh
+# Pre-commit hook: scan staged files for secrets with gitleaks.
+# Skips gracefully if gitleaks is not installed (CI enforces server-side).
+# Install: git config core.hooksPath .githooks  (or: npm run hooks:install)
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "⚠️  gitleaks not installed — skipping local secret scan."
+  echo "    Install it (https://github.com/gitleaks/gitleaks) to scan locally."
+  exit 0
+fi
+
+config=".gitleaks.toml"
+[ -f "$config" ] || config=""
+
+echo "🔍 gitleaks: scanning staged changes..."
+if [ -n "$config" ]; then
+  gitleaks protect --staged --config "$config" --no-banner
+else
+  gitleaks protect --staged --no-banner
+fi
+
+status=$?
+if [ $status -ne 0 ]; then
+  echo "❌ Secret scan failed — commit blocked."
+  echo "   If this is a false positive, add an allowlist entry to .gitleaks.toml."
+fi
+exit $status

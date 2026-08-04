@@ -114,6 +114,7 @@ async function chat(args) {
 const CF_DIR = process.env.CF_DIR || '/home/cardinal-frame';
 const HEALTH_URL = 'http://localhost:8080/api/health';
 const PID_FILE = '/tmp/cardinal.pid';
+const LOG_FILE = process.env.CF_LOG_FILE || '/tmp/cardinal-server.log';
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -152,13 +153,13 @@ async function run(args) {
   const logStream = (chunk) => {
     const out = chunk.toString();
     process.stdout.write(`Server: ${out}`);
-    try { appendFileSync('/tmp/cardinal-server.log', out); } catch {}
+    try { appendFileSync(LOG_FILE, out); } catch {}
   };
   serverProc.stdout?.on('data', logStream);
   serverProc.stderr?.on('data', logStream);
   serverProc.on('exit', (code, signal) => {
     console.log(`Server exited (code=${code}, signal=${signal})`);
-    try { appendFileSync('/tmp/cardinal-server.log', `\nServer exited (code=${code})\n`); } catch {}
+    try { appendFileSync(LOG_FILE, `\nServer exited (code=${code})\n`); } catch {}
   });
 
   // Wait for the API to come up (max ~30s), then report clearly
@@ -172,7 +173,7 @@ async function run(args) {
   }
 
   if (!up) {
-    console.error('Server did not come up within 30s. Check /tmp/cardinal-server.log');
+    console.error(`Server did not come up within 30s. Check ${LOG_FILE}`);
     process.exit(1);
   }
 
@@ -251,7 +252,7 @@ Commands:
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
-  CF_LOG_FILE  Path to log file (default: /tmp/cardinal-start.log)
+  CF_LOG_FILE  Path to log file (default: /tmp/cardinal-server.log)
 
 Run 'cardinal' (no args) or 'cardinal help' for this message.
 `;

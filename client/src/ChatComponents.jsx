@@ -7,7 +7,7 @@ import {
  ChevronDown, ChevronRight, Terminal, Cpu, Bot, User, Play, Square,
  Code, Eye, FileText, Clock, X, Edit3, Save, Lock, Unlock, Trash2,
  Sparkles, Zap, Activity, Network, Layers, BookOpen, Search, RefreshCw,
- ChevronLeft, AlertTriangle, CheckCircle2, XCircle, Loader2, Pause, Resume
+ ChevronLeft, AlertTriangle, CheckCircle2, XCircle, Loader2, Pause
 } from 'lucide-react';
 
 const NEON = { cyan:'#00f0ff', magenta:'#ff00ff', blue:'#3b82f6', purple:'#a855f7', green:'#22c55e', yellow:'#eab308', red:'#ef4444', pink:'#ec4899', orange:'#f97316', teal:'#14b8a6' };
@@ -124,18 +124,31 @@ export const CodeSandboxBlock = memo(function CodeSandboxBlock({ initialCode = '
  const [running, setRunning] = useState(false);
  const textareaRef = useRef();
 
- const runCode = useCallback(async () => {
+ const runCode = useCallback(async (force = false) => {
   setRunning(true);
   setTab('console');
   try {
-  const result = await api('/api/sandbox/execute', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ code, language }),
-  });
-  setOutput(result);
+   const token = localStorage.getItem('cf_token');
+   const res = await fetch('/api/sandbox/execute', {
+   method: 'POST',
+   headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+   body: JSON.stringify({ code, language, warden_approve: force }),
+   });
+   const body = await res.json().catch(() => ({}));
+   if (!res.ok) {
+   if (body.needs_approval) {
+    setRunning(false);
+    const ok = window.confirm(`WARDEN flagged this code as medium-risk:\n\n${(body.warden?.reasons || []).join('\n') || 'Review required.'}\n\nApprove and run?`);
+    if (ok) return runCode(true);
+    setOutput({ exitCode: 0, stdout: '', stderr: 'Execution cancelled — approval not granted.' });
+    return;
+   }
+   setOutput({ exitCode: 1, stdout: '', stderr: body.error || `Request failed: ${res.status}` });
+   return;
+   }
+   setOutput(body);
   } catch (e) {
-  setOutput({ exitCode: 1, stdout: '', stderr: e.message });
+   setOutput({ exitCode: 1, stdout: '', stderr: e.message });
   }
   setRunning(false);
  }, [code, language]);

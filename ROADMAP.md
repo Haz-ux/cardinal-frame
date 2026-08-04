@@ -34,6 +34,17 @@
 
 ---
 
+## Planned
+
+### Phase 5 — Audit recommendations (Aug 2026)
+- [ ] 5.1 Plugin marketplace / discovery UI — tie plugin discovery + install into the same flow as Skill Hub installation
+- [ ] 5.2 WARDEN-style pre-execution risk gate — risk-scored approval ahead of high-privilege actions (sandbox execution, cross-node delegation), extending governance enforcement
+- [ ] 5.3 Cost-aware Adaptive Matrix routing — feed live cost-per-outcome into the bandit router reward signal (alongside latency/success) for local MINERVA + cloud pool
+- [ ] 5.4 Graceful MINERVA offline fallback for DAG execution — degrade to local inference when primary LLM provider is unreachable
+- [ ] 5.5 npm workspace migration — single root + `client/` dependency tree (ADR-0018)
+
+---
+
 ## Principles
 - No shortcuts — every change is production-grade with tests
 - One canonical tree — `client/src/` for frontend, `src/server/` for backend

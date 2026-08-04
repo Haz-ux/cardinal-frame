@@ -72,8 +72,8 @@ export default function systemRoutes(ctx) {
         connected_clients: wss.clients.size,
       },
       event_loop: {
-        max_heap_mb: Math.round(require('v8').getHeapStatistics().total_physical_size / 1024 / 1024 * 100) / 100,
-        used_heap_mb: Math.round(require('v8').getHeapStatistics().used_heap_size / 1024 / 1024 * 100) / 100,
+        heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
+        heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
       },
       timestamp: new Date().toISOString(),
     });

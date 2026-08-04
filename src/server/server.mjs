@@ -8,11 +8,8 @@ import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { existsSync } from 'fs';
-import { spawn, exec } from 'child_process';
-import { execSync } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import os from 'os';
-import pkg from 'cron-parser';
-const { parseExpression: parseCronExpression } = pkg;
 import { createServer } from 'http';
 import { validateBody, schemas } from './validate.mjs';
 import * as mcp from './mcp-client.mjs';
@@ -45,6 +42,8 @@ import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
 import skillHubRoutes from './routes/skill-hub.mjs';
+import pluginMarketRoutes from './routes/plugin-market.mjs';
+import wardenRoutes from './routes/warden.mjs';
 import chainsRoutes from './routes/chains.mjs';
 import evolutionRoutes from './routes/evolution.mjs';
 import heartbeatRulesRoutes from './routes/heartbeat-rules.mjs';
@@ -58,6 +57,7 @@ import governanceRoutes, { initGovernance, checkPermission, auditLog } from './r
 import nodesRoutes from './routes/nodes.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
+import { evaluate as wardenEvaluate } from './warden.mjs';
 import { executeSkillChain } from './chains.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
 import { initNodeRegistry } from './node-registry.mjs';
@@ -120,10 +120,16 @@ app.use((req, res, next) => {
 
 // ─── Process-level error handlers (prevent crashes) ──────────────
 process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled Rejection:', reason);
+  logger.error('Unhandled Rejection', {
+    message: reason?.message || String(reason),
+    stack: reason?.stack ? reason.stack.split('\n').slice(0, 6).join('\n') : '',
+  });
 });
 process.on('uncaughtException', (err) => {
-  logger.error('Uncaught Exception:', err.message);
+  logger.error('Uncaught Exception', {
+    message: err?.message || String(err),
+    stack: err?.stack ? err.stack.split('\n').slice(0, 6).join('\n') : '',
+  });
 });
 
 // ─── Request ID Tracking ─────────────────────────────────────────────
@@ -1120,6 +1126,21 @@ const stmts = {
         updateInstalled: db.prepare("UPDATE skill_hub_sources SET installed_skills = ? WHERE id = ?"),
         delete: db.prepare('DELETE FROM skill_hub_sources WHERE id = ?'),
       },
+      pluginMarket: {
+        insert: db.prepare('INSERT INTO plugin_market_sources (id, name, url, type, verified, trust_score, scan_status) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getAll: db.prepare('SELECT * FROM plugin_market_sources ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM plugin_market_sources WHERE id = ?'),
+        updateScan: db.prepare("UPDATE plugin_market_sources SET scan_status = ?, scan_result = ?, last_scanned_at = datetime('now'), trust_score = ? WHERE id = ?"),
+        updateInstalled: db.prepare("UPDATE plugin_market_sources SET installed_plugins = ? WHERE id = ?"),
+        delete: db.prepare('DELETE FROM plugin_market_sources WHERE id = ?'),
+      },
+      warden: {
+        insert: db.prepare('INSERT INTO warden_approvals (id, scope, action, payload, warden, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getAll: db.prepare('SELECT * FROM warden_approvals ORDER BY created_at DESC'),
+        getByStatus: db.prepare('SELECT * FROM warden_approvals WHERE status = ? ORDER BY created_at DESC'),
+        getById: db.prepare('SELECT * FROM warden_approvals WHERE id = ?'),
+        updateStatus: db.prepare("UPDATE warden_approvals SET status = ?, decided_by = ?, decided_at = datetime('now') WHERE id = ?"),
+      },
       skillProposals: {
         insert: db.prepare('INSERT INTO skill_proposals (id, skill_id, skill_name, proposed_content, rationale) VALUES (?, ?, ?, ?, ?)'),
         getPending: db.prepare("SELECT * FROM skill_proposals WHERE status = 'pending' ORDER BY created_at DESC"),
@@ -1406,6 +1427,8 @@ app.use('/api', chatConvRoutes(ctx));
 app.use('/api', chatCompRoutes(ctx));
 app.use('/api', skillsRoutes(ctx));
 app.use('/api', skillHubRoutes(ctx));
+app.use('/api', pluginMarketRoutes(ctx));
+app.use('/api', wardenRoutes(ctx));
 app.use('/api', chainsRoutes(ctx));
 app.use('/api', evolutionRoutes(ctx));
 app.use('/api', heartbeatRulesRoutes(ctx));
@@ -1456,11 +1479,50 @@ app.post('/api/jobs/:id/retry', authMiddleware, requireRole('admin'), apiLimiter
   res.json({ retried: true, id: req.params.id });
 });
 
+// ─── WARDEN Risk Gate (sandbox + delegation) ─────────────────────
+// Returns:
+//   { ok: true }                        → allowed to proceed
+//   { ok: false, status, body }         → respond immediately with `body`
+async function wardenGate(scope, payload, req) {
+  const report = wardenEvaluate(scope, payload);
+  auditLog(stmts, req.user.username, `warden:${scope}`, scope, { ...report }, req.id);
+
+  if (report.verdict === 'block') {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: 'WARDEN: high-risk action blocked', warden: report },
+    };
+  }
+
+  if (report.verdict === 'approve' && req.body?.warden_approve !== true) {
+    const approvalId = randomUUID();
+    stmts.warden.insert.run(approvalId, scope, 'execute', JSON.stringify(payload), JSON.stringify(report), 'pending', req.user.username);
+    broadcast('warden:approval_required', { approval_id: approvalId, scope, warden: report });
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: 'WARDEN: action requires explicit approval',
+        needs_approval: true,
+        approval_id: approvalId,
+        warden: report,
+      },
+    };
+  }
+
+  return { ok: true };
+}
+
 // ─── Code Execution Sandbox ──────────────────────────────────────
 app.post('/api/sandbox/execute', authMiddleware, requireRole('admin'), sandboxLimiter, validateBody(schemas.sandboxExecute), async (req, res) => {
  try {
   const { code, language = 'javascript' } = req.body;
   auditLog(stmts, req.user.username, 'sandbox:execute', language, { code_length: code.length }, req.id);
+
+  const gate = await wardenGate('sandbox', { code, language }, req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+
   const fs = await import('fs');
   const tmpFile = path.join(os.tmpdir(), `cf_sandbox_${Date.now()}.${language === 'python' ? 'py' : 'mjs'}`);
   await fs.promises.writeFile(tmpFile, code);
@@ -1843,7 +1905,7 @@ function gracefulShutdown(signal) {
 if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.argv[1]}`) {
   server.listen(PORT, '0.0.0.0', () => {
    logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop + job-queue)`);
-   fireHook('onServerStart', { port: PORT, version: pkg?.version || 'unknown' });
+   fireHook('onServerStart', { port: PORT, version: '0.7.1' });
 
    // Start heartbeat daemon
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,

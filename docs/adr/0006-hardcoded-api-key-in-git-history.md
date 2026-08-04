@@ -36,7 +36,7 @@ The key was used as a last-resort fallback — if `gemini_api_key.txt` didn't ex
 
 - [x] Key rotated in Google Cloud Console (user action)
 - [x] `server.ts` deleted from working tree (Phase 1.1)
-- [ ] Consider adding a pre-commit hook for secret scanning (e.g., `gitleaks`)
+- [x] Pre-commit hook added — `.githooks/pre-commit` runs gitleaks on staged files (`npm run hooks:install`); CI (`secret-scan` job) enforces server-side
 
 ## Related
 
