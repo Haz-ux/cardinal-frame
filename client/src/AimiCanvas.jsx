@@ -353,8 +353,51 @@ export default function AimiCanvasCompanion() {
  const [streamBuf, setStreamBuf] = useState('');
  const [expanded, setExpanded] = useState(false);
  const [showQuickActions, setShowQuickActions] = useState(true);
- const chatEndRef = useRef(null);
- const abortRef = useRef(null);
+  const chatEndRef = useRef(null);
+  const abortRef = useRef(null);
+
+  // ─── Draggable position (persisted across reloads) ──────────────
+  const MASCOT_POS_KEY = 'aimi_mascot_pos';
+  const ORB_SIZE = 56;
+  const clampPos = (left, top) => ({
+    left: Math.max(0, Math.min(left, window.innerWidth - ORB_SIZE)),
+    top: Math.max(0, Math.min(top, window.innerHeight - ORB_SIZE)),
+  });
+
+  const [mascotPos, setMascotPos] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(MASCOT_POS_KEY));
+      if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') return saved;
+    } catch {}
+    return { left: window.innerWidth - 20 - ORB_SIZE, top: window.innerHeight - 20 - ORB_SIZE };
+  });
+  const mascotPosRef = useRef(mascotPos);
+  useEffect(() => { mascotPosRef.current = mascotPos; }, [mascotPos]);
+  const dragRef = useRef(null); // { startX, startY, left, top }
+  const movedRef = useRef(false);
+
+  const onDragStart = useCallback((e) => {
+    movedRef.current = false;
+    dragRef.current = { startX: e.clientX, startY: e.clientY, left: mascotPos.left, top: mascotPos.top };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }, [mascotPos]);
+
+  const onDragMove = useCallback((e) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) movedRef.current = true;
+    setMascotPos(clampPos(d.left + dx, d.top + dy));
+  }, []);
+
+  const onDragEnd = useCallback((e) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    try { e.currentTarget.releasePointerCapture?.(e.pointerId); } catch {}
+    try { localStorage.setItem(MASCOT_POS_KEY, JSON.stringify(mascotPosRef.current)); } catch {}
+  }, []);
+
 
  const stage = getStage(xp);
 
@@ -438,38 +481,50 @@ export default function AimiCanvasCompanion() {
  const lastMsg = messages[messages.length - 1]?.text || '';
  const currentExpr = getExpression(lastMsg, streaming);
 
- // ── Closed: floating orb ──
- if (!open) {
+  // ── Closed: floating orb ──
+  if (!open) {
+   return (
+    <button
+     onClick={() => { if (movedRef.current) { movedRef.current = false; return; } setOpen(true); }}
+     onPointerDown={onDragStart}
+     onPointerMove={onDragMove}
+     onPointerUp={onDragEnd}
+     onPointerCancel={onDragEnd}
+     className="fixed z-50 w-14 h-14 rounded-full group aimi-float flex items-center justify-center"
+     style={{ left: mascotPos.left, top: mascotPos.top, background: `linear-gradient(135deg, ${AIMI.shell}, ${AIMI.core})`, boxShadow: `0 0 20px ${AIMI.core}44, 0 0 40px ${AIMI.shell}22`, touchAction: 'none', cursor: 'move' }}
+     title="Open Aimi"
+    >
+     <AimiCanvas expression={currentExpr} stage={stage.level} streaming={streaming} size={56} />
+     <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 56 56">
+      <circle cx="28" cy="28" r="26" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="2" />
+      <circle cx="28" cy="28" r="26" fill="none" stroke={stage.color} strokeWidth="2"
+       strokeDasharray={`${(xp % 100) * 1.63} 163`} strokeLinecap="round" />
+     </svg>
+     {messages.length > 1 && (
+      <div style={{ position: 'absolute', top: 2, right: 2, width: 8, height: 8, borderRadius: '50%', background: AIMI.alert, boxShadow: `0 0 6px ${AIMI.alert}` }} />
+     )}
+    </button>
+   );
+  }
+
+  // ── Open: chat panel ──
+  const panelWidth = expanded ? 420 : 340;
+  const panelHeight = expanded ? 540 : 420;
+  const panelLeft = Math.max(0, Math.min(mascotPos.left, window.innerWidth - panelWidth));
+  const panelTop = Math.max(0, Math.min(mascotPos.top, window.innerHeight - panelHeight));
+
   return (
-   <button
-    onClick={() => setOpen(true)}
-    className="fixed bottom-5 right-5 z-50 w-14 h-14 rounded-full group aimi-float flex items-center justify-center"
-    style={{ background: `linear-gradient(135deg, ${AIMI.shell}, ${AIMI.core})`, boxShadow: `0 0 20px ${AIMI.core}44, 0 0 40px ${AIMI.shell}22` }}
-    title="Open Aimi"
-   >
-    <AimiCanvas expression={currentExpr} stage={stage.level} streaming={streaming} size={56} />
-    <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 56 56">
-     <circle cx="28" cy="28" r="26" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="2" />
-     <circle cx="28" cy="28" r="26" fill="none" stroke={stage.color} strokeWidth="2"
-      strokeDasharray={`${(xp % 100) * 1.63} 163`} strokeLinecap="round" />
-    </svg>
-    {messages.length > 1 && (
-     <div style={{ position: 'absolute', top: 2, right: 2, width: 8, height: 8, borderRadius: '50%', background: AIMI.alert, boxShadow: `0 0 6px ${AIMI.alert}` }} />
-    )}
-   </button>
-  );
- }
+   <div className="fixed z-50 rounded-xl overflow-hidden flex flex-col"
+    style={{ left: panelLeft, top: panelTop, background: `linear-gradient(180deg, ${AIMI.dark}, ${AIMI.mid})`, border: `1px solid ${AIMI.core}30`, boxShadow: `0 0 30px ${AIMI.core}22, 0 4px 20px rgba(0,0,0,0.5)`, width: panelWidth, height: panelHeight, transition: 'width 0.2s, height 0.2s' }}>
 
- // ── Open: chat panel ──
- const panelWidth = expanded ? 420 : 340;
- const panelHeight = expanded ? 540 : 420;
-
- return (
-  <div className="fixed bottom-5 right-5 z-50 rounded-xl overflow-hidden flex flex-col"
-   style={{ background: `linear-gradient(180deg, ${AIMI.dark}, ${AIMI.mid})`, border: `1px solid ${AIMI.core}30`, boxShadow: `0 0 30px ${AIMI.core}22, 0 4px 20px rgba(0,0,0,0.5)`, width: panelWidth, height: panelHeight, transition: 'width 0.2s, height 0.2s' }}>
-
-   {/* Header */}
-   <div className="flex items-center gap-2 px-3 py-2" style={{ background: `linear-gradient(90deg, ${AIMI.shell}33, transparent)`, borderBottom: `1px solid ${AIMI.core}20` }}>
+   {/* Header — draggable (except over its buttons) */}
+   <div
+    onPointerDown={e => { if (!e.target.closest('button, input, select, textarea')) onDragStart(e); }}
+    onPointerMove={onDragMove}
+    onPointerUp={onDragEnd}
+    onPointerCancel={onDragEnd}
+    className="flex items-center gap-2 px-3 py-2 select-none"
+    style={{ background: `linear-gradient(90deg, ${AIMI.shell}33, transparent)`, borderBottom: `1px solid ${AIMI.core}20`, touchAction: 'none', cursor: 'move' }}>
     <div className="w-10 h-10 shrink-0">
      <AimiCanvas expression={currentExpr} stage={stage.level} streaming={streaming} size={40} />
     </div>

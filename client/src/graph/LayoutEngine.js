@@ -41,6 +41,18 @@ export class LayoutEngine {
     this._metrics = null;
     this._initialLayoutDone = false;
     this._tickAccum = 0;
+
+    // Restore a previously persisted layout (see getSnapshot). When the graph
+    // structure is unchanged, the restored positions are used as-is instead of
+    // re-running the world simulation — which is what caused clusters to
+    // reshuffle every time the page was reopened.
+    const snapshot = opts.snapshot || null;
+    this._snapshotClusters = null;
+    if (snapshot && typeof snapshot === 'object') {
+      this.cache.restore(snapshot);
+      this._snapshotClusters = snapshot.clusters || null;
+      this._initialLayoutDone = true;
+    }
   }
 
   /**
@@ -68,31 +80,47 @@ export class LayoutEngine {
     // 3. Assign sectors (or reuse if same cluster set)
     this.sectors = assignSectors(clusterOrder);
 
-    // 4. World sim: run on first load, when cluster set or radii change, or when
-    //    new nodes appear. We track the previous plan's cluster radii to detect
-    //    growth that would cause overlapping hub positions.
-    const prevRadii = this._prevRadii || new Map();
-    let radiiChanged = false;
-    for (const [cid, plan] of this.plan.clusters) {
-      const prevR = prevRadii.get(cid);
-      const currR = Math.max(180, plan.radius);
-      if (prevR !== undefined && Math.abs(prevR - currR) > 20) {
-        radiiChanged = true;
-        break;
-      }
-      if (prevR === undefined) radiiChanged = true;
-    }
-    this._prevRadii = new Map();
-    for (const [cid, plan] of this.plan.clusters) {
-      this._prevRadii.set(cid, Math.max(180, plan.radius));
-    }
+    // 4. Stable-reload fast path: if this engine was restored from a snapshot
+    //    AND the graph structure is unchanged, keep the saved positions and
+    //    rebuild per-cluster state around them. This prevents clusters from
+    //    reshuffling when the page is reopened.
+    const stableRestore = this._snapshotClusters !== null &&
+      !diff.linksChanged &&
+      diff.newNodes.length === 0 &&
+      diff.removedNodes.length === 0 &&
+      this._layoutMatchesSnapshot();
 
-    if (!this._initialLayoutDone || diff.linksChanged ||
-        diff.newNodes.length > 0 || radiiChanged) {
-      simulateClusters(this.plan.clusters, clusterOrder, this.plan.bridgeLinks);
-      this._initialLayoutDone = true;
+    if (stableRestore) {
+      // Rebuild clusterOf from the (now populated) link set, then let the
+      // per-cluster sim creation below reuse the saved hub fx/fy anchors.
+      this.cache.refreshClusterOf();
     } else {
-      relocateHubs(this.plan.clusters, clusterOrder, this.sectors);
+      // World sim: run on first load, when cluster set or radii change, or when
+      // new nodes appear. We track the previous plan's cluster radii to detect
+      // growth that would cause overlapping hub positions.
+      const prevRadii = this._prevRadii || new Map();
+      let radiiChanged = false;
+      for (const [cid, plan] of this.plan.clusters) {
+        const prevR = prevRadii.get(cid);
+        const currR = Math.max(180, plan.radius);
+        if (prevR !== undefined && Math.abs(prevR - currR) > 20) {
+          radiiChanged = true;
+          break;
+        }
+        if (prevR === undefined) radiiChanged = true;
+      }
+      this._prevRadii = new Map();
+      for (const [cid, plan] of this.plan.clusters) {
+        this._prevRadii.set(cid, Math.max(180, plan.radius));
+      }
+
+      if (!this._initialLayoutDone || diff.linksChanged ||
+          diff.newNodes.length > 0 || radiiChanged) {
+        simulateClusters(this.plan.clusters, clusterOrder, this.plan.bridgeLinks);
+        this._initialLayoutDone = true;
+      } else {
+        relocateHubs(this.plan.clusters, clusterOrder, this.sectors);
+      }
     }
 
     // 5. Categorize links
@@ -289,6 +317,41 @@ export class LayoutEngine {
   }
 
   /**
+   * Capture the current layout as a compact snapshot for persistence.
+   * Includes per-node positions/velocities/fixed anchors, the link signature
+   * (detects structural changes), and the cluster membership per node.
+   * Pass the result back into the constructor as `{ snapshot }` on reload.
+   */
+  getSnapshot() {
+    const nodes = {};
+    for (const node of this.cache.allNodes()) {
+      const entry = {
+        x: node.x,
+        y: node.y,
+        vx: node.vx || 0,
+        vy: node.vy || 0,
+      };
+      if (typeof node.fx === 'number') {
+        entry.fx = node.fx;
+        entry.fy = typeof node.fy === 'number' ? node.fy : node.y;
+      }
+      nodes[node.id] = entry;
+    }
+
+    const clusters = {};
+    for (const node of this.cache.allNodes()) {
+      const cid = this.cache.getCluster(node.id);
+      (clusters[cid] = clusters[cid] || []).push(node.id);
+    }
+
+    return {
+      linkSignature: this.cache.linkSignature,
+      nodes,
+      clusters,
+    };
+  }
+
+  /**
    * Get the current metrics.
    */
   getMetrics() {
@@ -394,6 +457,28 @@ export class LayoutEngine {
   }
 
   // ─── Internal ──────────────────────────────────────────────────
+
+  /**
+   * Compare the current cluster plan's membership against the snapshot that
+   * seeded this engine. Returns true only when every cluster has the exact
+   * same node set, so restored positions are safe to reuse.
+   */
+  _layoutMatchesSnapshot() {
+    if (!this._snapshotClusters || !this.plan) return false;
+    const saved = this._snapshotClusters;
+    const plan = this.plan;
+
+    if (Object.keys(saved).length !== plan.clusters.size) return false;
+
+    for (const [cid, savedIds] of Object.entries(saved)) {
+      const planNodes = plan.clusters.get(cid)?.nodes;
+      if (!planNodes || planNodes.length !== savedIds.length) return false;
+      for (const node of planNodes) {
+        if (!savedIds.includes(node.id)) return false;
+      }
+    }
+    return true;
+  }
 
   _notifyTick() {
     const positions = this.getPositions();

@@ -92,7 +92,9 @@ export class PositionCache {
     const newSig = this._linkSignature(fresh.links);
     const linksChanged = newSig !== this.linkSignature;
 
-    if (linksChanged) {
+    // Adopt fresh links when they changed, OR when the cache was restored from a
+    // snapshot (where this.links starts empty but the signature already matches).
+    if (linksChanged || this.links.length === 0) {
       this.links = fresh.links;
       this.linkSignature = newSig;
 
@@ -155,5 +157,44 @@ export class PositionCache {
     this.links = [];
     this.linkSignature = '';
     this.clusterOf.clear();
+  }
+
+  /**
+   * Restore the cache from a previously saved snapshot (see LayoutEngine.getSnapshot).
+   * Seeds saved node positions so a reopened page keeps its last layout instead of
+   * re-running a full world simulation that reshuffles clusters.
+   *
+   * @param {{ linkSignature?: string, nodes?: Object }} snapshot
+   */
+  restore(snapshot = {}) {
+    this.nodes.clear();
+    this.links = [];
+    this.linkSignature = snapshot.linkSignature || '';
+    this.clusterOf.clear();
+
+    const nodes = snapshot.nodes || {};
+    for (const [id, pos] of Object.entries(nodes)) {
+      if (!pos || typeof pos.x !== 'number' || !Number.isFinite(pos.x)) continue;
+      if (typeof pos.y !== 'number' || !Number.isFinite(pos.y)) continue;
+      const entry = { id, x: pos.x, y: pos.y, vx: pos.vx || 0, vy: pos.vy || 0 };
+      if (typeof pos.fx === 'number') {
+        entry.fx = pos.fx;
+        entry.fy = typeof pos.fy === 'number' ? pos.fy : pos.y;
+      }
+      this.nodes.set(id, entry);
+    }
+  }
+
+  /**
+   * Rebuild the clusterOf map from the current links (used after restore when
+   * link signature matches so merge() won't recompute it).
+   */
+  refreshClusterOf() {
+    this.clusterOf.clear();
+    const adj = buildAdjacency(this.links);
+    for (const node of this.nodes.values()) {
+      const cid = getClusterId(node, adj);
+      this.clusterOf.set(node.id, cid || 'unclustered');
+    }
   }
 }

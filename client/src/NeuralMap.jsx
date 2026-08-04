@@ -4,7 +4,7 @@ import { cachedFetch } from './dataCache';
 import { useWebSocket } from './useWebSocket';
 import { ActivityFeed, useActivityFeed, useActivityPulses } from './ActivityOverlay';
 import { usePolling } from './usePolling';
-import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity } from 'lucide-react';
+import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity, RotateCcw } from 'lucide-react';
 import { LayoutEngine } from './graph/LayoutEngine.js';
 import {
   NEON, BG, GROUP_STYLE, LINK_COLORS, STATUS_COLORS,
@@ -311,17 +311,27 @@ export default function NeuralMap() {
  // The engine runs its own internal RAF loop and manages ALL layout:
  // cluster hub positions, per-cluster node simulations, collisions.
  // NeuralMap just reads positions from it and renders.
- const engineRef = useRef(null);
- const [, setTick] = useState(0);  // force re-render when engine ticks
- const tickRef = useRef(0);
+  const engineRef = useRef(null);
+  const [, setTick] = useState(0);  // force re-render when engine ticks
+  const tickRef = useRef(0);
+  const lastSaveRef = useRef(0);
 
- if (!engineRef.current) {
-   engineRef.current = new LayoutEngine();
-   engineRef.current.onTick = () => {
-     tickRef.current++;
-     setTick(tickRef.current);
-   };
- }
+  if (!engineRef.current) {
+    // Restore the last persisted layout (if the graph structure is unchanged)
+    // so clusters don't reshuffle when the page is reopened.
+    let snapshot = null;
+    try { snapshot = JSON.parse(localStorage.getItem('neural_map_layout')); } catch {}
+    engineRef.current = new LayoutEngine({ snapshot });
+    engineRef.current.onTick = () => {
+      tickRef.current++;
+      setTick(tickRef.current);
+      // Throttled snapshot persistence (~every 2s) while the map is alive.
+      if (Date.now() - (lastSaveRef.current || 0) > 2000) {
+        lastSaveRef.current = Date.now();
+        try { localStorage.setItem('neural_map_layout', JSON.stringify(engineRef.current.getSnapshot())); } catch {}
+      }
+    };
+  }
 
  // Responsive canvas
  useEffect(() => {
@@ -840,9 +850,26 @@ useEffect(() => {
    engineRef.current?.unpin(node.id);
  }, []);
 
- const unpinAll = useCallback(() => {
-    engineRef.current?.unpinAll();
- }, []);
+  const unpinAll = useCallback(() => {
+     engineRef.current?.unpinAll();
+  }, []);
+
+  // Reset Layout — wipe the persisted snapshot, rebuild the engine from scratch,
+  // and force a full world re-layout (clusters get re-seeded at fresh sectors).
+  const resetLayout = useCallback(() => {
+    try { localStorage.removeItem('neural_map_layout'); } catch {}
+    engineRef.current?.destroy();
+    engineRef.current = new LayoutEngine();
+    engineRef.current.onTick = () => {
+      tickRef.current++;
+      setTick(tickRef.current);
+      if (Date.now() - (lastSaveRef.current || 0) > 2000) {
+        lastSaveRef.current = Date.now();
+        try { localStorage.setItem('neural_map_layout', JSON.stringify(engineRef.current.getSnapshot())); } catch {}
+      }
+    };
+    load();
+  }, [load]);
  const toggleGroup = (g) => {
   setActiveGroups(prev => {
    const next = new Set(prev);
@@ -907,10 +934,14 @@ useEffect(() => {
       {pinMode ? <Pin size={12} /> : <PinOff size={12} />}
       {pinMode ? 'Pin On' : 'Pin Off'}
      </button>
-     <button onClick={unpinAll} className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-all"
-      title="Release all pinned nodes">
-      <Unlock size={12} /> Release
-     </button>
+      <button onClick={unpinAll} className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs text-gray-500 hover:text-cyan-400 hover:bg-white/5 transition-all"
+       title="Release all pinned nodes">
+       <Unlock size={12} /> Release
+      </button>
+      <button onClick={resetLayout} className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs text-gray-500 hover:text-orange-400 hover:bg-white/5 transition-all"
+       title="Reset layout — re-layout clusters from scratch">
+       <RotateCcw size={12} /> Reset Layout
+      </button>
      <div className="w-px h-4 bg-gray-800" />
      <div className="relative">
       <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
