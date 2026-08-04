@@ -29,6 +29,15 @@ vi.mock('../src/server/safe-fetch.mjs', () => ({
       });
     }
     if (u.endsWith('index.mjs')) {
+      if (name.includes('elevated')) {
+        return mockResponse("const { exec } = require('child_process'); eval(x); process.env.SECRET;");
+      }
+      if (name.includes('blocked')) {
+        return mockResponse("require('child_process'); eval(x); fetch('http://x'); require('fs').writeFileSync('/tmp/x','y'); process.env.SECRET;");
+      }
+      if (name.includes('caution')) {
+        return mockResponse("require('fs'); fetch('http://x');");
+      }
       return mockResponse('export function onTaskCompleted(data){ console.log("test"); }');
     }
     if (u.endsWith('plugins-index.json')) {
@@ -53,8 +62,10 @@ beforeAll(async () => {
 afterAll(async () => {
   // Clean up anything the marketplace test installed on disk
   try { rmSync(join('/home/cardinal-frame', 'plugins', TEST_PLUGIN), { recursive: true, force: true }); } catch {}
+  try { rmSync(join('/home/cardinal-frame', 'plugins', 'caution-plugin'), { recursive: true, force: true }); } catch {}
   try {
     db.prepare('DELETE FROM plugins WHERE name = ?').run(TEST_PLUGIN);
+    db.prepare('DELETE FROM plugins WHERE name = ?').run('caution-plugin');
   } catch {}
   cleanupTestServer();
 });
@@ -162,6 +173,45 @@ describe('Plugin Marketplace API', () => {
         .set(adminAuth())
         .send({ url: `https://registry.example.com/plugins/${TEST_PLUGIN}` });
       expect(res.status).toBe(409);
+    });
+  });
+
+  describe('POST /api/plugins/market/install-url — WARDEN gate', () => {
+    it('holds an elevated-risk plugin for approval (403 needs_approval)', async () => {
+      const res = await request(app)
+        .post('/api/plugins/market/install-url')
+        .set(adminAuth())
+        .send({ url: 'https://registry.example.com/plugins/elevated-plugin' });
+      expect(res.status).toBe(403);
+      expect(res.body.needs_approval).toBe(true);
+      expect(res.body.approval_id).toBeDefined();
+      expect(res.body.risk.verdict).toBe('elevated');
+      expect(res.body.warden.verdict).toBe('approve');
+
+      const list = await request(app).get('/api/warden/approvals?status=pending').set(adminAuth());
+      expect(list.body.some(a => a.id === res.body.approval_id && a.scope === 'plugin_install')).toBe(true);
+    });
+
+    it('blocks a high-risk plugin outright', async () => {
+      const res = await request(app)
+        .post('/api/plugins/market/install-url')
+        .set(adminAuth())
+        .send({ url: 'https://registry.example.com/plugins/blocked-plugin' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('WARDEN: high-risk action blocked');
+      expect(res.body.warden.verdict).toBe('block');
+      expect(res.body.risk.verdict).toBe('elevated');
+    });
+
+    it('installs a caution-risk plugin with risk surfaced in the response', async () => {
+      const res = await request(app)
+        .post('/api/plugins/market/install-url')
+        .set(adminAuth())
+        .send({ url: 'https://registry.example.com/plugins/caution-plugin' });
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty('id');
+      expect(res.body.risk).toBeDefined();
+      expect(res.body.risk.verdict).toBe('caution');
     });
   });
 

@@ -318,9 +318,9 @@ async function generateAutoReply(text, channel) {
   
   // Try LLM if available
   try {
-    const defaultModel = stmts.llmModels.getDefault.get();
+    const defaultModel = stmts.models.getDefault.get();
     if (defaultModel) {
-      const provider = stmts.llmProviders.getById.get(defaultModel.provider_id);
+      const provider = stmts.providers.getById.get(defaultModel.provider_id);
       if (provider) {
         const response = await callAgentLLM([
           { role: 'system', content: "You are Cardinal Frame's comms assistant. Reply concisely." },

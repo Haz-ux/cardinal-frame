@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import os from 'os';
 import { createServer } from 'http';
+import { createRequire } from 'module';
 import { validateBody, schemas } from './validate.mjs';
 import * as mcp from './mcp-client.mjs';
 import * as embeddings from './embeddings.mjs';
@@ -65,9 +66,12 @@ import { runMigrations } from './migrator.mjs';
 
 dotenv.config();
 
+const require = createRequire(import.meta.url);
+const APP_VERSION = require('../../package.json').version;
+
 const app = express();
 app.set('etag', false); // Disable ETags — prevents 304 stale cache on auth routes
-let PORT = process.env.PORT || 8080; // may be overridden by dev_settings below
+let PORT = process.env.PORT || 8080; // fixed unless PORT env var is set
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(import.meta.dirname, '..', '..', 'data'));
 const JWT_SECRET = process.env.JWT_SECRET || 'cardinal-frame-dev-secret-change-me';
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'cardinal-frame-dev-secret-change-me') {
@@ -159,15 +163,8 @@ db.pragma('foreign_keys = ON');
 // ─── Run migrations (version-tracked SQL files) ────────────────────
 runMigrations(db);
 
-// ─── Override PORT from saved dev_settings (persists across boots) ─
-// ENV PORT takes highest priority (Docker/CI), then saved dev setting, then default 8080
-try {
-  const savedPort = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get('port');
-  if (savedPort && !process.env.PORT) {
-    const p = parseInt(savedPort.value, 10);
-    if (p >= 1 && p <= 65535) PORT = p;
-  }
-} catch {} // table might not exist on first boot before schema runs
+// Port is fixed to process.env.PORT || 8080. The saved dev_settings 'port'
+// override was removed — use the PORT env var to change it.
 
 // Schema with task_logs, task_assignments, and RBAC
 const adminHash = bcrypt.hashSync('admin123', 10);
@@ -1391,6 +1388,7 @@ const ctx = {
   get deviceStateCache() { return deviceStateCache; },
   get executeTask() { return executeTask; },
   get sanitizeCommand() { return sanitizeCommand; },
+  get wardenGate() { return wardenGate; },
   get callAgentLLM() { return callAgentLLM; },
   get runAgentLoop() { return runAgentLoop; },
   get nodeRegistry() { return nodeRegistry; },
@@ -1905,7 +1903,7 @@ function gracefulShutdown(signal) {
 if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.argv[1]}`) {
   server.listen(PORT, '0.0.0.0', () => {
    logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop + job-queue)`);
-   fireHook('onServerStart', { port: PORT, version: '0.7.1' });
+   fireHook('onServerStart', { port: PORT, version: APP_VERSION });
 
    // Start heartbeat daemon
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,

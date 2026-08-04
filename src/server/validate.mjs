@@ -177,6 +177,7 @@ export const schemas = {
   sandboxExecute: z.object({
     code: z.string().min(1).max(10000),
     language: z.enum(['javascript', 'python']).optional(),
+    warden_approve: z.boolean().optional(),
   }),
 
   // UUID param

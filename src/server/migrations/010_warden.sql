@@ -1,6 +1,7 @@
 -- 010_warden.sql
 -- WARDEN risk-gate approval queue. Medium-risk actions (sandbox code,
--- delegation commands) require an explicit approval before execution.
+-- delegation commands, plugin installs) require an explicit approval
+-- before execution.
 
 CREATE TABLE IF NOT EXISTS warden_approvals (
   id TEXT PRIMARY KEY,

@@ -8,6 +8,30 @@ const STATUS_STYLES = {
  inactive: { color: '#666', bg: 'rgba(0,0,0,0.3)', border: '#333' },
  error: { color: NEON.red, bg: `${NEON.red}15`, border: `${NEON.red}30` },
 };
+const RISK_STYLES = {
+ safe: { color: NEON.green, label: 'safe' },
+ caution: { color: NEON.yellow, label: 'caution' },
+ elevated: { color: NEON.red, label: 'elevated' },
+};
+function RiskBadge({ verdict }) {
+ const s = RISK_STYLES[verdict] || RISK_STYLES.safe;
+ return (
+  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: `${s.color}15`, color: s.color, border: `1px solid ${s.color}30` }}>
+   risk: {s.label}
+  </span>
+ );
+}
+// Like api() but keeps the response body on non-2xx so install handlers can
+// read needs_approval / approval_id / risk from WARDEN-held installs.
+const marketFetch = async (path, opts = {}) => {
+ const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+ const token = localStorage.getItem('cf_token');
+ if (token) headers['Authorization'] = `Bearer ${token}`;
+ const res = await fetch(path, { ...opts, headers, cache: 'no-store' });
+ const body = await res.json().catch(() => ({}));
+ if (!res.ok) throw Object.assign(new Error(body.error || `Request failed: ${res.status}`), body);
+ return body;
+};
 function InstallModal({ onClose, onInstalled }) {
  const [name, setName] = useState('');
  const [version, setVersion] = useState('1.0.0');
@@ -109,52 +133,77 @@ function Marketplace({ onInstalled }) {
  const [directLoading, setDirectLoading] = useState(false);
  const [directError, setDirectError] = useState('');
  const [showAdd, setShowAdd] = useState(false);
+ const [notice, setNotice] = useState(null);
  const loadSources = () => api('/api/plugins/market/sources').then(setSources).catch(() => {});
  useEffect(() => { loadSources(); }, []);
  const runSearch = async (q) => {
-   setSearching(true); setSearched(true);
-   try {
-     const data = await api(`/api/plugins/market/search?q=${encodeURIComponent(q)}`);
-     setResults(data.results || []);
-   } catch { setResults([]); }
-   setSearching(false);
+  setSearching(true); setSearched(true);
+  try {
+   const data = await api(`/api/plugins/market/search?q=${encodeURIComponent(q)}`);
+   setResults(data.results || []);
+  } catch { setResults([]); }
+  setSearching(false);
  };
  const rescan = async (id) => {
-   try { await api(`/api/plugins/market/sources/${id}/scan`, { method: 'POST' }); loadSources(); } catch (e) { console.error(e); }
+  try { await api(`/api/plugins/market/sources/${id}/scan`, { method: 'POST' }); loadSources(); } catch (e) { console.error(e); }
  };
  const removeSource = async (id) => { await api(`/api/plugins/market/sources/${id}`, { method: 'DELETE' }); loadSources(); };
  const install = async (sourceId, name) => {
-   setInstalling(name);
-   try {
-     await api('/api/plugins/market/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_id: sourceId, plugin_name: name }) });
-     onInstalled();
-   } catch (e) { console.error('Install failed:', e); }
-   setInstalling(null);
+  setInstalling(name);
+  setNotice(null);
+  try {
+   const res = await marketFetch('/api/plugins/market/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_id: sourceId, plugin_name: name }) });
+   setNotice({ kind: 'installed', risk: res.risk });
+   onInstalled();
+  } catch (e) {
+   if (e.needs_approval) setNotice({ kind: 'held', risk: e.risk, approvalId: e.approval_id });
+   else setNotice({ kind: 'error', message: e.message });
+  }
+  setInstalling(null);
  };
  const installDirect = async (e) => {
-   e.preventDefault();
-   if (!directUrl.trim()) return;
-   setDirectLoading(true); setDirectError('');
-   try {
-     await api('/api/plugins/market/install-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: directUrl }) });
-     setDirectUrl('');
-     onInstalled();
-   } catch (err) { setDirectError(err.message || String(err)); }
-   setDirectLoading(false);
+  e.preventDefault();
+  if (!directUrl.trim()) return;
+  setDirectLoading(true); setDirectError(''); setNotice(null);
+  try {
+   const res = await marketFetch('/api/plugins/market/install-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: directUrl }) });
+   setDirectUrl('');
+   setNotice({ kind: 'installed', risk: res.risk });
+   onInstalled();
+  } catch (err) {
+   if (err.needs_approval) setNotice({ kind: 'held', risk: err.risk, approvalId: err.approval_id });
+   else setDirectError(err.message || String(err));
+  }
+  setDirectLoading(false);
  };
  return (
    <div className="space-y-4">
      {showAdd && <AddSourceModal onClose={() => setShowAdd(false)} onAdded={loadSources} />}
-     <div className="flex items-center justify-between flex-wrap gap-3">
-       <div className="flex items-center gap-2">
-         <Store size={16} style={{ color: NEON.cyan }} />
-         <h3 className="text-sm font-bold" style={{ color: NEON.cyan }}>Market Sources</h3>
-       </div>
-       <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
-         style={{ background: `${NEON.cyan}15`, border: `1px solid ${NEON.cyan}30`, color: NEON.cyan }}>
-         <Plus size={14} /> Add Source
-       </button>
-     </div>
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          <Store size={16} style={{ color: NEON.cyan }} />
+          <h3 className="text-sm font-bold" style={{ color: NEON.cyan }}>Market Sources</h3>
+        </div>
+        <button onClick={() => setShowAdd(true)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
+          style={{ background: `${NEON.cyan}15`, border: `1px solid ${NEON.cyan}30`, color: NEON.cyan }}>
+          <Plus size={14} /> Add Source
+        </button>
+      </div>
+      {notice && (
+         <div className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-lg text-xs" style={{
+           background: 'rgba(0,0,0,0.35)',
+           border: `1px solid ${notice.kind === 'error' ? `${NEON.red}30` : notice.kind === 'held' ? `${NEON.yellow}30` : `${NEON.green}30`}`,
+         }}>
+           {notice.kind === 'error' && <span style={{ color: NEON.red }}>{notice.message}</span>}
+           {notice.kind === 'held' && (
+             <span style={{ color: NEON.yellow }}>
+               Install held — WARDEN approval required{notice.approvalId ? ` (#${notice.approvalId.slice(0, 8)})` : ''}. Resubmit with approval to continue.
+             </span>
+           )}
+           {notice.kind === 'installed' && <span style={{ color: NEON.green }}>Installed.</span>}
+           {notice.risk && notice.kind !== 'error' && <RiskBadge verdict={notice.risk.verdict} />}
+         </div>
+      )}
      {/* Sources list */}
      <div className="rounded-xl overflow-hidden" style={{ background: 'rgba(10,10,20,0.9)', border: '1px solid rgba(0,240,255,0.1)' }}>
        {sources.length === 0 ? (

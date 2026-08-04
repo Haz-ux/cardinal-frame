@@ -24,15 +24,20 @@ export function initOllama(db, stmts, logger) {
       if (status.models?.length) {
         const provider = db.prepare("SELECT id FROM llm_providers WHERE type = 'ollama'").get();
         if (provider) {
+          let added = 0;
           for (const modelName of status.models) {
-            const existingModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(provider.id, modelName);
-            if (!existingModel) {
-              const mid = randomUUID();
-              db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name, enabled) VALUES (?, ?, ?, ?, ?)')
-                .run(mid, provider.id, modelName, modelName.replace(':latest', ''), 1);
+            try {
+              const existingModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(provider.id, modelName);
+              if (existingModel) continue;
+              const mid = `${provider.id}:${modelName}`;
+              db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name) VALUES (?, ?, ?, ?)')
+                .run(mid, provider.id, modelName, modelName.replace(':latest', ''));
+              added++;
+            } catch (e) {
+              logger.warn(`🦙 Failed to register model "${modelName}": ${e.message}`);
             }
           }
-          logger.info(`🦙 Auto-detected ${status.models.length} Ollama models`);
+          logger.info(`🦙 Auto-detected ${added} Ollama models (${status.models.length} available)`);
         }
       }
     } else {
@@ -42,7 +47,7 @@ export function initOllama(db, stmts, logger) {
 }
 
 export default function llmRoutes(ctx) {
-  const { db, stmts, authMiddleware, optionalAuth, requireRole, apiLimiter, audit, logger, PORT } = ctx;
+  const { db, stmts, authMiddleware, optionalAuth, requireRole, apiLimiter, audit, broadcast, logger, PORT } = ctx;
   const router = express.Router();
 
   // ─── Ollama Status & Detection ─────────────────────────────
@@ -70,9 +75,9 @@ export default function llmRoutes(ctx) {
       for (const modelName of (status.models || [])) {
         const existingModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(provider.id, modelName);
         if (!existingModel) {
-          const mid = randomUUID();
-          db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name, enabled) VALUES (?, ?, ?, ?, ?)')
-            .run(mid, provider.id, modelName, modelName.replace(':latest', ''), 1);
+          const mid = `${provider.id}:${modelName}`;
+          db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name) VALUES (?, ?, ?, ?)')
+            .run(mid, provider.id, modelName, modelName.replace(':latest', ''));
           added++;
         }
       }
@@ -177,54 +182,52 @@ export default function llmRoutes(ctx) {
     }
   });
 
-  // ─── Auto-detect models from a provider ──────────────────────
-  router.post('/llm/providers/:id/detect', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
-    const provider = stmts.providers.getById.get(req.params.id);
-    if (!provider) return res.status(404).json({ error: 'Provider not found' });
+  // ─── Shared model detection ───────────────────────────────────
+  // Fetches the model list for any provider (OpenAI-compatible /models,
+  // Ollama /api/tags, or the known Anthropic catalog) and upserts each
+  // model into llm_models, keyed by `${provider.id}:${model.id}`.
+  async function detectModelsFromProvider(provider) {
     const isOllama = provider.type === 'ollama';
-    if (!provider.api_key && !isOllama) return res.status(400).json({ error: 'No API key configured for this provider' });
-
-    const baseUrl = provider.base_url || PROVIDER_TYPES[provider.type]?.baseUrl || '';
-    const modelsUrl = provider.base_url
-      ? `${provider.base_url}${PROVIDER_TYPES[provider.type]?.modelsUrl || '/models'}`
-      : `${baseUrl}${PROVIDER_TYPES[provider.type]?.modelsUrl || '/models'}`;
+    const providerInfo = PROVIDER_TYPES[provider.type];
+    const baseUrl = provider.base_url || providerInfo?.baseUrl || '';
+    const modelsUrl = isOllama
+      ? `${baseUrl}/api/tags`
+      : `${baseUrl}${providerInfo?.modelsUrl || '/models'}`;
 
     let detected = [];
-    try {
-      if (provider.type === 'anthropic') {
-        const anthropicModels = [
-          { id: 'claude-sonnet-4-20250514', display_name: 'Claude Sonnet 4', context_window: 200000 },
-          { id: 'claude-opus-4-20250514', display_name: 'Claude Opus 4', context_window: 200000 },
-          { id: 'claude-3.7-sonnet-20250219', display_name: 'Claude 3.7 Sonnet', context_window: 200000 },
-          { id: 'claude-3.5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet (v2)', context_window: 200000 },
-          { id: 'claude-3.5-haiku-20241022', display_name: 'Claude 3.5 Haiku', context_window: 200000 },
-          { id: 'claude-3-opus-20240229', display_name: 'Claude 3 Opus', context_window: 200000 },
-          { id: 'claude-3-sonnet-20240229', display_name: 'Claude 3 Sonnet', context_window: 200000 },
-          { id: 'claude-3-haiku-20240307', display_name: 'Claude 3 Haiku', context_window: 200000 },
-        ];
-        detected = anthropicModels;
+    if (provider.type === 'anthropic') {
+      detected = [
+        { id: 'claude-sonnet-4-20250514', display_name: 'Claude Sonnet 4', context_window: 200000 },
+        { id: 'claude-opus-4-20250514', display_name: 'Claude Opus 4', context_window: 200000 },
+        { id: 'claude-3.7-sonnet-20250219', display_name: 'Claude 3.7 Sonnet', context_window: 200000 },
+        { id: 'claude-3.5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet (v2)', context_window: 200000 },
+        { id: 'claude-3.5-haiku-20241022', display_name: 'Claude 3.5 Haiku', context_window: 200000 },
+        { id: 'claude-3-opus-20240229', display_name: 'Claude 3 Opus', context_window: 200000 },
+        { id: 'claude-3-sonnet-20240229', display_name: 'Claude 3 Sonnet', context_window: 200000 },
+        { id: 'claude-3-haiku-20240307', display_name: 'Claude 3 Haiku', context_window: 200000 },
+      ];
+    } else {
+      const { headers, url } = buildProviderAuth(provider, modelsUrl);
+      const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`Provider API returned ${resp.status}: ${text.slice(0, 200)}`);
+      }
+      const data = await resp.json();
+
+      let rawModels;
+      if (isOllama) {
+        rawModels = (data.models || []).map(m => ({ id: m.name || m.model, display_name: (m.name || m.model).replace(':latest', ''), context_window: m.details?.parameter_size || null, capabilities: JSON.stringify(m.details || {}) }));
       } else {
-        const { headers: fetchHeaders, url: fetchUrl } = buildProviderAuth(provider, modelsUrl);
-        const resp = await fetch(fetchUrl, {
-          headers: fetchHeaders,
-          signal: AbortSignal.timeout(15000),
-        });
-        if (!resp.ok) {
-          const text = await resp.text().catch(() => '');
-          return res.status(502).json({ error: `Provider API returned ${resp.status}: ${text.slice(0, 200)}` });
-        }
-        const data = await resp.json();
+        rawModels = data.data || data.models || data;
+      }
 
-        let rawModels;
+      if (Array.isArray(rawModels)) {
         if (isOllama) {
-          rawModels = (data.models || []).map(m => ({ id: m.name || m.model, display_name: (m.name || m.model).replace(':latest', ''), context_window: m.details?.parameter_size || null, capabilities: JSON.stringify(m.details || {}) }));
+          detected = rawModels;
         } else {
-          rawModels = data.data || data.models || data;
-        }
-
-        if (Array.isArray(rawModels)) {
-          if (!isOllama) {
-            detected = rawModels.map(m => {
+          detected = rawModels
+            .map(m => {
               if (typeof m === 'string') return { id: m, display_name: m };
               return {
                 id: m.id || m.model_id || m.name,
@@ -232,22 +235,42 @@ export default function llmRoutes(ctx) {
                 context_window: m.context_window || m.context_length || m.max_context_tokens || null,
                 capabilities: JSON.stringify(m.capabilities || m.metadata || {}),
               };
-            }).filter(m => m.id);
-          } else {
-            detected = rawModels;
-          }
+            })
+            .filter(m => m.id);
         }
       }
+    }
 
-      let inserted = 0;
-      for (const model of detected) {
-        const modelId = `${provider.id}:${model.id}`;
-        try {
-          stmts.models.insert.run(modelId, provider.id, model.id, model.display_name || model.id, model.context_window, model.capabilities || '{}', 0, new Date().toISOString());
-          inserted++;
-        } catch { /* skip duplicates */ }
-      }
+    let inserted = 0;
+    const upsert = db.prepare(`
+      INSERT INTO llm_models (id, provider_id, model_id, display_name, context_window, capabilities, is_default, detected_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        model_id = excluded.model_id,
+        display_name = excluded.display_name,
+        context_window = excluded.context_window,
+        capabilities = excluded.capabilities,
+        detected_at = excluded.detected_at
+    `);
+    for (const model of detected) {
+      const modelId = `${provider.id}:${model.id}`;
+      try {
+        upsert.run(modelId, provider.id, model.id, model.display_name || model.id, model.context_window, model.capabilities || '{}', new Date().toISOString());
+        inserted++;
+      } catch { /* skip duplicates */ }
+    }
+    return { detected, inserted };
+  }
 
+  // ─── Auto-detect models from a provider ──────────────────────
+  router.post('/llm/providers/:id/detect', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+    const provider = stmts.providers.getById.get(req.params.id);
+    if (!provider) return res.status(404).json({ error: 'Provider not found' });
+    const isOllama = provider.type === 'ollama';
+    if (!provider.api_key && !isOllama) return res.status(400).json({ error: 'No API key configured for this provider' });
+
+    try {
+      const { detected, inserted } = await detectModelsFromProvider(provider);
       stmts.providers.updatePing.run(provider.id);
       audit('detect', 'llm_provider', provider.id, req.user.id, { models_detected: inserted });
       logger.info(`Detected ${inserted} models from ${provider.name}`);
@@ -292,19 +315,21 @@ export default function llmRoutes(ctx) {
     res.json({ ok: true });
   });
 
-  // ─── Detect ALL providers at once ────────────────────────────
+  // ─── Detect ALL enabled providers at once ─────────────────────
+  // Runs the shared detection logic directly (no loopback HTTP call),
+  // covering keyed providers and local Ollama.
   router.post('/llm/detect-all', authMiddleware, requireRole('admin'), apiLimiter, async (_req, res) => {
-    const providers = stmts.providers.getAll.all().filter(p => p.enabled && p.api_key);
+    const providers = stmts.providers.getAll.all()
+      .filter(p => p.enabled)
+      .map(p => stmts.providers.getById.get(p.id))
+      .filter(p => p && (p.api_key || p.type === 'ollama'));
     const results = [];
 
     for (const provider of providers) {
       try {
-        const detectRes = await fetch(`http://localhost:${PORT}/api/llm/providers/${provider.id}/detect`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${_req.headers.authorization?.slice(7) || ''}`, 'Content-Type': 'application/json' },
-        });
-        const data = await detectRes.json();
-        results.push({ provider: provider.name, status: 'ok', ...data });
+        const { detected, inserted } = await detectModelsFromProvider(provider);
+        stmts.providers.updatePing.run(provider.id);
+        results.push({ provider: provider.name, provider_id: provider.id, status: 'ok', detected: inserted, models: detected.map(m => m.display_name || m.id) });
       } catch (err) {
         results.push({ provider: provider.name, status: 'error', error: err.message });
       }
@@ -355,7 +380,7 @@ export default function llmRoutes(ctx) {
       // Step 2: Test API key (skip for ollama — no key needed)
       if (type !== 'ollama' && api_key) {
         try {
-          const { headers, url } = buildProviderAuth(api_key, providerInfo.baseUrl, providerInfo.modelsUrl);
+          const { headers } = buildProviderAuth({ type, api_key: api_key || '', base_url: finalBaseUrl || providerInfo.baseUrl || '' }, (finalBaseUrl || providerInfo.baseUrl) + (providerInfo.modelsUrl || '/models'));
 
           if (type === 'anthropic') {
             const testResp = await fetch('https://api.anthropic.com/v1/models', { headers });
@@ -394,14 +419,14 @@ export default function llmRoutes(ctx) {
       try {
         let detectedModels = [];
         if (type === 'anthropic') {
-          const { headers } = buildProviderAuth(api_key, providerInfo.baseUrl, '/v1/models');
+          const { headers } = buildProviderAuth({ type, api_key: api_key || '', base_url: providerInfo.baseUrl || '' }, 'https://api.anthropic.com/v1/models');
           const modelsResp = await fetch('https://api.anthropic.com/v1/models', { headers });
           if (modelsResp.ok) {
             const modelsData = await modelsResp.json();
             detectedModels = (modelsData.data || []).map(m => m.id);
           }
         } else {
-          const { headers, url: modelsUrl } = buildProviderAuth(api_key, finalBaseUrl || providerInfo.baseUrl, providerInfo.modelsUrl || '/models');
+          const { headers, url: modelsUrl } = buildProviderAuth({ type, api_key: api_key || '', base_url: finalBaseUrl || providerInfo.baseUrl || '' }, (finalBaseUrl || providerInfo.baseUrl) + (providerInfo.modelsUrl || '/models'));
           const modelsResp = await fetch(modelsUrl, { headers });
           if (modelsResp.ok) {
             const modelsData = await modelsResp.json();
@@ -414,15 +439,15 @@ export default function llmRoutes(ctx) {
         for (const modelId of detectedModels) {
           const existingModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(id, modelId);
           if (!existingModel) {
-            const modelUuid = randomUUID();
-            db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name, enabled) VALUES (?, ?, ?, ?, 1)').run(modelUuid, id, modelId, modelId);
+            const modelUuid = `${id}:${modelId}`;
+            db.prepare('INSERT INTO llm_models (id, provider_id, model_id, display_name) VALUES (?, ?, ?, ?)').run(modelUuid, id, modelId, modelId);
             added++;
           }
         }
         result.steps.push({ step: 'detect_models', status: 'passed', models_found: detectedModels.length, models_added: added, models: detectedModels.slice(0, 20) });
 
         // Step 5: Set first detected model as default if no default exists
-        const currentDefault = stmts.llmModels.getDefault.get();
+        const currentDefault = stmts.models.getDefault.get();
         if (!currentDefault && detectedModels.length > 0) {
           const firstModel = db.prepare('SELECT id FROM llm_models WHERE provider_id = ? AND model_id = ?').get(id, detectedModels[0]);
           if (firstModel) {

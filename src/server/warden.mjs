@@ -1,8 +1,8 @@
 /**
  * WARDEN — Cardinal Frame risk gate.
  *
- * Scores actions (sandbox code, delegation commands, agent tool calls)
- * and enforces a verdict policy:
+ * Scores actions (sandbox code, plugin installs, delegation commands,
+ * agent tool calls) and enforces a verdict policy:
  *   - score 0–1  → low    → allow
  *   - score 2–3  → medium → require explicit approval
  *   - score 4+   → high   → block
@@ -147,12 +147,12 @@ export function scoreCode(code, language = 'javascript', opts = {}) {
 
 /**
  * Generic evaluate — pick the right scorer for a scope.
- * @param {string} scope — 'sandbox' | 'command' | 'delegate'
+ * @param {string} scope — 'sandbox' | 'plugin_install' | 'command' | 'delegate'
  * @param {object} payload — { code?, language?, command? }
  * @param {{policy?: string}} [opts]
  */
 export function evaluate(scope, payload = {}, opts = {}) {
-  if (scope === 'sandbox') {
+  if (scope === 'sandbox' || scope === 'plugin_install') {
     return scoreCode(payload.code || '', payload.language || 'javascript', opts);
   }
   return scoreCommand(payload.command || payload.code || '', opts);

@@ -16,6 +16,7 @@
  *   - SSRF-safe fetch (safeFetch — hostname blocklist + DNS re-check per hop)
  *   - Name sanitization (no path traversal)
  *   - Static risk scan of plugin code before activation (audit logged)
+ *   - Elevated-risk plugins pass through the WARDEN gate (approval/block)
  *
  * Dependencies: db, stmts, authMiddleware, requireRole, apiLimiter,
  *               logger, broadcast, auditLog, pluginLoader, randomUUID
@@ -31,7 +32,7 @@ const PLUGIN_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
 const MAX_CODE_BYTES = 2 * 1024 * 1024; // 2 MB safety cap on plugin source
 
 export default function pluginMarketRoutes(ctx) {
-  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, auditLog, pluginLoader } = ctx;
+  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, auditLog, pluginLoader, wardenGate } = ctx;
   const router = express.Router();
 
   // SSRF protection — reject internal/loopback/link-local addresses
@@ -170,7 +171,10 @@ export default function pluginMarketRoutes(ctx) {
       if (!entry.url) return res.status(400).json({ error: `Plugin "${plugin_name}" has no installable URL` });
 
       const result = await installFromUrl(plugin_name, entry.url, entry.version, req);
-      if (result.error) return res.status(result.status || 500).json({ error: result.error });
+      if (result.error) {
+        const { status = 500, error, ...extra } = result;
+        return res.status(status).json({ error, ...extra });
+      }
       res.status(201).json(result);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -184,7 +188,10 @@ export default function pluginMarketRoutes(ctx) {
       if (isInternalUrl(url)) return res.status(403).json({ error: 'Internal/private URLs not allowed' });
 
       const result = await installFromUrl(name || null, url, version, req);
-      if (result.error) return res.status(result.status || 500).json({ error: result.error });
+      if (result.error) {
+        const { status = 500, error, ...extra } = result;
+        return res.status(status).json({ error, ...extra });
+      }
       res.status(201).json(result);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -248,6 +255,13 @@ export default function pluginMarketRoutes(ctx) {
 
       // Static risk scan before writing to disk
       const risk = scanPluginCode(code);
+
+      // WARDEN risk gate — elevated-risk plugins are held for approval or
+      // blocked outright (same enforcement path as sandbox/delegation).
+      if (risk.verdict === 'elevated') {
+        const gate = await wardenGate('plugin_install', { name, code, url: base, language: 'javascript' }, req);
+        if (!gate.ok) return { status: gate.status, ...gate.body, risk };
+      }
 
       mkdirSync(targetDir, { recursive: true });
       writeFileSync(path.join(targetDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
