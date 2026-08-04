@@ -193,9 +193,7 @@ export default function settingsRoutes(ctx) {
       if (!updates || typeof updates !== 'object') return res.status(400).json({ error: 'Object required' });
 
       if (updates.port !== undefined) {
-        const port = parseInt(updates.port, 10);
-        if (isNaN(port) || port < 1 || port > 65535) return res.status(400).json({ error: 'Port must be 1-65535' });
-        updates.port = String(port);
+        return res.status(400).json({ error: 'Server port is fixed to 8080 — set PORT env var instead' });
       }
       if (updates.logLevel && !['error', 'warn', 'info', 'debug'].includes(updates.logLevel)) {
         return res.status(400).json({ error: 'Log level must be: error, warn, info, or debug' });
@@ -226,7 +224,7 @@ export default function settingsRoutes(ctx) {
       if (updates.logLevel) process.env.LOG_LEVEL = updates.logLevel;
       if (updates.embeddingModel) process.env.CF_EMBEDDING_MODEL = updates.embeddingModel;
 
-      res.json({ success: true, updated, note: updates.port ? 'Restart server to apply new port' : undefined });
+      res.json({ success: true, updated });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 

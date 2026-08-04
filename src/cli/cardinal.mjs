@@ -86,17 +86,10 @@ async function token() {
   }
 }
 
-// `cardinal port` — GET /api/settings/dev, print current port
+// `cardinal port` — GET /api/settings/dev, print current port (read-only; fixed to 8080 unless PORT env set)
 async function port() {
   const data = await req('GET', '/settings/dev');
-  console.log(`Current port: ${data.port}`);
-}
-
-// `cardinal port:set <port>` — PUT /api/settings/dev with {port}
-async function portSet([portValue]) {
-  if (!portValue) { console.error('Usage: cardinal port:set <port>'); process.exit(1); }
-  const data = await req('PUT', '/settings/dev', { port: portValue });
-  console.log(`Port set to: ${data.port ?? portValue}`);
+  console.log(`Current port: ${data.port} (fixed — set PORT env var to change)`);
 }
 
 // `cardinal chat <message>` — POST /api/chat
@@ -243,8 +236,7 @@ Commands:
   tasks                        List tasks (GET /api/tasks)
   tasks:create <title> [aid]   Create a task (POST /api/tasks)
   token                        Login as admin, print JWT (POST /api/auth/login)
-  port                         Show current dev port (GET /api/settings/dev)
-  port:set <port>              Set the dev port (PUT /api/settings/dev)
+  port                         Show current dev port (fixed to 8080; set PORT env var to change)
   chat <message>               Send a chat message (POST /api/chat)
   run [args]                   Start server + dashboard (--no-client, --server-only)
   stop                         Stop server + dashboard
@@ -280,8 +272,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         await token();
         break;
       case 'port':
-        if (sub === 'set') await portSet(rest);
-        else await port();
+        await port();
         break;
       case 'chat':
         await chat(sub !== undefined ? process.argv.slice(3) : []);

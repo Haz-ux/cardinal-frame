@@ -87,6 +87,6 @@ client/src/
 ## Deployment
 - **Docker:** 3-stage build (client → server deps → clean runtime)
 - **Runtime:** dumb-init for signal handling, non-root user
-- **Port:** 8080 (configurable via PORT env)
+- **Port:** API fixed to 8080 (override via PORT env), client dev fixed to 5173 (strictPort)
 - **Data:** `/app/data` volume for SQLite + uploads
 - **Resource limits:** 512MB memory, 1.0 CPU (recommended)

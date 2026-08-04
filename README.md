@@ -64,7 +64,7 @@ npm run dev:client
 npm run dev
 ```
 
-The dashboard is available at `http://localhost:5174` (Vite dev server proxies API to `:8080`).
+The dashboard is available at `http://localhost:5173` (Vite dev server proxies API to `:8080`). Ports are fixed: client on 5173, API on 8080 (override the API with the `PORT` env var).
 
 ## Build
 

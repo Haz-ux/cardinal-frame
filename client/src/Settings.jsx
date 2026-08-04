@@ -193,11 +193,9 @@ const DevSettings = memo(function DevSettings({ showToast }) {
     setSaving(false);
   };
 
-  const portValue = editing.port !== undefined ? editing.port : settings.port;
-
   return (
     <div className="space-y-3">
-      {/* Port Setting */}
+      {/* Port Setting — read-only, fixed to 8080 */}
       <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.green}15` }}>
         <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.green}10`, border: `1px solid ${NEON.green}20` }}>
           <Server size={16} style={{ color: NEON.green }} />
@@ -206,32 +204,12 @@ const DevSettings = memo(function DevSettings({ showToast }) {
           <div className="text-sm font-semibold text-white">Server Port</div>
           <div className="text-xs text-gray-500 mt-0.5">
             Current: <span className="font-mono" style={{ color: NEON.green }}>{settings.port}</span> ·
-            {process.env.PORT ? ' Set via ENV (overrides saved)' : ' Saved in DB (persists on reboot)'}
+            Fixed to 8080 — set the PORT env var to override
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {editing.port !== undefined ? (
-            <>
-              <input
-                type="number"
-                value={editing.port}
-                onChange={e => setEditing(prev => ({ ...prev, port: e.target.value }))}
-                min="1" max="65535"
-                className="w-24 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none focus:ring-1 focus:ring-green-500/30"
-                style={{ border: `1px solid ${NEON.green}30` }}
-                autoFocus
-              />
-              <button onClick={() => handleSave({ port: editing.port })} disabled={saving || !editing.port} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green, opacity: saving || !editing.port ? 0.4 : 1 }}>
-                <Save size={10} className="inline mr-1" />Save
-              </button>
-              <button onClick={() => cancelEdit('port')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-300">✕</button>
-            </>
-          ) : (
-            <>
-              <span className="text-sm font-mono font-bold" style={{ color: NEON.green }}>{settings.port}</span>
-              {!process.env.PORT && <button onClick={() => startEdit('port')} className="text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors" style={{ color: NEON.cyan }}>Change</button>}
-            </>
-          )}
+          <span className="text-sm font-mono font-bold" style={{ color: NEON.green }}>{settings.port}</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: 'rgba(0,0,0,0.3)', color: '#666', border: '1px solid #1a1a1a' }}>LOCKED</span>
         </div>
       </div>
 
