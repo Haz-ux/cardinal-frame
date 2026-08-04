@@ -14,9 +14,9 @@ config=".gitleaks.toml"
 
 echo "🔍 gitleaks: scanning staged changes..."
 if [ -n "$config" ]; then
-  gitleaks protect --staged --config "$config" --no-banner
+  gitleaks git --staged --config "$config" --no-banner
 else
-  gitleaks protect --staged --no-banner
+  gitleaks git --staged --no-banner
 fi
 
 status=$?
