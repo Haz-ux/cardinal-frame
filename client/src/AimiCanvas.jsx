@@ -433,12 +433,13 @@ export default function AimiCanvasCompanion() {
     signal: controller.signal,
    });
 
-   if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: { message: `HTTP ${resp.status}` } }));
-    setMessages(prev => [...prev, { role: 'aimi', text: `⚠ Error: ${err.error?.message || 'Request failed'}` }]);
-    setStreaming(false);
-    return;
-   }
+    if (!resp.ok) {
+     const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+     const errMsg = (typeof err.error === 'string' ? err.error : err.error?.message) || err.message || 'Request failed';
+     setMessages(prev => [...prev, { role: 'aimi', text: `⚠ Error: ${errMsg}` }]);
+     setStreaming(false);
+     return;
+    }
 
    const reader = resp.body.getReader();
    const decoder = new TextDecoder();
