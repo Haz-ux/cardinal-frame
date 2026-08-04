@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
+import { join } from 'path';
 import { getTestServer, cleanupTestServer, adminAuth, userAuth } from './helpers.mjs';
+
+const PROJECT_ROOT = join(import.meta.dirname, '..');
 
 let app;
 
@@ -240,7 +243,7 @@ describe('Skill Runtime API', () => {
       const res = await request(app)
         .post('/api/skills/execute/git-status')
         .set(adminAuth())
-        .send({ input: { cwd: '/home/haz/cardinal-frame/cardinal-frame' } });
+        .send({ input: { cwd: PROJECT_ROOT } });
       expect(res.status).toBe(200);
       // If the skill failed, log the error for debugging
       if (!res.body.ok) {

@@ -6,6 +6,10 @@ import { getTestServer, cleanupTestServer, adminAuth, userAuth } from './helpers
 
 const TEST_PLUGIN = 'mktestplugin';
 
+// Project root derived from this file's location — never hardcode an absolute path.
+const PROJECT_ROOT = join(import.meta.dirname, '..');
+const PLUGINS_DIR = join(PROJECT_ROOT, 'plugins');
+
 function mockResponse(body, status = 200) {
   return {
     ok: status >= 200 && status < 300,
@@ -61,8 +65,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // Clean up anything the marketplace test installed on disk
-  try { rmSync(join('/home/cardinal-frame', 'plugins', TEST_PLUGIN), { recursive: true, force: true }); } catch {}
-  try { rmSync(join('/home/cardinal-frame', 'plugins', 'caution-plugin'), { recursive: true, force: true }); } catch {}
+  try { rmSync(join(PLUGINS_DIR, TEST_PLUGIN), { recursive: true, force: true }); } catch {}
+  try { rmSync(join(PLUGINS_DIR, 'caution-plugin'), { recursive: true, force: true }); } catch {}
   try {
     db.prepare('DELETE FROM plugins WHERE name = ?').run(TEST_PLUGIN);
     db.prepare('DELETE FROM plugins WHERE name = ?').run('caution-plugin');
