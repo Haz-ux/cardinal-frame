@@ -1,7 +1,7 @@
 # ADR 0018: Convert root + client/ to an npm workspace
 
 Date: 2026-08-03
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -30,4 +30,6 @@ with shared dependencies hoisted into one root `node_modules`, and duplicate dec
 
 ## Status
 
-Not started. Unblocks further client/root de-duplication. Shortlist: verify `vite` workspace behavior with `client/vite.config`, run full suite after migration.
+Executed. The root `package.json` now declares `"workspaces": ["client"]` with a single root lockfile, and the client workspace owns all frontend-only deps (`react`, `react-dom`, `lucide-react`, `react-force-graph-2d`, `vite@7`, `tailwindcss`, `@vitejs/plugin-react`, `@types/react*`). The root keeps server/test deps plus the shared `d3-force` (still required by `tests/graph.test.mjs` via `client/src/graph/ClusterSimulation.js`) and `typescript@6` for the repo-wide `tsc --noEmit`. `client/package-lock.json` was deleted; `npm ci` at root installs the whole workspace.
+
+Verified after migration: `npm ls` clean, `tsc --noEmit` exits 0, `npm run build:client` succeeds, and the full suite passes (37 files / 590 tests). Note `vite@8.2.0` remains in the tree as `vitest@4`'s dependency and is distinct from the client's `vite@7.3.6`; conflicting copies (`react@19.2.8` vs the `19.2.6` range from `@xyflow/react`) are nested under `client/node_modules`, which is normal workspace resolution.
