@@ -860,7 +860,7 @@ const stmts = {
       },
       providers: {
       insert: db.prepare('INSERT INTO llm_providers (id, name, type, api_key, base_url, enabled) VALUES (?, ?, ?, ?, ?, ?)'),
-      getAll: db.prepare('SELECT id, name, type, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
+      getAll: db.prepare('SELECT id, name, type, api_key, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
       getById: db.prepare('SELECT * FROM llm_providers WHERE id = ?'),
       getByName: db.prepare('SELECT * FROM llm_providers WHERE name = ?'),
       updateApiKey: db.prepare('UPDATE llm_providers SET api_key = ? WHERE id = ?'),
