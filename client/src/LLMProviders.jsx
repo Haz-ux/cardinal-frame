@@ -75,29 +75,36 @@ function EditKeyModal({ provider, onClose, onSaved }) {
 }
 
 // ─── Model Selector Dropdown ───────────────────────────────────────
-const ModelSelector = memo(function ModelSelector({ providers, models, defaultModel, onSetDefault, onDeleteModel }) {
- const enabledProviders = useMemo(() => providers.filter(p => p.enabled), [providers]);
- const [selProviderId, setSelProviderId] = useState('');
- const [selModelId, setSelModelId] = useState('');
- const [openProvider, setOpenProvider] = useState(false);
- const [openModel, setOpenModel] = useState(false);
+const ModelSelector = memo(function ModelSelector({ providers, models, defaultModel, onSetDefault, onDeleteModel, onDetectProvider, detecting }) {
+  const [selProviderId, setSelProviderId] = useState('');
+  const [selModelId, setSelModelId] = useState('');
+  const [openProvider, setOpenProvider] = useState(false);
+  const [openModel, setOpenModel] = useState(false);
 
- const filteredModels = useMemo(() => {
- if (!selProviderId) return models;
- return models.filter(m => m.provider_id === selProviderId);
- }, [models, selProviderId]);
+  const selectedProvider = useMemo(() => providers.find(p => p.id === selProviderId), [providers, selProviderId]);
 
- const selectedModel = useMemo(() => models.find(m => m.id === selModelId), [models, selModelId]);
+  const filteredModels = useMemo(() => {
+  if (!selProviderId) return models;
+  return models.filter(m => m.provider_id === selProviderId);
+  }, [models, selProviderId]);
 
- useEffect(() => {
- const handler = () => { setOpenProvider(false); setOpenModel(false); };
- document.addEventListener('click', handler);
- return () => document.removeEventListener('click', handler);
- }, []);
+  const selectedModel = useMemo(() => models.find(m => m.id === selModelId), [models, selModelId]);
 
- const handleProviderSelect = (p) => { setSelProviderId(p.id); setSelModelId(''); setOpenProvider(false); };
- const handleModelSelect = (m) => { setSelModelId(m.id); setOpenModel(false); };
- const clearFilter = () => { setSelProviderId(''); setSelModelId(''); };
+  useEffect(() => {
+  const handler = () => { setOpenProvider(false); setOpenModel(false); };
+  document.addEventListener('click', handler);
+  return () => document.removeEventListener('click', handler);
+  }, []);
+
+  const handleProviderSelect = (p) => {
+  setSelProviderId(p.id); setSelModelId(''); setOpenProvider(false); setOpenModel(true);
+  // Auto-detect available models for the selected provider (needs a key).
+  if (p?.id && p?.has_key && !detecting[p.id]) {
+  onDetectProvider(p);
+  }
+  };
+  const handleModelSelect = (m) => { setSelModelId(m.id); setOpenModel(false); };
+  const clearFilter = () => { setSelProviderId(''); setSelModelId(''); };
 
  return (
  <div className="rounded-xl p-5" style={{ background: CARD_BG, border: `1px solid ${NEON.cyan}18` }}>
@@ -114,13 +121,13 @@ const ModelSelector = memo(function ModelSelector({ providers, models, defaultMo
  <div className="flex flex-wrap items-center gap-3">
  <div className="relative flex-1 min-w-[180px]">
  <button onClick={(e) => { e.stopPropagation(); setOpenProvider(!openProvider); setOpenModel(false); }} className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg text-sm text-left" style={{ background: 'rgba(0,0,0,0.5)', border: `1px solid ${NEON.cyan}25`, color: selProviderId ? '#fff' : '#666' }}>
- <span className="flex items-center gap-2"><Cpu size={13} style={{ color: NEON.cyan }} />{selProviderId ? (enabledProviders.find(p => p.id === selProviderId)?.name || 'Provider') : 'All Providers'}</span>
+  <span className="flex items-center gap-2"><Cpu size={13} style={{ color: NEON.cyan }} />{selProviderId ? (providers.find(p => p.id === selProviderId)?.name || 'Provider') : 'All Providers'}</span>
  <ChevronDown size={14} style={{ color: '#555', transform: openProvider ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }} />
  </button>
  {openProvider && (
  <div className="absolute z-20 mt-1 w-full rounded-lg py-1 overflow-hidden" style={{ background: 'rgba(8,8,18,0.98)', border: `1px solid ${NEON.cyan}25`, boxShadow: `0 8px 32px rgba(0,0,0,0.6)` }}>
- <button onClick={() => handleProviderSelect({ id: '' })} className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5 text-gray-300" style={{ borderBottom: `1px solid rgba(255,255,255,0.04)` }}><Cpu size={13} style={{ color: NEON.cyan }} /> All Providers{!selProviderId && <Check size={13} className="ml-auto" style={{ color: NEON.cyan }} />}</button>
- {enabledProviders.map(p => { const color = PROVIDER_COLORS[p.type] || NEON.cyan; return (<button key={p.id} onClick={() => handleProviderSelect(p)} className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5 text-gray-200" style={{ borderBottom: `1px solid rgba(255,255,255,0.04)` }}><span className="w-2 h-2 rounded-full shrink-0" style={{ background: color, boxShadow: `0 0 4px ${color}60` }} /><span className="flex-1 text-left">{p.name}</span><span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded" style={{ background: `${color}12`, color, border: `1px solid ${color}25` }}>{p.type}</span>{selProviderId === p.id && <Check size={13} style={{ color }} />}</button>); })}
+  <button onClick={(e) => { e.stopPropagation(); handleProviderSelect({ id: '' }); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5 text-gray-300" style={{ borderBottom: `1px solid rgba(255,255,255,0.04)` }}><Cpu size={13} style={{ color: NEON.cyan }} /> All Providers{!selProviderId && <Check size={13} className="ml-auto" style={{ color: NEON.cyan }} />}</button>
+  {providers.map(p => { const color = PROVIDER_COLORS[p.type] || NEON.cyan; return (<button key={p.id} onClick={(e) => { e.stopPropagation(); handleProviderSelect(p); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5 text-gray-200" style={{ borderBottom: `1px solid rgba(255,255,255,0.04)` }}><span className="w-2 h-2 rounded-full shrink-0" style={{ background: p.has_key ? color : '#555', boxShadow: p.has_key ? `0 0 4px ${color}60` : 'none' }} /><span className="flex-1 text-left">{p.name}</span><span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded" style={{ background: `${color}12`, color, border: `1px solid ${color}25` }}>{p.type}</span>{!p.has_key && <span className="text-[9px] text-gray-600">no key</span>}{selProviderId === p.id && <Check size={13} style={{ color }} />}</button>); })}
  </div>
  )}
  </div>
@@ -134,7 +141,7 @@ const ModelSelector = memo(function ModelSelector({ providers, models, defaultMo
  {filteredModels.map(m => { const pColor = PROVIDER_COLORS[providers.find(p => p.id === m.provider_id)?.type] || NEON.cyan; return (<button key={m.id} onClick={() => handleModelSelect(m)} className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5 text-gray-200" style={{ borderBottom: `1px solid rgba(255,255,255,0.04)` }}>{m.is_default ? <Star size={11} style={{ color: NEON.yellow }} /> : <span className="w-3" />}<span className="flex-1 text-left truncate font-mono text-xs">{m.display_name || m.model_id}</span><span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: `${pColor}12`, color: pColor, border: `1px solid ${pColor}25` }}>{m.provider_name}</span>{m.context_window && <span className="text-[10px] text-gray-500">{(m.context_window/1000).toFixed(0)}k</span>}{selModelId === m.id && <Check size={13} style={{ color: NEON.cyan }} />}</button>); })}
  </div>
  )}
- {openModel && filteredModels.length === 0 && (<div className="absolute z-20 mt-1 w-full rounded-lg p-4 text-center text-xs text-gray-500" style={{ background: 'rgba(8,8,18,0.98)', border: `1px solid ${NEON.cyan}25` }}>{selProviderId ? 'No models for this provider' : 'No models detected yet'}</div>)}
+  {openModel && filteredModels.length === 0 && (<div className="absolute z-20 mt-1 w-full rounded-lg p-4 text-center text-xs text-gray-500" style={{ background: 'rgba(8,8,18,0.98)', border: `1px solid ${NEON.cyan}25` }}>{selProviderId && detecting[selProviderId] ? <span style={{ color: NEON.cyan }}><RefreshCw size={12} className="inline animate-spin mr-1" />Detecting models...</span> : selProviderId && !selectedProvider?.has_key ? 'Add an API key to this provider to detect models' : selProviderId ? 'No models detected yet' : 'Select a provider to detect its models'}</div>)}
  </div>
  {selectedModel && (
  <div className="flex items-center gap-2">
@@ -318,7 +325,7 @@ export default function LLMProviders() {
  )}
 
  {/* Model Selector Dropdown */}
- <ModelSelector providers={providers} models={filteredModels} defaultModel={defaultModel} onSetDefault={setDefault} onDeleteModel={deleteModel} />
+  <ModelSelector providers={providers} models={filteredModels} defaultModel={defaultModel} onSetDefault={setDefault} onDeleteModel={deleteModel} onDetectProvider={detectModels} detecting={detecting} />
 
  {/* Providers Grid — Flip Cards */}
  <div>
