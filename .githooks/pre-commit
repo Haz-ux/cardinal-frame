@@ -3,6 +3,12 @@
 # Skips gracefully if gitleaks is not installed (CI enforces server-side).
 # Install: git config core.hooksPath .githooks  (or: npm run hooks:install)
 
+# Ensure gitleaks installed to ~/.local/bin (see ~/.bashrc) is found in this
+# non-interactive shell, where interactive PATH additions don't apply.
+if ! command -v gitleaks >/dev/null 2>&1 && [ -x "$HOME/.local/bin/gitleaks" ]; then
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
 if ! command -v gitleaks >/dev/null 2>&1; then
   echo "⚠️  gitleaks not installed — skipping local secret scan."
   echo "    Install it (https://github.com/gitleaks/gitleaks) to scan locally."
