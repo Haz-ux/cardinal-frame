@@ -570,8 +570,8 @@ export default function AimiCanvasCompanion() {
   }
 
   // ── Open: chat panel ──
-  const panelWidth = expanded ? 420 : 340;
-  const panelHeight = expanded ? 540 : 420;
+  const panelWidth = Math.min(expanded ? 420 : 340, window.innerWidth - 8);
+  const panelHeight = Math.min(expanded ? 540 : 420, window.innerHeight - 8);
   const panelLeft = Math.max(0, Math.min(mascotPos.left, window.innerWidth - panelWidth));
   const panelTop = Math.max(0, Math.min(mascotPos.top, window.innerHeight - panelHeight));
 
@@ -619,6 +619,7 @@ export default function AimiCanvasCompanion() {
         color: msg.role === 'user' ? AIMI.accent : '#bbb',
         border: `1px solid ${msg.role === 'user' ? AIMI.core + '20' : AIMI.shell + '33'}`,
         whiteSpace: 'pre-wrap',
+        overflowWrap: 'anywhere',
        }}>
         {msg.role === 'aimi' && <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>{companionName}</span>}
        {msg.text}
@@ -627,10 +628,10 @@ export default function AimiCanvasCompanion() {
     ))}
     {(streaming || streamBuf || thinking) && (
      <div className="flex justify-start">
-      <div className="max-w-[90%] px-2.5 py-1.5 rounded-lg rounded-bl-sm text-xs leading-relaxed" style={{ background: `${AIMI.shell}22`, color: '#bbb', border: `1px solid ${AIMI.shell}33`, whiteSpace: 'pre-wrap' }}>
+      <div className="max-w-[90%] px-2.5 py-1.5 rounded-lg rounded-bl-sm text-xs leading-relaxed" style={{ background: `${AIMI.shell}22`, color: '#bbb', border: `1px solid ${AIMI.shell}33`, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
         <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>{companionName}</span>
        {thinking && (
-        <div className="mb-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap' }}>▸ {thinking}{thinking.length >= 900 ? '…' : ''}</div>
+        <div className="mb-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>▸ {thinking}{thinking.length >= 900 ? '…' : ''}</div>
        )}
        {streamBuf ? (
         <>{streamBuf}<span className="neon-pulse" style={{ display: 'inline-block', width: 4, height: 12, background: AIMI.core, marginLeft: 2, verticalAlign: 'middle', borderRadius: 1 }} /></>

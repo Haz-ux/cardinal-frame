@@ -191,7 +191,7 @@ export default function SkillsTools({ initialTab }) {
             {tools.map(tool => (
               <div key={tool.id} style={{
                 background: BG.card, border: `1px solid ${NEON.magenta}10`, borderRadius: 10,
-                padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12,
+                padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
               }}>
                 <div style={{ width: 32, height: 32, borderRadius: 8, background: `${NEON.magenta}10`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <Zap size={14} style={{ color: NEON.magenta }} />
@@ -203,7 +203,7 @@ export default function SkillsTools({ initialTab }) {
                 <span style={{ ...methodBadge, background: `${methodColor(tool.method)}15`, color: methodColor(tool.method), border: `1px solid ${methodColor(tool.method)}30` }}>
                   {tool.method}
                 </span>
-                <span style={{ color: '#444', fontSize: 11, fontFamily: 'monospace', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ flex: 1, minWidth: 0, color: '#444', fontSize: 11, fontFamily: 'monospace', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {tool.endpoint}
                 </span>
                 <span style={{ color: tool.enabled ? NEON.green : '#555', fontSize: 10, fontWeight: 700 }}>

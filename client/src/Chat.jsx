@@ -498,7 +498,7 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
               {personas.find(p => p.id === selectedPersona)?.name || 'Direct'} <ChevronDown size={12} />
             </button>
             {showPersonaPicker && (
-            <div style={{ position: 'absolute', right: 0, top: '100%', width: 260, maxHeight: 320, overflow: 'auto', background: BG.card, border: `1px solid ${NEON.purple}30`, borderRadius: 8, zIndex: 60, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
+            <div style={{ position: 'absolute', right: 0, top: '100%', width: 'min(260px, calc(100vw - 24px))', maxHeight: 320, overflow: 'auto', background: BG.card, border: `1px solid ${NEON.purple}30`, borderRadius: 8, zIndex: 60, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
             {personas.map(p => (
             <div key={p.id} onClick={() => { setSelectedPersona(p.id); setShowPersonaPicker(false); }} style={{
             padding: '8px 12px', cursor: 'pointer', fontSize: 12,
@@ -533,7 +533,7 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
               <Cpu size={13} /> {selectedModel ? (selectedModel.length > 24 ? selectedModel.slice(0, 22) + '…' : selectedModel) : 'Select Model'} <ChevronDown size={12} />
             </button>
             {showModelPicker && (
-            <div style={{ position: 'absolute', right: 0, top: '100%', width: 320, maxHeight: 300, overflow: 'auto', background: BG.card, border: `1px solid ${NEON.cyan}30`, borderRadius: 8, zIndex: 50, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
+            <div style={{ position: 'absolute', right: 0, top: '100%', width: 'min(320px, calc(100vw - 24px))', maxHeight: 300, overflow: 'auto', background: BG.card, border: `1px solid ${NEON.cyan}30`, borderRadius: 8, zIndex: 50, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
             {models.slice(0, 20).map(m => (
             <div key={m.id} onClick={() => { setSelectedModel(m.model_id); setShowModelPicker(false); }} style={{
             padding: '6px 12px', cursor: 'pointer', fontSize: 12,
@@ -615,7 +615,7 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
                 <Bot size={14} style={{ color: NEON.cyan }} />
               </div>
               <div style={{ flex: 1, background: `${BG.card}`, border: `1px solid ${NEON.cyan}15`, borderRadius: '0 12px 12px 12px', padding: '10px 14px' }}>
-                <div style={{ color: '#ccc', fontSize: 13, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+                <div style={{ color: '#ccc', fontSize: 13, whiteSpace: 'pre-wrap', lineHeight: 1.6, overflowWrap: 'anywhere' }}>
                   <MarkdownContent content={streamBuf} />
                   <span className="neon-pulse" style={{ display: 'inline-block', width: 6, height: 14, background: NEON.cyan, marginLeft: 2, verticalAlign: 'middle', borderRadius: 1 }} />
                 </div>
@@ -731,9 +731,9 @@ function MessageBubble({ msg }) {
  padding: '10px 14px',
  }}>
  {isTool && <div style={{ color: NEON.magenta, fontSize: 10, fontWeight: 700, marginBottom: 4, letterSpacing: 1 }}>TOOL RESULT</div>}
- <div style={{ color: '#ccc', fontSize: 13, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
- <MarkdownContent content={msg.content} />
- </div>
+  <div style={{ color: '#ccc', fontSize: 13, whiteSpace: 'pre-wrap', lineHeight: 1.6, overflowWrap: 'anywhere' }}>
+  <MarkdownContent content={msg.content} />
+  </div>
 
  {/* ── Rich inline components for structured messages ── */}
  {execSteps.length > 0 && <TerminalAccordion steps={execSteps} title="Execution Log" />}

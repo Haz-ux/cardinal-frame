@@ -81,7 +81,7 @@ export default function BootScreen({ onDone }) {
       {/* Content */}
       <div className="relative z-10 flex flex-col items-center w-full max-w-lg px-8">
         {/* Logo */}
-        <div className="mb-8 flex items-center gap-3">
+        <div className="mb-8 flex flex-wrap justify-center items-center gap-3 text-center">
           <Sparkles
             size={36}
             style={{
@@ -91,7 +91,7 @@ export default function BootScreen({ onDone }) {
             }}
           />
           <span
-            className="text-3xl font-black tracking-widest"
+            className="text-2xl md:text-3xl font-black tracking-widest text-center"
             style={{
               background: `linear-gradient(135deg, ${NEON.cyan}, ${NEON.blue})`,
               WebkitBackgroundClip: 'text',

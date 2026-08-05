@@ -454,7 +454,7 @@ export default function DAGEditor() {
   useEffect(() => {
     const obs = new ResizeObserver(entries => {
       const { width, height } = entries[0].contentRect;
-      setDimensions({ width: Math.max(400, width), height: Math.max(300, height) });
+      setDimensions({ width: Math.max(200, width), height: Math.max(200, height) });
     });
     if (svgRef.current?.parentElement) obs.observe(svgRef.current.parentElement);
     return () => obs.disconnect();
@@ -844,7 +844,7 @@ export default function DAGEditor() {
         <DagMinimap nodes={nodes} edges={edges} dimensions={dimensions} zoom={zoom} pan={pan} onPan={setPan} />
 
         {/* Hint */}
-        <div className="absolute top-3 left-3 text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded">
+        <div className="absolute top-3 left-3 hidden md:flex text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded">
           Drag nodes · Connect ports · Click edge to delete · Scroll to zoom · Auto Arrange for layout
         </div>
       </div>
@@ -852,11 +852,11 @@ export default function DAGEditor() {
       {/* Node detail side panel */}
       {selectedNode && selectedCfg && (
         <div className="rounded-xl p-4" style={{ background: `${BG.card}f5`, border: `1px solid ${selectedCfg.color}25` }}>
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
+          <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
+            <div className="flex items-center gap-2 min-w-0">
               <span className="text-lg">{selectedCfg.icon}</span>
-              <h3 className="text-sm font-bold" style={{ color: selectedCfg.color }}>{selectedNode.name}</h3>
-              <span className="px-2 py-0.5 rounded text-[10px]" style={{ background: `${selectedCfg.color}15`, color: selectedCfg.color, border: `1px solid ${selectedCfg.color}30` }}>{selectedNode.type}</span>
+              <h3 className="text-sm font-bold truncate" style={{ color: selectedCfg.color }}>{selectedNode.name}</h3>
+              <span className="px-2 py-0.5 rounded text-[10px] shrink-0" style={{ background: `${selectedCfg.color}15`, color: selectedCfg.color, border: `1px solid ${selectedCfg.color}30` }}>{selectedNode.type}</span>
             </div>
             <div className="flex items-center gap-2">
               {/* Run button with inline status indicator */}
@@ -888,9 +888,9 @@ export default function DAGEditor() {
           </div>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
             <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{selectedNode.id?.slice(0, 12)}…</span></div>
-            {(selectedNode.type === 'task' || selectedNode.type === 'trigger') && <div><span className="text-gray-500 block">Command</span><code style={{ color: NEON.green }}>{selectedNode.command || '—'}</code></div>}
-            {selectedNode.type === 'transform' && <div><span className="text-gray-500 block">Expression</span><code style={{ color: NEON.purple }}>{selectedNode.command || '—'}</code></div>}
-            {selectedNode.type === 'webhook' && <div><span className="text-gray-500 block">Path</span><code style={{ color: NEON.teal }}>{selectedNode.command || '—'}</code></div>}
+            {(selectedNode.type === 'task' || selectedNode.type === 'trigger') && <div><span className="text-gray-500 block">Command</span><code className="break-all" style={{ color: NEON.green }}>{selectedNode.command || '—'}</code></div>}
+            {selectedNode.type === 'transform' && <div><span className="text-gray-500 block">Expression</span><code className="break-all" style={{ color: NEON.purple }}>{selectedNode.command || '—'}</code></div>}
+            {selectedNode.type === 'webhook' && <div><span className="text-gray-500 block">Path</span><code className="break-all" style={{ color: NEON.teal }}>{selectedNode.command || '—'}</code></div>}
             <div><span className="text-gray-500 block">Created</span><span style={{ color: '#888' }}>{selectedNode.created_at ? new Date(selectedNode.created_at).toLocaleString() : '—'}</span></div>
             <div><span className="text-gray-500 block">Incoming</span><span style={{ color: NEON.blue }}>{edges.filter(e => e.to === selectedNode.id).length}</span></div>
             <div><span className="text-gray-500 block">Outgoing</span><span style={{ color: NEON.blue }}>{edges.filter(e => e.from === selectedNode.id).length}</span></div>

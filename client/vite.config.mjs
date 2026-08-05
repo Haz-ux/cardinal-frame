@@ -15,6 +15,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    host: '127.0.0.1', // bind IPv4 so mobile webviews resolving localhost to 127.0.0.1 can connect
     strictPort: true, // fail hard if 5173 is busy instead of silently bumping to 5174+
     proxy: {
       '/api': { target: 'http://localhost:8080', changeOrigin: true, secure: false },

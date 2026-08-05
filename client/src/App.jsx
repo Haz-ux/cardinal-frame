@@ -27,9 +27,10 @@ const AimiLearnPage = lazy(() => import('./AimiLearn'));
 const SettingsPage = lazy(() => import('./Settings'));
 const AutomationPage = lazy(() => import('./Automation'));
 import { ToastProvider } from './ToastContext';
-import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Link2 } from 'lucide-react';
+import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Link2, Monitor, Smartphone } from 'lucide-react';
 import AimiCanvasCompanion from './AimiCanvas';
 import { NEON, BG, FONTS } from './theme';
+import { isDesktopMode, applyViewportMode, toggleDesktopMode } from './viewportMode';
 import { PersonaProvider, usePersonas } from './PersonaContext';
 
 function PublicRoute({ children }) {
@@ -43,20 +44,16 @@ function ProtectedRoute({ children }) {
  const [bootPhase, setBootPhase] = useState('none'); // 'none' | 'galaxy' | 'boot'
  const bootChecked = React.useRef(false);
 
- useEffect(() => {
-  if (!bootChecked.current && user) {
-   bootChecked.current = true;
-   prewarm(['/api/dashboard/summary', '/api/llm/models', '/api/llm/providers', '/api/graph', '/api/agents', '/api/tasks', '/api/tools', '/api/skills']);
-   const justLoggedIn = sessionStorage.getItem('cf_just_logged_in');
-   if (justLoggedIn) {
+  useEffect(() => {
+   if (!bootChecked.current && user) {
+    bootChecked.current = true;
+    prewarm(['/api/dashboard/summary', '/api/llm/models', '/api/llm/providers', '/api/graph', '/api/agents', '/api/tasks', '/api/tools', '/api/skills']);
     sessionStorage.removeItem('cf_just_logged_in');
-    // Boot sequence: galaxy "big bang" splash first, then the typed boot
-    // splash, then the app. On narrow screens the galaxy is skipped (the
-    // explosion needs room) and we fall straight to the boot splash.
-    setBootPhase(window.innerWidth >= 480 ? 'galaxy' : 'boot');
+    // Boot cinematic on every startup (skippable): galaxy "big bang" splash,
+    // then the typed boot splash, then the app.
+    setBootPhase('galaxy');
    }
-  }
- }, [user]);
+  }, [user]);
 
  if (loading) return <div className="min-h-screen flex items-center justify-center" style={{ background: BG.void }}><Loader size={24} className="animate-spin" style={{ color: NEON.green }} /></div>;
  if (!user) return <Navigate to="/login" replace />;
@@ -71,14 +68,25 @@ function ProtectedRoute({ children }) {
 
  return children;
 }
-function Layout() {
- const { user, logout } = useAuth();
- const navigate = useNavigate();
- const { companionName } = usePersonas();
- const [mobileOpen, setMobileOpen] = useState(false);
- const [desktopCollapsed, setDesktopCollapsed] = useState(false);
- const closeMobile = useCallback(() => setMobileOpen(false), []);
- const links = [
+ function Layout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const { companionName } = usePersonas();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [desktopCollapsed, setDesktopCollapsed] = useState(false);
+  const [desktopView, setDesktopView] = useState(isDesktopMode());
+  const closeMobile = useCallback(() => setMobileOpen(false), []);
+  // Apply the persisted viewport mode on boot and keep the icon in sync
+  // (changing the viewport meta fires a resize, so the CSS breakpoints
+  // re-evaluate on their own — this state only tracks the toggle UI).
+  useEffect(() => {
+   applyViewportMode();
+   setDesktopView(isDesktopMode());
+   const onResize = () => setDesktopView(isDesktopMode());
+   window.addEventListener('resize', onResize);
+   return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const links = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard', color: NEON.green },
   { to: '/chat', icon: MessageSquare, label: 'Chat', color: NEON.cyan },
   { to: '/tasks', icon: ListTodo, label: 'Tasks', color: NEON.green },
@@ -187,6 +195,17 @@ function Layout() {
      </span>
      {user?.role === 'admin' && <ShieldCheck size={12} style={{ color: NEON.red, flexShrink: 0 }} />}
     </div>
+    <button
+     onClick={() => { toggleDesktopMode(); setDesktopView(isDesktopMode()); }}
+     className="flex items-center gap-2 px-3 py-2 text-sm w-full transition-all font-hud text-[12px]"
+     style={{ color: desktopView ? NEON.green : '#555', border: '1px solid transparent' }}
+     title={desktopView ? 'Switch to mobile view' : 'Switch to desktop view'}
+    >
+     {desktopView ? <Monitor size={14} style={{ flexShrink: 0 }} /> : <Smartphone size={14} style={{ flexShrink: 0 }} />}
+     <span className={`whitespace-nowrap overflow-hidden transition-all duration-300 ${isMobile ? 'opacity-100 w-auto' : (desktopCollapsed ? 'md:w-0 md:opacity-0' : 'md:w-auto md:opacity-100')} opacity-100 w-auto`}>
+      {desktopView ? 'Mobile View' : 'Desktop View'}
+     </span>
+    </button>
     <button onClick={() => { logout(); if (isMobile) closeMobile(); }}
      className="flex items-center gap-2 px-3 py-2 text-sm w-full transition-all font-hud text-[12px]"
      style={{ color: '#555', border: '1px solid transparent' }}
@@ -267,16 +286,25 @@ function Layout() {
      >
       <Menu size={20} />
      </button>
-     <span className="ml-3 font-bold text-sm tracking-wider font-hud"
-      style={{
-       background: `linear-gradient(135deg, ${NEON.green}, ${NEON.cyan})`,
-       WebkitBackgroundClip: 'text',
-       WebkitTextFillColor: 'transparent',
-      }}
-     >
-      CARDINAL FRAME
-     </span>
-    </div>
+      <span className="ml-3 font-bold text-sm tracking-wider font-hud"
+       style={{
+        background: `linear-gradient(135deg, ${NEON.green}, ${NEON.cyan})`,
+        WebkitBackgroundClip: 'text',
+        WebkitTextFillColor: 'transparent',
+       }}
+      >
+       CARDINAL FRAME
+      </span>
+      <button
+       onClick={() => { toggleDesktopMode(); setDesktopView(isDesktopMode()); }}
+       className="ml-auto p-2 transition-all flex items-center gap-1.5"
+       style={{ color: desktopView ? NEON.green : NEON.cyan, border: `1px solid ${desktopView ? NEON.green : NEON.cyan}20`, background: desktopView ? `${NEON.green}08` : 'transparent' }}
+       title={desktopView ? 'Switch to mobile view' : 'Switch to desktop view'}
+      >
+       {desktopView ? <Monitor size={16} /> : <Smartphone size={16} />}
+       <span className="text-[10px] font-hud">{desktopView ? 'DESKTOP' : 'MOBILE'}</span>
+      </button>
+     </div>
     {/* Scrollable page content */}
     <div className="flex-1 p-3 md:p-6 overflow-auto">
      <Suspense fallback={<PageLoader />}>

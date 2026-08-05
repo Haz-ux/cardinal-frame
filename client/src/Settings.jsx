@@ -73,7 +73,7 @@ const ProviderKeyCard = memo(function ProviderKeyCard({ preset, existingKeys, on
 
   return (
     <div className="rounded-xl p-3.5 transition-all hover:brightness-110" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${hasKey ? preset.color + '25' : '#333'}` }}>
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 flex-wrap">
         <div className="w-10 h-10 rounded-lg flex items-center justify-center text-sm font-bold" style={{ background: `${preset.color}15`, color: preset.color, border: `1px solid ${preset.color}30` }}>
           {preset.label.slice(0, 2).toUpperCase()}
         </div>
@@ -97,8 +97,8 @@ const ProviderKeyCard = memo(function ProviderKeyCard({ preset, existingKeys, on
               {hasKey && <button onClick={() => { setTesting(true); onTest(preset.envKey).finally(() => setTesting(false)); }} disabled={testing} className="flex items-center gap-1 text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors" style={{ color: NEON.cyan }}>{testing ? <RefreshCw size={10} className="animate-spin" /> : <Zap size={10} />} Test</button>}
             </>
           ) : (
-            <div className="flex items-center gap-1.5">
-              <input value={val} onChange={e => setVal(e.target.value)} type={showVal ? 'text' : 'password'} placeholder="sk-..." className="w-44 px-2 py-1 rounded text-xs font-mono bg-black/50 text-white outline-none" style={{ border: `1px solid ${preset.color}30` }} autoFocus />
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <input value={val} onChange={e => setVal(e.target.value)} type={showVal ? 'text' : 'password'} placeholder="sk-..." className="w-36 sm:w-44 px-2 py-1 rounded text-xs font-mono bg-black/50 text-white outline-none" style={{ border: `1px solid ${preset.color}30` }} autoFocus />
               <button onClick={() => setShowVal(!showVal)} className="p-1 text-gray-500 hover:text-gray-300">{showVal ? <EyeOff size={11} /> : <Eye size={11} />}</button>
               <button onClick={() => { onSave(preset.envKey, val, 1, 'llm'); setEditing(false); }} disabled={!val} className="px-2 py-1 rounded text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green, opacity: val ? 1 : 0.4 }}><Save size={10} /></button>
               <button onClick={() => setEditing(false)} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">✕</button>
@@ -126,9 +126,9 @@ const VarRow = memo(function VarRow({ v, onSave, onDelete, onTest }) {
 
  return (
  <div className="group px-4 py-3 hover:bg-white/[0.02] transition-all" style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
- <div className="flex items-center gap-3">
- {/* Category icon */}
- <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0" style={{ background: `${catColor}10`, border: `1px solid ${catColor}20` }}>
+  <div className="flex items-center gap-3 flex-wrap">
+  {/* Category icon */}
+  <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0" style={{ background: `${catColor}10`, border: `1px solid ${catColor}20` }}>
  <CatIcon size={12} style={{ color: catColor }} />
  </div>
  <div className="flex-1 min-w-0">
@@ -147,11 +147,11 @@ const VarRow = memo(function VarRow({ v, onSave, onDelete, onTest }) {
  ) : (
  <div className="flex items-center gap-2 mt-0.5">
  <span className="text-xs font-mono text-gray-500 truncate max-w-[300px]">{displayVal}</span>
- {isSecret && <button onClick={() => setShowVal(!showVal)} className="p-0.5 text-gray-600 hover:text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">{showVal ? <EyeOff size={10} /> : <Eye size={10} />}</button>}
- </div>
- )}
- </div>
- <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+  {isSecret && <button onClick={() => setShowVal(!showVal)} className="p-1 text-gray-600 hover:text-gray-400 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">{showVal ? <EyeOff size={10} /> : <Eye size={10} />}</button>}
+  </div>
+  )}
+  </div>
+  <div className="flex items-center gap-1 shrink-0 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
  {!editing && <button onClick={() => { setEditing(true); setVal(v.value || ''); }} className="text-xs text-gray-500 hover:text-cyan-400 px-2 py-1 rounded hover:bg-white/5 transition-colors">Edit</button>}
  {isSecret && <button onClick={() => { setTesting(true); onTest(v.key).finally(() => setTesting(false)); }} disabled={testing} className="flex items-center gap-1 text-xs px-2 py-1 rounded hover:bg-white/5 transition-colors" style={{ color: NEON.cyan }}>{testing ? <RefreshCw size={10} className="animate-spin" /> : <Zap size={10} />} Test</button>}
  <button onClick={() => onDelete(v.key)} className="p-1.5 rounded text-gray-600 hover:text-red-400 hover:bg-red-500/10 transition-colors"><Trash2 size={12} /></button>
@@ -334,7 +334,7 @@ const DevSettings = memo(function DevSettings({ showToast }) {
       </div>
 
       {/* Embedding Model */}
-      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.teal}15` }}>
+      <div className="rounded-xl p-4 flex items-center gap-3 flex-wrap sm:gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.teal}15` }}>
         <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.teal}10`, border: `1px solid ${NEON.teal}20` }}>
           <Cpu size={16} style={{ color: NEON.teal }} />
         </div>
@@ -342,7 +342,7 @@ const DevSettings = memo(function DevSettings({ showToast }) {
           <div className="text-sm font-semibold text-white">Embedding Model</div>
           <div className="text-xs text-gray-500 mt-0.5 truncate">Model used for semantic search & similarity</div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 flex-wrap">
           {editing.embeddingModel !== undefined ? (
             <>
               <input
@@ -493,7 +493,7 @@ export default function Settings() {
   return (
     <div className="space-y-5">
       {toast && (
-        <div className="fixed top-4 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold animate-pulse" style={{ background: toast.type === 'success' ? `${NEON.green}15` : toast.type === 'error' ? `${NEON.red}15` : `${NEON.cyan}15`, border: `1px solid ${toast.type === 'success' ? NEON.green : toast.type === 'error' ? NEON.red : NEON.cyan}40`, color: toast.type === 'success' ? NEON.green : toast.type === 'error' ? NEON.red : NEON.cyan }}>
+        <div className="fixed top-4 right-4 z-50 max-w-[calc(100vw-2rem)] flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold animate-pulse" style={{ background: toast.type === 'success' ? `${NEON.green}15` : toast.type === 'error' ? `${NEON.red}15` : `${NEON.cyan}15`, border: `1px solid ${toast.type === 'success' ? NEON.green : toast.type === 'error' ? NEON.red : NEON.cyan}40`, color: toast.type === 'success' ? NEON.green : toast.type === 'error' ? NEON.red : NEON.cyan }}>
           {toast.type === 'success' ? <CheckCircle size={14} /> : toast.type === 'error' ? <AlertTriangle size={14} /> : <Zap size={14} />}
           {toast.msg}
         </div>
@@ -563,7 +563,7 @@ export default function Settings() {
 
                <div className="flex items-center gap-2 flex-wrap">
                  {/* Single paste input */}
-                 <div className="flex-1 relative">
+                 <div className="flex-1 relative min-w-[220px]">
                    <Key size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600" />
                    <input
                      value={newKey}
@@ -607,7 +607,7 @@ export default function Settings() {
                      onChange={e => setNewVal(e.target.value)}
                      placeholder="Value"
                      type={newEncrypted ? 'password' : 'text'}
-                     className="flex-1 px-3 py-2.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none focus:ring-1 focus:ring-purple-500/20 transition-all"
+                      className="flex-1 min-w-[140px] px-3 py-2.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none focus:ring-1 focus:ring-purple-500/20 transition-all"
                      style={{ border: `1px solid #333` }}
                    />
                  )}

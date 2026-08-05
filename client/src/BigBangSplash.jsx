@@ -269,7 +269,7 @@ export default function BigBangSplash({ onDone }) {
           style={{ transform: logoIn ? 'none' : 'scale(1.12)' }}
         >
           <div
-            className="text-4xl md:text-6xl font-black tracking-[0.22em] pl-[0.22em] font-hud"
+            className="text-3xl md:text-6xl font-black tracking-[0.15em] md:tracking-[0.22em] pl-[0.15em] md:pl-[0.22em] font-hud whitespace-nowrap px-2"
             style={{
               background: `linear-gradient(135deg, ${NEON.cyan}, ${NEON.blue})`,
               WebkitBackgroundClip: 'text',

@@ -1306,10 +1306,10 @@ useEffect(() => {
    {/* Selected node detail panel */}
    {selectedNode && (
     <div className="rounded-xl p-4" style={{ background: `${BG.card}f5`, border: `1px solid ${(GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color}20` }}>
-     <div className="flex items-center justify-between mb-3">
-      <div className="flex items-center gap-2.5">
-       <span className="w-3.5 h-3.5 rounded-full" style={{ background: (GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color, boxShadow: `0 0 8px ${(GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color}60` }} />
-       <h3 className="text-sm font-bold text-white font-hud">{selectedNode.name}</h3>
+     <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
+      <div className="flex items-center gap-2.5 min-w-0">
+       <span className="w-3.5 h-3.5 rounded-full shrink-0" style={{ background: (GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color, boxShadow: `0 0 8px ${(GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color}60` }} />
+       <h3 className="text-sm font-bold text-white font-hud truncate">{selectedNode.name}</h3>
        <span className="px-2 py-0.5 rounded text-[10px] font-medium" style={{
         background: `${(GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color}12`,
         color: (GROUP_STYLE[selectedNode.group] || GROUP_STYLE.system).color,

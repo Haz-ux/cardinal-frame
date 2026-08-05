@@ -172,7 +172,7 @@ export default function PersonasPanel() {
           {error && <span className="text-[11px]" style={{ color: NEON.red }}>{error}</span>}
           {status && <span className="text-[11px]" style={{ color: NEON.green }}>{status}</span>}
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <button onClick={save} disabled={saving}
               className="flex items-center gap-2 px-4 py-2 rounded-lg text-[11px] font-bold transition-all"
               style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}40`, color: NEON.green, cursor: saving ? 'not-allowed' : 'pointer' }}>
@@ -183,7 +183,7 @@ export default function PersonasPanel() {
               style={{ background: `${NEON.red}10`, border: `1px solid ${NEON.red}30`, color: NEON.red, cursor: saving ? 'not-allowed' : 'pointer' }}>
               <RotateCcw size={13} /> Reset to Default
             </button>
-            <span className="text-[10px] flex items-center gap-1" style={{ color: '#555' }}>
+            <span className="w-full sm:w-auto text-[10px] flex items-center gap-1" style={{ color: '#555' }}>
               <Wand2 size={11} /> Rename to change the AI name everywhere.
             </span>
           </div>

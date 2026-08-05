@@ -162,7 +162,7 @@ function AimiIntentBox({ type, onGenerated }) {
           outline: 'none',
         }}
       />
-      <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+      <div style={{ display: 'flex', gap: '8px', marginTop: '8px', flexWrap: 'wrap' }}>
         <button onClick={generate} disabled={loading || !prompt.trim()}
           style={btnStyle(NEON.purple, loading || !prompt.trim())}>
           {loading ? <Loader size={14} className="animate-spin" /> : <Zap size={14} />}
@@ -235,7 +235,7 @@ function ChainEditor({ chain, type, availableSkills, availableTools, onSave, onC
 
   return (
     <div style={{ border: `1px solid ${NEON.cyan}40`, borderRadius: '10px', padding: '16px', background: 'rgba(0,0,0,0.4)' }}>
-      <div style={{ display: 'flex', gap: '12px', marginBottom: '12px' }}>
+      <div style={{ display: 'flex', gap: '12px', marginBottom: '12px', flexWrap: 'wrap' }}>
         <input value={name} onChange={e => setName(e.target.value)} placeholder="chain-name"
           style={inputStyle(NEON.cyan)} />
         <input value={description} onChange={e => setDescription(e.target.value)} placeholder="Description"
@@ -269,7 +269,7 @@ function ChainEditor({ chain, type, availableSkills, availableTools, onSave, onC
         </div>
       ))}
 
-      <div style={{ display: 'flex', gap: '8px' }}>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
         <button onClick={addStep} style={btnStyle(NEON.cyan, false)}><Plus size={14} /><span style={{ marginLeft: '4px' }}>Add Step</span></button>
         <button onClick={() => onSave({ name, description, steps })} disabled={!name}
           style={btnStyle(NEON.green, !name)}>Save</button>
@@ -282,6 +282,7 @@ function ChainEditor({ chain, type, availableSkills, availableTools, onSave, onC
 // ─── Helpers ──────────────────────────────────────────────────
 const inputStyle = (color) => ({
   flex: 1,
+  minWidth: 0,
   background: 'rgba(0,0,0,0.5)',
   border: `1px solid ${color}30`,
   borderRadius: '4px',
@@ -450,7 +451,7 @@ export default function Chains() {
       {/* Chain List + Detail */}
       <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
         {/* Left: Chain List */}
-        <div style={{ flex: '0 0 300px' }}>
+        <div style={{ flex: '1 1 300px' }}>
           <button onClick={() => { setCreating(true); setSelected(null); setEditing(false); }}
             style={btnStyle(NEON.green, false)}><Plus size={14} /><span style={{ marginLeft: '4px' }}>New {tab} chain</span></button>
 

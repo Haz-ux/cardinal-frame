@@ -109,7 +109,7 @@ export default function AuditLog() {
                 <span className="text-xs font-semibold w-28 truncate" style={{ color }}>{entry.action}</span>
                 <span className="flex-1 text-xs truncate" style={{ color: '#888' }}>{entry.target_type} {entry.target_id ? `→ ${entry.target_id.slice(0,8)}` : ''}</span>
                 <span className="text-xs hidden sm:block" style={{ color: '#555' }}>{entry.user_id || 'system'}</span>
-                <span className="text-[10px] font-mono shrink-0" style={{ color: '#444' }}>{entry.timestamp || entry.created_at ? new Date(entry.timestamp || entry.created_at).toLocaleString() : '—'}</span>
+                <span className="text-[10px] font-mono shrink-0 hidden sm:block" style={{ color: '#444' }}>{entry.timestamp || entry.created_at ? new Date(entry.timestamp || entry.created_at).toLocaleString() : '—'}</span>
                 {isExpanded ? <ChevronUp size={12} style={{ color: '#555' }} /> : <ChevronDown size={12} style={{ color: '#555' }} />}
               </div>
               {isExpanded && (

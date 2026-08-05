@@ -360,7 +360,7 @@ export default function Plugins() {
            style={{ background: 'rgba(0,0,0,0.4)', border: `1px solid ${NEON.pink}15`, outline: 'none' }} />
        </div>
        {/* Plugin list */}
-       <div className="rounded-xl overflow-hidden" style={{ background: 'rgba(10,10,20,0.9)', border: '1px solid rgba(0,240,255,0.1)' }}>
+       <div className="rounded-xl overflow-x-auto" style={{ background: 'rgba(10,10,20,0.9)', border: '1px solid rgba(0,240,255,0.1)' }}>
          {filtered.length === 0 ? (
            <div className="text-center py-12" style={{ color: '#444' }}>
              <Puzzle size={32} className="mx-auto mb-2 opacity-30" />No plugins installed.
@@ -372,12 +372,12 @@ export default function Plugins() {
            const config = parseConfig(plugin);
            return (
              <div key={plugin.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-               <div className="flex items-center gap-3 px-4 py-3 transition-colors cursor-pointer"
-                 onClick={() => setExpandedId(isExpanded ? null : plugin.id)}>
-                 <Package size={14} style={{ color: s.color }} />
-                 <span className="flex-1 text-sm font-semibold" style={{ color: '#ddd' }}>{plugin.name}</span>
-                 {plugin.loaded && <span className="text-[10px] font-semibold" style={{ color: NEON.green }}>● loaded</span>}
-                 <span className="text-xs" style={{ color: '#555' }}>v{plugin.version || '0.0.0'}</span>
+                <div className="flex items-center gap-3 px-4 py-3 transition-colors cursor-pointer flex-wrap"
+                  onClick={() => setExpandedId(isExpanded ? null : plugin.id)}>
+                  <Package size={14} style={{ color: s.color }} />
+                  <span className="flex-1 min-w-0 text-sm font-semibold truncate" style={{ color: '#ddd' }}>{plugin.name}</span>
+                  {plugin.loaded && <span className="text-[10px] font-semibold hidden sm:block" style={{ color: NEON.green }}>● loaded</span>}
+                  <span className="text-xs hidden sm:block" style={{ color: '#555' }}>v{plugin.version || '0.0.0'}</span>
                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: s.bg, color: s.color, border: `1px solid ${s.border}` }}>
                    {isEnabled ? 'active' : 'inactive'}
                  </span>
