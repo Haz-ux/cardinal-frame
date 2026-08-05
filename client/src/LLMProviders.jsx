@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, memo } from 'react';
 import { api } from './AuthContext';
-import { cachedFetch } from './dataCache';
+import { cachedFetch, invalidateCache } from './dataCache';
 import { usePolling } from './usePolling';
 import { Cpu, Plus, Trash2, Search, Key, RefreshCw, ToggleLeft, ToggleRight, Eye, EyeOff, Star, Zap, X, Download, ChevronDown, Check, Settings, Layers, FlipHorizontal, AlertTriangle } from 'lucide-react';
 
@@ -178,10 +178,13 @@ const FlipProviderCard = memo(function FlipProviderCard({ provider, providerMode
   <button onClick={() => onDelete(provider.id)} title="Delete" className="p-1 rounded text-gray-500 hover:text-red-400 hover:bg-white/5"><Trash2 size={12} /></button>
   </div>
   </div>
-  <div className="flex items-center gap-3 text-xs mb-2">
-  <button onClick={() => onEditKey(provider)} className="flex items-center gap-1 px-2 py-0.5 rounded-lg hover:bg-white/5 transition-colors" style={{ color: provider.has_key ? NEON.green : NEON.red }}><Key size={10} />{provider.has_key ? 'Key set' : 'No key'}</button>
-  <span className="text-gray-500">{providerModels.length} models</span>
-  </div>
+   <div className="flex items-center gap-3 text-xs mb-2">
+   <button onClick={() => onEditKey(provider)} className="flex items-center gap-1 px-2 py-0.5 rounded-lg hover:bg-white/5 transition-colors" style={{ color: provider.has_key ? NEON.green : NEON.red }}><Key size={10} />{provider.has_key ? 'Key set' : 'No key'}</button>
+   <span className="text-gray-500">{providerModels.length} models</span>
+   {providerModels.find(m => m.is_default) && (
+   <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full truncate max-w-[140px]" title="Default model" style={{ background: `${NEON.yellow}15`, border: `1px solid ${NEON.yellow}30`, color: NEON.yellow }}><Star size={9} className="shrink-0" />{providerModels.find(m => m.is_default).display_name || providerModels.find(m => m.is_default).model_id}</span>
+   )}
+   </div>
   {provider.has_key && provider.enabled && (
   <button onClick={() => onDetect(provider)} disabled={isDetecting} className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-all hover:brightness-125 w-full" style={{ background: `${color}10`, border: `1px solid ${color}25`, color }}>
   <RefreshCw size={10} className={isDetecting ? 'animate-spin' : ''} /> {isDetecting ? 'Detecting...' : 'Detect Models'}
@@ -200,19 +203,18 @@ const FlipProviderCard = memo(function FlipProviderCard({ provider, providerMode
   <button onClick={() => setFlipped(false)} className="p-1 rounded text-gray-500 hover:text-cyan-400 hover:bg-white/5"><FlipHorizontal size={12} /></button>
   </div>
   <div className="overflow-y-auto max-h-36 space-y-0.5" style={{ scrollbarWidth: 'thin', scrollbarColor: `${color}22 transparent` }}>
-  {providerModels.length === 0 ? (
-  <div className="text-[10px] text-gray-600 text-center py-4">No models detected</div>
-  ) : providerModels.map(m => (
-  <div key={m.id} className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-white/5 transition-colors group/model">
-  {m.is_default ? <Star size={9} style={{ color: NEON.yellow, filter: `drop-shadow(0 0 3px ${NEON.yellow})` }} /> : <span className="w-[9px]" />}
-  <span className="flex-1 truncate text-[11px] font-mono text-gray-300">{m.display_name || m.model_id}</span>
-  {m.context_window && <span className="text-[9px] text-gray-500">{(m.context_window/1000).toFixed(0)}k</span>}
-  <div className="opacity-0 group-hover/model:opacity-100 flex items-center gap-0.5 transition-opacity">
-  {!m.is_default && <button onClick={() => onSetDefault(m.id)} className="p-0.5 text-gray-600 hover:text-yellow-400"><Star size={9} /></button>}
-  <button onClick={() => onDeleteModel(m.id)} className="p-0.5 text-gray-600 hover:text-red-400"><Trash2 size={9} /></button>
-  </div>
-  </div>
-  ))}
+   {providerModels.length === 0 ? (
+   <div className="text-[10px] text-gray-600 text-center py-4">No models detected</div>
+   ) : providerModels.map(m => (
+   <div key={m.id} className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-white/5 transition-colors">
+   {m.is_default ? <Star size={10} className="shrink-0" style={{ color: NEON.yellow, filter: `drop-shadow(0 0 3px ${NEON.yellow})` }} /> : (
+   <button onClick={() => onSetDefault(m.id)} title="Set as default" className="shrink-0 p-0.5 rounded text-gray-500 hover:text-yellow-400 hover:bg-yellow-400/10"><Star size={10} /></button>
+   )}
+   <span className="flex-1 truncate text-[11px] font-mono text-gray-300">{m.display_name || m.model_id}</span>
+   {m.context_window && <span className="text-[9px] text-gray-500">{(m.context_window/1000).toFixed(0)}k</span>}
+   <button onClick={() => onDeleteModel(m.id)} title="Delete model" className="p-0.5 rounded text-gray-600 hover:text-red-400 hover:bg-red-500/10"><Trash2 size={9} /></button>
+   </div>
+   ))}
   </div>
   </div>
  </div>
@@ -231,11 +233,14 @@ export default function LLMProviders() {
   const [detecting, setDetecting] = useState({});
   const [detectError, setDetectError] = useState(null);
 
- const load = useCallback(() => {
- cachedFetch('/api/llm/providers').then(setProviders).catch(() => {});
- cachedFetch('/api/llm/models').then(setModels).catch(() => {});
- cachedFetch('/api/llm/models/default').then(setDefaultModel).catch(() => {});
- }, []);
+  const load = useCallback(() => {
+  invalidateCache('/api/llm/providers');
+  invalidateCache('/api/llm/models');
+  invalidateCache('/api/llm/models/default');
+  cachedFetch('/api/llm/providers').then(setProviders).catch(() => {});
+  cachedFetch('/api/llm/models').then(setModels).catch(() => {});
+  cachedFetch('/api/llm/models/default').then(setDefaultModel).catch(() => {});
+  }, []);
 
  usePolling(load, 60000);
 
