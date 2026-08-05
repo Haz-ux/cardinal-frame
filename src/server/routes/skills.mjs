@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { runSandboxed, runSandboxedHybrid } from './sandbox.mjs';
 import { executeInDocker, isDockerAvailable } from './docker-backend.mjs';
 import { checkProposalContent } from '../skill-safety.mjs';
+import { reinforcePattern } from '../learn.mjs';
 
 /**
  * Skills API routes + shared skill execution engine.
@@ -175,6 +176,13 @@ export async function executeSkill(skill, input = {}, traceId = null) {
     // Non-fatal — don't fail the skill execution if logging fails
     console.error('[skill-invocations] Failed to log:', logErr.message);
   }
+
+  // Close the learning loop: real usage reinforces (or decays) the pattern this
+  // auto-learned skill came from.
+  try {
+    stmts.skills.updateRunCounts?.run(result.ok ? 1 : 0, result.ok ? 0 : 1, skill.id);
+    reinforcePattern(stmts, skill.id, result.ok);
+  } catch { /* non-fatal */ }
 
   return result;
 }

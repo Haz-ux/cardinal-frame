@@ -2,6 +2,9 @@ import express from 'express';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { getModelCost } from './costs.mjs';
 import { applyPersona, DEFAULT_PERSONA, listPersonas } from '../personas.mjs';
+import { autoObserve } from '../learn.mjs';
+
+export { autoObserve };
 
 /**
  * Chat completions proxy: routes chat requests to the user's selected
@@ -29,43 +32,6 @@ export function findFallbackProvider(stmts, excludeProviderId) {
     }
   }
   return null;
-}
-
-export function autoObserve(stmts, broadcast, logger, randomUUID, conversation_id, messages, assistantContent, modelId) {
-  try {
-    const lastUserMsg = messages?.filter(m => m.role === 'user').pop();
-    if (!lastUserMsg || !assistantContent) return;
-    const userInput = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : JSON.stringify(lastUserMsg.content || '');
-    const inputLower = userInput.toLowerCase();
-    let intent = 'general';
-    if (/deploy|build|stag|prod/.test(inputLower)) intent = 'deploy-build';
-    else if (/search|find|look for|where/.test(inputLower)) intent = 'search';
-    else if (/create|make|new|add/.test(inputLower)) intent = 'create';
-    else if (/delete|remove|clean/.test(inputLower)) intent = 'delete';
-    else if (/status|health|check|monitor/.test(inputLower)) intent = 'monitor';
-    else if (/explain|what|how|why|describe/.test(inputLower)) intent = 'query';
-    const obsId = randomUUID();
-    stmts.observations.insert.run(obsId, conversation_id || null, userInput, assistantContent, intent, '[]', null, 0);
-    const words = inputLower.split(/\s+/).filter(w => w.length > 3);
-    const patternKey = words.slice(0, 4).join(' ');
-    if (patternKey.length > 10) {
-      const existing = stmts.patterns.getByKey.get(patternKey);
-      if (existing) {
-        const newCount = existing.occurrence_count + 1;
-        const newConfidence = Math.min(0.99, existing.confidence + 0.05);
-        stmts.patterns.increment.run(newConfidence, existing.id);
-        broadcast('learn:pattern', { id: existing.id, pattern_key: patternKey, occurrence_count: newCount, confidence: newConfidence });
-      } else {
-        const patternId = randomUUID();
-        stmts.patterns.insert.run(patternId, patternKey, intent, `Recurring: "${patternKey}"`, 0.3);
-        broadcast('learn:pattern', { id: patternId, pattern_key: patternKey, pattern_type: intent, occurrence_count: 1, confidence: 0.3 });
-      }
-    }
-    broadcast('learn:observation', { id: obsId, intent, conversation_id });
-    logger.info(`Aimi observed: intent=${intent}, pattern="${patternKey}"`);
-  } catch (err) {
-    logger.error('Auto-observe error:', err.message);
-  }
 }
 
 export default function chatCompletionsRoutes(ctx) {

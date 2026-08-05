@@ -61,6 +61,7 @@ import { PluginLoader } from './plugins.mjs';
 import { evaluate as wardenEvaluate } from './warden.mjs';
 import { executeSkillChain } from './chains.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
+import { LearnLoopDaemon } from './learning-loop.mjs';
 import { initNodeRegistry } from './node-registry.mjs';
 import { runMigrations } from './migrator.mjs';
 
@@ -905,6 +906,7 @@ const stmts = {
       update: db.prepare('UPDATE skills SET description = ?, category = ?, parameters = ?, enabled = ? WHERE id = ?'),
       delete: db.prepare('DELETE FROM skills WHERE id = ?'),
       updateConfidence: db.prepare('UPDATE skills SET confidence = ?, success_count = ?, failure_count = ? WHERE id = ?'),
+      updateRunCounts: db.prepare('UPDATE skills SET success_count = success_count + ?, failure_count = failure_count + ? WHERE id = ?'),
       getAutoProposed: db.prepare('SELECT * FROM skills WHERE auto_proposed = 1 ORDER BY confidence DESC'),
       insertWithConfidence: db.prepare('INSERT INTO skills (id, name, description, category, handler, parameters, enabled, confidence, auto_proposed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
       getAllWithTrigger: db.prepare("SELECT * FROM skills WHERE enabled = 1 AND trigger != '' ORDER BY confidence DESC"),
@@ -969,6 +971,7 @@ const stmts = {
       patterns: {
         insert: db.prepare('INSERT INTO learn_patterns (id, pattern_key, pattern_type, description, occurrence_count, confidence) VALUES (?, ?, ?, ?, 1, ?)'),
         getByKey: db.prepare('SELECT * FROM learn_patterns WHERE pattern_key = ?'),
+        getByAutoSkill: db.prepare('SELECT * FROM learn_patterns WHERE auto_skill_id = ?'),
         getAll: db.prepare('SELECT * FROM learn_patterns ORDER BY occurrence_count DESC, confidence DESC'),
         increment: db.prepare('UPDATE learn_patterns SET occurrence_count = occurrence_count + 1, last_seen = datetime(\'now\'), confidence = ? WHERE id = ?'),
         updateConfidence: db.prepare('UPDATE learn_patterns SET confidence = ?, auto_skill_id = ? WHERE id = ?'),
@@ -1931,6 +1934,15 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
    );
    heartbeat.start(parseInt(process.env.HEARTBEAT_INTERVAL || '60') * 1000);
    globalThis._heartbeat = heartbeat;
+
+   // Start the Aimi learning loop daemon — promotes recurring patterns into
+   // auto-learned skills on an interval (throttled per hour).
+   const learnLoop = new LearnLoopDaemon(
+     { stmts, logger, randomUUID, broadcast },
+     { intervalMs: parseInt(process.env.LEARN_LOOP_INTERVAL || '300') * 1000 }
+   );
+   learnLoop.start();
+   globalThis._learnLoop = learnLoop;
   });
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));

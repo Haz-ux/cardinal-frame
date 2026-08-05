@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload, detectModelsFromProvider } from './llm-helpers.mjs';
+import { autoObserve } from '../learn.mjs';
 
 /**
  * Aimi routes: built-in system tools, system prompt builder, and the smart
@@ -58,6 +59,8 @@ export function buildAimiSystemPrompt(stmts, userId) {
   const providers = stmts.providers.getAll.all().filter(p => p.enabled);
   const tools = stmts.tools.getEnabled.all();
   const schedules = stmts.schedules.getAll.all();
+  const learnedPatterns = (stmts.patterns?.getAll.all() || []).slice(0, 8);
+  const learnedSkills = (stmts.skills?.getAutoProposed.all() || []).filter(s => s.success_count > 0).slice(0, 8);
 
   const activeAgents = agents.filter(a => a.status === 'active').length;
   const pendingTasks = tasks.filter(t => t.status === 'pending').length;
@@ -70,6 +73,11 @@ export function buildAimiSystemPrompt(stmts, userId) {
  - Tasks: ${tasks.length} total, ${pendingTasks} pending, ${runningTasks} running
  - LLM Providers: ${providers.length} enabled
  - Schedules: ${schedules.length} configured
+
+ ## What You've Learned
+ - Recurring patterns: ${learnedPatterns.length ? learnedPatterns.map(p => `"${p.pattern_key}" (${p.pattern_type}, x${p.occurrence_count}, ${Math.round((p.confidence || 0) * 100)}%)`).join('; ') : 'none yet — keep chatting and patterns will emerge'}
+ - Validated auto-learned skills: ${learnedSkills.length ? learnedSkills.map(s => `${s.name} (${s.description || ''})`).join('; ') : 'none yet'}
+ - The learning loop promotes a recurring pattern into an auto-learned skill when it recurs 3+ times with confidence ≥ 60%. When a user repeats something you've seen before, reference what you learned.
 
  ## Your Capabilities
  You can perform real actions on the Cardinal Frame system. When the user asks you to do something, you should use the available tools to accomplish it.
@@ -268,6 +276,7 @@ export default function aimiRoutes(ctx) {
         db.prepare("UPDATE chat_conversations SET updated_at = datetime('now') WHERE id = ?").run(conversation_id);
         fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content: fullContent, model: modelId });
       }
+      autoObserve(stmts, broadcast, logger, randomUUID, conversation_id, [{ role: 'user', content: message }], fullContent, modelId);
       res.end();
     } catch (err) {
       logger.error('Aimi chat error:', err);

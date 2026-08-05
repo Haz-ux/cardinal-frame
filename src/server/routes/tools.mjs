@@ -4,6 +4,8 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
 import path from 'path';
 import { runSandboxed } from './sandbox.mjs';
+import { runLearnLoop } from '../learning-loop.mjs';
+import { reinforcePattern } from '../learn.mjs';
 
 /**
  * Tools routes: CRUD tools, self-learning API, AI system tool endpoints.
@@ -112,6 +114,18 @@ export default function toolsRoutes(ctx) {
       validated_skills: validatedSkills,
       avg_pattern_confidence: Math.round(avgConfidence * 100) / 100,
     });
+  });
+
+  // POST /learn/run-loop — run one learning pass now (promote the most mature
+  // recurring pattern into an auto-learned skill). Admin-only; the background
+  // daemon calls the same logic on an interval.
+  router.post('/learn/run-loop', authMiddleware, requireRole('admin'), apiLimiter, async (_req, res) => {
+    const result = await runLearnLoop({ db, stmts, randomUUID, broadcast, audit, logger });
+    if (!result) {
+      const patterns = stmts.patterns.getAll.all();
+      return res.json({ promoted: false, reason: 'No mature pattern eligible for promotion (need >=3 occurrences and >=60% confidence)', pattern_count: patterns.length });
+    }
+    res.json({ promoted: true, ...result });
   });
 
   router.post('/skills/auto-propose', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
@@ -224,6 +238,7 @@ export default function toolsRoutes(ctx) {
     const newFailureCount = skill.failure_count + (passed ? 0 : 1);
     const newConfidence = total > 0 ? Math.round((passCount / total) * 100) / 100 : skill.confidence;
     stmts.skills.updateConfidence.run(newConfidence, newSuccessCount, newFailureCount, skill.id);
+    reinforcePattern(stmts, skill.id, !!passed);
 
     broadcast('skill:validated', { skill_id: skill.id, validation_id: validationId, passed, confidence: newConfidence });
 
@@ -255,6 +270,7 @@ export default function toolsRoutes(ctx) {
     const newConfidence = total > 0 ? Math.round((newSuccessCount / total) * 100) / 100 : skill.confidence;
 
     stmts.skills.updateConfidence.run(newConfidence, newSuccessCount, newFailureCount, skill.id);
+    reinforcePattern(stmts, skill.id, !!success);
     broadcast('skill:feedback', { skill_id: skill.id, success, confidence: newConfidence });
 
     res.json({ skill_id: skill.id, confidence: newConfidence, success_count: newSuccessCount, failure_count: newFailureCount });
