@@ -19,8 +19,8 @@ function CreateUserModal({ onClose, onCreated }) {
    setLoading(false);
  };
  return (
-   <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
-     <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.pink}30` }} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.pink}30` }} onClick={e => e.stopPropagation()}>
        <h3 className="text-lg font-bold mb-4" style={{ color: NEON.pink }}>Create User</h3>
        <form onSubmit={handleSubmit} className="space-y-3">
          <div>
@@ -94,7 +94,7 @@ export default function Users() {
          style={{ background: 'rgba(0,0,0,0.4)', border: `1px solid ${NEON.pink}15`, outline: 'none' }} />
      </div>
      {/* User table */}
-     <div className="rounded-xl overflow-hidden" style={{ background: 'rgba(10,10,20,0.9)', border: '1px solid rgba(0,240,255,0.1)' }}>
+      <div className="rounded-xl overflow-x-auto" style={{ background: 'rgba(10,10,20,0.9)', border: '1px solid rgba(0,240,255,0.1)' }}>
        <div className="flex items-center gap-3 px-4 py-2.5 text-xs font-semibold tracking-wider uppercase" style={{ color: '#555', borderBottom: '1px solid rgba(0,240,255,0.08)' }}>
          <span className="w-8"></span><span className="flex-1">Username</span><span className="w-24">Role</span><span className="w-32 hidden sm:block">Created</span><span className="w-16">Actions</span>
        </div>

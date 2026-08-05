@@ -378,7 +378,7 @@ const DevSettings = memo(function DevSettings({ showToast }) {
             <div className="text-xs text-gray-500 mt-0.5">Requests per minute, per tier</div>
           </div>
         </div>
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
           {[
             { label: 'Auth', value: '20/min', color: NEON.cyan },
             { label: 'Writes', value: '50/min', color: NEON.blue },
@@ -561,7 +561,7 @@ export default function Settings() {
                  <span className="text-sm font-semibold text-white">Add API Key</span>
                </div>
 
-               <div className="flex items-center gap-2">
+               <div className="flex items-center gap-2 flex-wrap">
                  {/* Single paste input */}
                  <div className="flex-1 relative">
                    <Key size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600" />

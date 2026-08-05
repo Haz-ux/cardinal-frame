@@ -26,8 +26,8 @@ function RegisterModal({ onClose, onCreated }) {
     setLoading(false);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.blue}30` }} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.blue}30` }} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-bold mb-4" style={{ color: NEON.blue }}>Register Agent</h3>
         <form onSubmit={handleSubmit} className="space-y-3">
           <div><label className="text-xs text-gray-400 mb-1 block">Name</label><input value={name} onChange={e => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.blue}20` }} placeholder="e.g. data-processor" /></div>

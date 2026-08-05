@@ -31,8 +31,8 @@ function CreateScheduleModal({ onClose, onCreated, tasks }) {
   };
   const presets = [{ label: 'Every 5 min', cron: '*/5 * * * *' }, { label: 'Hourly', cron: '0 * * * *' }, { label: 'Daily midnight', cron: '0 0 * * *' }, { label: 'Weekly Mon 9am', cron: '0 9 * * 1' }];
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-bold mb-4" style={{ color: NEON.cyan }}>New Schedule</h3>
         <form onSubmit={handleSubmit} className="space-y-3">
           <div><label className="text-xs text-gray-400 mb-1 block">Name</label><input value={name} onChange={e => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.cyan}20` }} placeholder="e.g. daily-sync" /></div>

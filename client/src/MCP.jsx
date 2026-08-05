@@ -17,8 +17,8 @@ function ConnectModal({ onClose, onCreated }) {
     setLoading(false);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.purple}30` }} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.purple}30` }} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-bold mb-4" style={{ color: NEON.purple }}>Connect MCP Server</h3>
         <form onSubmit={handleSubmit} className="space-y-3">
           <div><label className="text-xs text-gray-400 mb-1 block">Name</label><input value={name} onChange={e => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.purple}20` }} placeholder="e.g. filesystem" /></div>
@@ -54,7 +54,7 @@ export default function MCP() {
       {filtered.length === 0 ? (
         <div className="text-center py-12 text-gray-600"><Cable size={32} className="mx-auto mb-2 opacity-30" />No MCP servers connected.</div>
       ) : (
-        <div className="rounded-xl overflow-hidden" style={{ background: 'rgba(10,10,20,0.9)', border: `1px solid ${NEON.purple}15` }}>
+        <div className="rounded-xl overflow-x-auto" style={{ background: 'rgba(10,10,20,0.9)', border: `1px solid ${NEON.purple}15` }}>
           {filtered.map(server => {
             const isExpanded = expandedId === server.id;
             const statusColor = STATUS_COLORS[server.status] || '#555';

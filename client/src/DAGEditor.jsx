@@ -232,8 +232,8 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
-      <div className="w-full max-w-md rounded-xl p-6" style={{ background: `${BG.card}f8`, border: `1px solid ${NEON.purple}30` }} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: `${BG.card}f8`, border: `1px solid ${NEON.purple}30` }} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-bold mb-4" style={{ color: NEON.purple }}>Add DAG Node</h3>
         <form onSubmit={handleSubmit} className="space-y-3">
           <div>
@@ -886,7 +886,7 @@ export default function DAGEditor() {
               <button onClick={() => setSelectedId(null)} className="p-1 text-gray-600 hover:text-gray-400"><X size={14} /></button>
             </div>
           </div>
-          <div className="grid grid-cols-3 md:grid-cols-5 gap-3 text-xs">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
             <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{selectedNode.id?.slice(0, 12)}…</span></div>
             {(selectedNode.type === 'task' || selectedNode.type === 'trigger') && <div><span className="text-gray-500 block">Command</span><code style={{ color: NEON.green }}>{selectedNode.command || '—'}</code></div>}
             {selectedNode.type === 'transform' && <div><span className="text-gray-500 block">Expression</span><code style={{ color: NEON.purple }}>{selectedNode.command || '—'}</code></div>}

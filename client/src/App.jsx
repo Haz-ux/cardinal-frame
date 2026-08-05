@@ -278,7 +278,7 @@ function Layout() {
      </span>
     </div>
     {/* Scrollable page content */}
-    <div className="flex-1 p-6 overflow-auto">
+    <div className="flex-1 p-3 md:p-6 overflow-auto">
      <Suspense fallback={<PageLoader />}>
       <Routes>
        <Route path="/" element={<Dashboard />} />

@@ -448,7 +448,7 @@ export default function Chains() {
       <AimiIntentBox type={tab} onGenerated={loadChains} />
 
       {/* Chain List + Detail */}
-      <div style={{ display: 'flex', gap: '16px' }}>
+      <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
         {/* Left: Chain List */}
         <div style={{ flex: '0 0 300px' }}>
           <button onClick={() => { setCreating(true); setSelected(null); setEditing(false); }}

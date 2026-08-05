@@ -49,8 +49,8 @@ function InstallModal({ onClose, onInstalled }) {
    setLoading(false);
  };
  return (
-   <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
-     <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.pink}30` }} onClick={e => e.stopPropagation()}>
+   <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.pink}30` }} onClick={e => e.stopPropagation()}>
        <h3 className="text-lg font-bold mb-4" style={{ color: NEON.pink }}>Install Plugin</h3>
        {error && <div className="mb-3 px-3 py-2 rounded-lg text-xs" style={{ background: `${NEON.red}15`, border: `1px solid ${NEON.red}30`, color: NEON.red }}>{error}</div>}
        <form onSubmit={handleSubmit} className="space-y-3">
@@ -92,8 +92,8 @@ function AddSourceModal({ onClose, onAdded }) {
    setLoading(false);
  };
  return (
-   <div className="fixed inset-0 z-50 flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
-     <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
+   <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
        <h3 className="text-lg font-bold mb-4" style={{ color: NEON.cyan }}>Add Market Source</h3>
        {error && <div className="mb-3 px-3 py-2 rounded-lg text-xs" style={{ background: `${NEON.red}15`, border: `1px solid ${NEON.red}30`, color: NEON.red }}>{error}</div>}
        <form onSubmit={handleSubmit} className="space-y-3">

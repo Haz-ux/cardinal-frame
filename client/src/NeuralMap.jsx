@@ -352,7 +352,7 @@ export default function NeuralMap() {
   const obs = new ResizeObserver(entries => {
    if (entries[0]) {
     const { width, height } = entries[0].contentRect;
-    setDim({ w: Math.max(400, width), h: Math.max(300, height) });
+    setDim({ w: Math.max(280, width), h: Math.max(300, height) });
    }
   });
   if (containerRef.current) obs.observe(containerRef.current);
@@ -1059,7 +1059,7 @@ useEffect(() => {
       {filteredData.nodes.length} nodes · {filteredData.links.length} cords
      </span>
     </div>
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
      <button onClick={() => setPinMode(!pinMode)} className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all"
       style={{ background: pinMode ? `${NEON.green}10` : 'rgba(0,0,0,0.2)', border: `1px solid ${pinMode ? NEON.green + '30' : '#222'}`, color: pinMode ? NEON.green : '#555' }}
       title={pinMode ? 'Nodes pin where dropped' : 'Nodes float free after drag'}>
@@ -1298,7 +1298,7 @@ useEffect(() => {
     <Minimap fgRef={fgRef} graphData={filteredData} dim={dim} />
 
     {/* Hint */}
-    <div className="absolute top-3 right-3 text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded">
+    <div className="absolute top-3 right-3 text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded hidden md:block">
      Click hub to expand · Drag to pin · Double-click to release · Right-click to fit all
     </div>
    </div>

@@ -30,12 +30,12 @@ function AddProviderModal({ onClose, onCreated }) {
  };
 
  return (
- <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
- <div className="w-full max-w-md rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
+ <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={onClose}>
+ <div className="w-full max-w-md rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${NEON.cyan}30` }} onClick={e => e.stopPropagation()}>
  <h3 className="text-lg font-bold mb-4" style={{ color: NEON.cyan }}>Add LLM Provider</h3>
  <form onSubmit={handleSubmit} className="space-y-3">
  <div><label className="text-xs text-gray-400 mb-1 block">Provider Type</label>
- <div className="grid grid-cols-3 gap-1.5 max-h-48 overflow-y-auto p-1 rounded-lg bg-black/40" style={{ border: `1px solid ${NEON.cyan}15` }}>
+ <div className="grid grid-cols-2 md:grid-cols-3 gap-1.5 max-h-48 overflow-y-auto p-1 rounded-lg bg-black/40" style={{ border: `1px solid ${NEON.cyan}15` }}>
  {types.map(t => (<button key={t} type="button" onClick={() => { setType(t); setBaseUrl(defaultUrls[t] || ''); }} className="px-2 py-1.5 text-xs rounded-lg transition-all capitalize hover:brightness-125" style={{ background: type === t ? `${PROVIDER_COLORS[t] || NEON.cyan}20` : 'rgba(0,0,0,0.3)', border: `1px solid ${type === t ? (PROVIDER_COLORS[t] || NEON.cyan) : '#222'}`, color: type === t ? (PROVIDER_COLORS[t] || NEON.cyan) : '#888' }}>{t}</button>))}
  </div></div>
  <div><label className="text-xs text-gray-400 mb-1 block">Display Name</label><input value={name} onChange={e => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.cyan}20` }} placeholder="e.g. My OpenAI" /></div>
@@ -62,8 +62,8 @@ function EditKeyModal({ provider, onClose, onSaved }) {
  };
  const color = PROVIDER_COLORS[provider.type] || NEON.cyan;
  return (
- <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={onClose}>
- <div className="w-full max-w-sm rounded-xl p-6" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${color}30` }} onClick={e => e.stopPropagation()}>
+ <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={onClose}>
+ <div className="w-full max-w-sm rounded-xl p-6 max-h-[90vh] overflow-y-auto" style={{ background: 'rgba(10,10,20,0.98)', border: `1px solid ${color}30` }} onClick={e => e.stopPropagation()}>
  <h3 className="text-lg font-bold mb-4" style={{ color }}>{provider.name} — API Key</h3>
  <form onSubmit={handleSubmit} className="space-y-3">
  <div className="relative"><input value={apiKey} onChange={e => setApiKey(e.target.value)} type={showKey ? 'text' : 'password'} className="w-full px-3 py-2 pr-10 rounded-lg text-sm text-white bg-black/40 outline-none font-mono" style={{ border: `1px solid ${color}20` }} placeholder="Enter API key..." /><button type="button" onClick={() => setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-gray-500 hover:text-gray-300">{showKey ? <EyeOff size={14} /> : <Eye size={14} />}</button></div>

@@ -654,7 +654,7 @@ export default function Dashboard() {
  return (
   <div className="space-y-5 fade-in">
    {/* ── Header ──────────────────────────────────────────────── */}
-   <div className="flex items-center gap-3 mb-2">
+   <div className="flex flex-wrap items-center gap-3 mb-2">
     <div className="flex items-center gap-2">
      <Sparkles size={20} style={{ color: NEON.green, filter: `drop-shadow(0 0 8px ${NEON.green})` }} />
      <h2 className="text-2xl font-bold font-hud" style={{
@@ -753,7 +753,7 @@ export default function Dashboard() {
    </div>
 
    {/* ── Footer status bar ───────────────────────────────────── */}
-   <div className="flex items-center justify-between px-4 py-2 text-xs neon-card font-hud" style={{ color: '#444' }}>
+   <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2 text-xs neon-card font-hud" style={{ color: '#444' }}>
     <div className="flex items-center gap-4">
      <span className="flex items-center gap-1">
       <Shield size={10} style={{ color: NEON.green }} /> Secure

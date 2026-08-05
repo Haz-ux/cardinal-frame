@@ -162,7 +162,7 @@ export const CodeSandboxBlock = memo(function CodeSandboxBlock({ initialCode = '
  return (
  <div className="rounded-xl overflow-hidden my-2" style={{ background: BG.card, border: `1px solid ${NEON.orange}20` }}>
   {/* Title bar */}
-  <div className="flex items-center gap-2 px-3 py-2" style={{ borderBottom: `1px solid ${NEON.orange}10` }}>
+   <div className="flex items-center gap-2 px-3 py-2 flex-wrap" style={{ borderBottom: `1px solid ${NEON.orange}10` }}>
   <Code size={13} style={{ color: NEON.orange, filter: `drop-shadow(0 0 3px ${NEON.orange})` }} />
   <span className="text-xs font-bold tracking-wider uppercase" style={{ color: '#888' }}>{title || `${language} Sandbox`}</span>
   <span className="text-[9px] px-1.5 py-0.5 rounded font-mono" style={{ background: `${NEON.orange}10`, color: NEON.orange, border: `1px solid ${NEON.orange}20` }}>{language}</span>

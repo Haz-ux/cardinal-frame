@@ -23,7 +23,8 @@ export default function Chat() {
   const [personas, setPersonas] = useState([]);
   const [selectedPersona, setSelectedPersona] = useState('aimi');
   const [showPersonaPicker, setShowPersonaPicker] = useState(false);
-const [sidebarOpen, setSidebarOpen] = useState(true);
+// Sidebar starts closed on phones (where it overlays the chat) and open on desktop.
+const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 768);
  const [attachments, setAttachments] = useState([]);
  const [showTools, setShowTools] = useState(false);
  const [showModelPicker, setShowModelPicker] = useState(false);
@@ -399,10 +400,14 @@ const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // ─── Render ────────────────────────────────────────────────────
   return (
-    <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
+    <div style={{ display: 'flex', height: '100%', minHeight: 0, position: 'relative' }}>
+      {/* Mobile backdrop — closes the conversation sidebar on tap */}
+      {sidebarOpen && (
+        <div className="md:hidden fixed inset-0 z-30 bg-black/60" onClick={() => setSidebarOpen(false)} />
+      )}
       {/* ── Sidebar: Conversations ── */}
       {sidebarOpen && (
-        <div style={{ width: 240, background: BG.surface, borderRight: `1px solid ${NEON.cyan}10`, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+        <div className="max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-2xl" style={{ width: 240, background: BG.surface, borderRight: `1px solid ${NEON.cyan}10`, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
           <div style={{ padding: '12px 12px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span style={{ color: NEON.cyan, fontWeight: 700, fontSize: 13, letterSpacing: 1 }}>CHATS</span>
             <button onClick={newConv} style={iconBtnStyle} title="New chat"><Plus size={16} /></button>
@@ -444,7 +449,7 @@ const [sidebarOpen, setSidebarOpen] = useState(true);
       {/* ── Main Chat Area ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       {/* Top bar */}
-      <div style={{ padding: '8px 16px', borderBottom: `1px solid ${NEON.cyan}10`, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+      <div style={{ padding: '8px 16px', borderBottom: `1px solid ${NEON.cyan}10`, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
       <span style={{ color: '#fff', fontWeight: 600, fontSize: 15 }}>{activeConv?.title || 'Cardinal Frame Chat'}</span>
       <div style={{ flex: 1 }} />
 
@@ -587,7 +592,7 @@ const [sidebarOpen, setSidebarOpen] = useState(true);
         )}
 
         {/* Messages area */}
-        <div style={{ flex: 1, overflow: 'auto', padding: '16px 20px' }}>
+        <div style={{ flex: 1, overflow: 'auto', padding: '12px 14px' }}>
         {/* FTS Context Breadcrumbs — shows injected context at conversation top */}
         <FTSBreadcrumbs conversationId={activeConv?.id} />
 

@@ -104,6 +104,7 @@ export const HardwareMonitor = memo(function HardwareMonitor({ contextUsage = { 
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 0,
+      flexWrap: 'wrap',
       background: `${BG.card}`, borderBottom: `1px solid ${NEON.cyan}10`,
       padding: '4px 14px', fontSize: 10, color: '#888',
       fontFamily: '"JetBrains Mono", "Fira Code", monospace',
