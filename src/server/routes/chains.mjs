@@ -72,6 +72,8 @@ export default function chainsRoutes(ctx) {
 
   // DELETE /api/chains/skills/:id
   router.delete('/chains/skills/:id', authMiddleware, (req, res) => {
+    if (!stmts.skillChains.getById.get(req.params.id)) return res.status(404).json({ error: 'Chain not found' });
+    stmts.chainExecutions?.deleteByChain?.run(req.params.id);
     stmts.skillChains.delete.run(req.params.id);
     res.json({ ok: true });
   });
@@ -206,6 +208,8 @@ export default function chainsRoutes(ctx) {
 
   // DELETE /api/chains/tools/:id
   router.delete('/chains/tools/:id', authMiddleware, (req, res) => {
+    if (!stmts.toolChains.getById.get(req.params.id)) return res.status(404).json({ error: 'Chain not found' });
+    stmts.chainExecutions?.deleteByChain?.run(req.params.id);
     stmts.toolChains.delete.run(req.params.id);
     res.json({ ok: true });
   });
@@ -226,7 +230,13 @@ export default function chainsRoutes(ctx) {
         const endpoint = step.endpoint || tool.endpoint;
         const url = `http://localhost:${PORT}${endpoint}`;
 
-        const fetchOpts = { method, headers: { 'Content-Type': 'application/json' } };
+        const fetchOpts = {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+          },
+        };
         if (method !== 'GET' && method !== 'HEAD') {
           fetchOpts.body = JSON.stringify(input || {});
         }

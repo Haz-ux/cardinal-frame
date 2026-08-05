@@ -1,7 +1,17 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { readFileSync } from 'node:fs';
+
+const rootPkg = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf-8')
+);
 
 export default defineConfig({
+  define: {
+    // Single source of truth for the app version — read from the repo's
+    // package.json at build time so it can never drift out of date again.
+    __APP_VERSION__: JSON.stringify(rootPkg.version),
+  },
   plugins: [react()],
   server: {
     port: 5173,

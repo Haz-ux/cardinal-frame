@@ -212,10 +212,16 @@ function AddNodeModal({ onClose, onAdded, existingNodes }) {
     setError('');
     try {
       const maxX = existingNodes.reduce((mx, n) => Math.max(mx, (n.x || 0) + NODE_W + 40), 40);
+      const y = 100 + Math.random() * 200;
+      const stepId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `step-${Date.now()}`;
       await api('/api/dags', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), type, command, edges: [], x: maxX, y: 100 + Math.random() * 200 }),
+        body: JSON.stringify({
+          name: name.trim(),
+          nodes: [{ id: stepId, name: name.trim(), type, command, x: maxX, y }],
+          edges: [],
+        }),
       });
       onAdded(); onClose();
     } catch (err) {
@@ -457,11 +463,23 @@ export default function DAGEditor() {
   const load = useCallback(() => {
     api('/api/dags').then(data => {
       const dagList = Array.isArray(data) ? data : (data.dags || []);
-      setNodes(dagList.map(n => ({ ...n, x: n.x ?? 80, y: n.y ?? 100 })));
+      setNodes(dagList.map(n => {
+        const step = (Array.isArray(n.nodes) && n.nodes[0]) || {};
+        return {
+          ...n,
+          type: n.type ?? step.type,
+          command: n.command ?? step.command,
+          x: step.x ?? n.x ?? 80,
+          y: step.y ?? n.y ?? 100,
+        };
+      }));
       const e = [];
       dagList.forEach(n => {
-        if (n.edges && Array.isArray(n.edges)) {
-          n.edges.forEach(targetId => { e.push({ from: n.id, to: targetId }); });
+        if (Array.isArray(n.edges)) {
+          n.edges.forEach(ed => {
+            if (ed && typeof ed === 'object' && ed.target) e.push({ from: ed.source || n.id, to: ed.target });
+            else e.push({ from: n.id, to: ed });
+          });
         }
       });
       setEdges(e);
@@ -503,10 +521,14 @@ export default function DAGEditor() {
       const adj = {};
       edges.forEach(e => { if (!adj[e.from]) adj[e.from] = []; adj[e.from].push(e.to); });
       for (const n of nodes) {
+        const step = (Array.isArray(n.nodes) && n.nodes[0]) || {};
         await api(`/api/dags/${n.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ edges: adj[n.id] || [], x: n.x, y: n.y }),
+          body: JSON.stringify({
+            nodes: [{ id: step.id || n.id, name: n.name, type: n.type || 'task', command: n.command || '', x: n.x ?? 80, y: n.y ?? 100 }],
+            edges: (adj[n.id] || []).map(to => ({ source: n.id, target: to })),
+          }),
         });
       }
       setValidation({ valid: true, issues: ['Saved successfully!'] });

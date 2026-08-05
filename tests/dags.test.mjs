@@ -241,6 +241,80 @@ describe('DAG API', () => {
       expect(runRes.body.layers).toBe(0);
     });
 
+    it('should ignore dangling edges (unknown endpoints) instead of crashing', async () => {
+      const createRes = await request(app)
+        .post('/api/dags')
+        .set(adminAuth())
+        .send({
+          name: 'Dangling Edge DAG',
+          nodes: [{ id: 'only-node', name: 'Solo', command: 'echo solo' }],
+          edges: [{ source: 'only-node', target: 'missing-node' }],
+        });
+      expect([200, 201]).toContain(createRes.status);
+      const id = createRes.body.id;
+
+      const runRes = await request(app)
+        .post(`/api/dags/${id}/run`)
+        .set(adminAuth());
+      expect([200, 202]).toContain(runRes.status);
+
+      const finalState = await waitForDagStatus(id);
+      expect(finalState.status).toBe('completed');
+    });
+
+    it('should run a single-node DAG created like the editor (step stored in nodes)', async () => {
+      const createRes = await request(app)
+        .post('/api/dags')
+        .set(adminAuth())
+        .send({
+          name: 'Editor Style DAG',
+          nodes: [{ id: 'editor-step-1', name: 'Editor Step', type: 'task', command: 'echo editor', x: 120, y: 80 }],
+          edges: [],
+        });
+      expect([200, 201]).toContain(createRes.status);
+      const id = createRes.body.id;
+
+      const runRes = await request(app)
+        .post(`/api/dags/${id}/run`)
+        .set(adminAuth());
+      expect([200, 202]).toContain(runRes.status);
+
+      const finalState = await waitForDagStatus(id);
+      expect(finalState.status).toBe('completed');
+      const result = JSON.parse(finalState.last_run_result);
+      expect(result).toHaveProperty('steps');
+      expect(result.steps).toHaveLength(1);
+      expect(result.steps[0].results[0]).toHaveProperty('status', 'success');
+    });
+
+    it('should preserve node metadata through PUT (editor save format)', async () => {
+      const createRes = await request(app)
+        .post('/api/dags')
+        .set(adminAuth())
+        .send({ name: 'Metadata DAG', nodes: [], edges: [] });
+      expect([200, 201]).toContain(createRes.status);
+      const id = createRes.body.id;
+
+      const putRes = await request(app)
+        .put(`/api/dags/${id}`)
+        .set(adminAuth())
+        .send({
+          nodes: [{ id: 'meta-step', name: 'Meta', type: 'delay', command: '', x: 300, y: 90 }],
+          edges: [{ source: 'meta-step', target: 'other-dag' }],
+        });
+      expect(putRes.status).toBe(200);
+
+      const getRes = await request(app).get(`/api/dags/${id}`);
+      expect(getRes.body.nodes[0]).toMatchObject({ id: 'meta-step', name: 'Meta', type: 'delay', x: 300, y: 90 });
+
+      const runRes = await request(app)
+        .post(`/api/dags/${id}/run`)
+        .set(adminAuth());
+      expect([200, 202]).toContain(runRes.status);
+      const finalState = await waitForDagStatus(id);
+      expect(finalState.status).toBe('completed');
+    });
+
     it('should mark DAG as completed on successful run (job queue path)', async () => {
       if (!runnableDagId) return;
       // Reset status and re-run to verify the job queue updates the dags table

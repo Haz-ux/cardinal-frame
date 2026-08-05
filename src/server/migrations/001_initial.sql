@@ -482,5 +482,5 @@ CREATE TABLE IF NOT EXISTS chain_executions (
   step_count INTEGER DEFAULT 0,
   error TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  FOREIGN KEY (chain_id) REFERENCES skill_chains(id)
+  FOREIGN KEY (chain_id) REFERENCES skill_chains(id) ON DELETE CASCADE
 );

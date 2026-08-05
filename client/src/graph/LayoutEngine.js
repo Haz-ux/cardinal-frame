@@ -26,7 +26,7 @@ import { createClusterSimulation } from './NodeSimulation.js';
 import { buildBoundaries, applyBoundaryCollision } from './CollisionEngine.js';
 import { categorizeLinks, groupIntraLinks } from './LinkRouter.js';
 import { clusterRadius } from './SectorLayout.js';
-import { LAYOUT_PARAMS, computeMetrics, computeDiagnostics } from './GraphMetrics.js';
+import { LAYOUT_PARAMS, computeMetrics, computeDiagnostics, GROUP_STYLE } from './GraphMetrics.js';
 
 export class LayoutEngine {
   constructor(opts = {}) {
@@ -298,10 +298,68 @@ export class LayoutEngine {
       );
     }
 
+    // Obsidian-style hard no-overlap guarantee. d3 forceCollide only runs
+    // inside each cluster's own simulation, so satellites from neighboring
+    // clusters can drift together across ring boundaries and overlap. This
+    // pass enforces the SAME minimum spacing globally (cross-cluster) and runs
+    // every frame — even at rest — so no two nodes can ever visually overlap.
+    // It only nudges pairs that are actually colliding, so settled layouts
+    // stay put.
+    this.resolveOverlaps(this.cache.allNodes());
+
     // Notify listeners
     this._notifyTick();
 
     return anyActive;
+  }
+
+  /**
+   * Obsidian-style no-overlap pass. Runs over ALL nodes (not just within one
+   * cluster's simulation) using the same collision radii d3 uses internally,
+   * so cross-cluster overlaps — ring edges of adjacent clusters, satellites
+   * pressed against a neighbor's hub — are eliminated.
+   *
+   * Only pairs closer than their combined collide radius are touched. Each is
+   * pushed apart by exactly the penetration depth, split evenly unless one
+   * side is pinned (fx/fy set). Settled layouts are untouched.
+   */
+  resolveOverlaps(nodes) {
+    const n = nodes.length;
+    for (let i = 0; i < n; i++) {
+      const a = nodes[i];
+      if (typeof a.x !== 'number' || !Number.isFinite(a.x) ||
+          typeof a.y !== 'number' || !Number.isFinite(a.y)) continue;
+      for (let j = i + 1; j < n; j++) {
+        const b = nodes[j];
+        if (typeof b.x !== 'number' || !Number.isFinite(b.x) ||
+            typeof b.y !== 'number' || !Number.isFinite(b.y)) continue;
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const dist = Math.hypot(dx, dy);
+        if (!(dist > 0.001) || !Number.isFinite(dist)) continue;
+        const ra = (GROUP_STYLE[a.group]?.size || 8) * 6 + 14;
+        const rb = (GROUP_STYLE[b.group]?.size || 8) * 6 + 14;
+        const min = ra + rb;
+        if (dist >= min) continue;
+        const push = min - dist;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const aFixed = typeof a.fx === 'number' || typeof a.fy === 'number';
+        const bFixed = typeof b.fx === 'number' || typeof b.fy === 'number';
+        if (!aFixed && !bFixed) {
+          a.x += nx * push * 0.5;
+          a.y += ny * push * 0.5;
+          b.x -= nx * push * 0.5;
+          b.y -= ny * push * 0.5;
+        } else if (!aFixed) {
+          a.x += nx * push;
+          a.y += ny * push;
+        } else if (!bFixed) {
+          b.x -= nx * push;
+          b.y -= ny * push;
+        }
+      }
+    }
   }
 
   /**

@@ -10,7 +10,8 @@ export default function stateRoutes(ctx) {
   const router = express.Router();
 
   const STATE_FILES_DIR = path.resolve(process.cwd(), 'state');
-  const STATE_FILES = ['MEMORY.md', 'PERSONA.md', 'CLAUDE.md', 'AGENTS.md'];
+  // CLAUDE.md and AGENTS.md serve the same purpose, so only AGENTS.md is kept.
+  const STATE_FILES = ['MEMORY.md', 'PERSONA.md', 'AGENTS.md'];
 
   // ─── State Files ──────────────────────────────────────────────
   router.get('/state', authMiddleware, async (_req, res) => {

@@ -3,8 +3,8 @@ import { api } from './AuthContext';
 import { cachedFetch } from './dataCache';
 import { useToast } from './ToastContext';
 import { NEON, BG, GLOW, STATUS } from './theme';
-import { MessageSquare, Plus, Trash2, Send, Paperclip, X, Bot, User, Wrench, Sparkles, ChevronLeft, ChevronRight, Cpu, Settings, Image, FileText, Code, Loader, Zap, ChevronDown, BookOpen, Database, PanelRightOpen, PanelRightClose, Brain, Eye } from 'lucide-react';
-import { FTSBreadcrumbs, StateViewer, TerminalAccordion, SubAgentMatrix, CodeSandboxBlock } from './ChatComponents';
+import { MessageSquare, Plus, Trash2, Send, Paperclip, X, Bot, User, Wrench, Sparkles, ChevronLeft, ChevronRight, Cpu, Settings, Image, FileText, Code, Loader, Zap, ChevronDown, BookOpen, PanelRightOpen, PanelRightClose, Brain, Eye } from 'lucide-react';
+import { FTSBreadcrumbs, TerminalAccordion, SubAgentMatrix, CodeSandboxBlock } from './ChatComponents';
 import { HardwareMonitor, EndpointSwitcher, ContextTrimVisualizer } from './ResilienceComponents';
 import { usePersonas } from './PersonaContext';
 import WorkPanel from './WorkPanel';
@@ -23,8 +23,7 @@ export default function Chat() {
   const [personas, setPersonas] = useState([]);
   const [selectedPersona, setSelectedPersona] = useState('aimi');
   const [showPersonaPicker, setShowPersonaPicker] = useState(false);
- const [sidebarOpen, setSidebarOpen] = useState(true);
- const [stateDrawerOpen, setStateDrawerOpen] = useState(false);
+const [sidebarOpen, setSidebarOpen] = useState(true);
  const [attachments, setAttachments] = useState([]);
  const [showTools, setShowTools] = useState(false);
  const [showModelPicker, setShowModelPicker] = useState(false);
@@ -484,14 +483,6 @@ export default function Chat() {
         })}
       </div>
       <div style={{ flex: 1 }} />
-      {/* State drawer toggle */}
-      <button onClick={() => setStateDrawerOpen(!stateDrawerOpen)} style={{
-      ...pillBtnStyle, background: stateDrawerOpen ? `${NEON.purple}15` : `${NEON.purple}08`,
-      border: `1px solid ${NEON.purple}${stateDrawerOpen ? '40' : '20'}`,
-      color: NEON.purple, display: 'flex', alignItems: 'center', gap: 4,
-      }} title="State Viewer">
-      <Database size={13} /> State
-      </button>
           {/* Persona picker */}
           <div style={{ position: 'relative' }}>
             <button onClick={() => setShowPersonaPicker(!showPersonaPicker)} style={{
@@ -700,21 +691,6 @@ export default function Chat() {
         />
         </div>
         </div>
-
-        {/* ── State Drawer (swipe-in from right) ── */}
-        {stateDrawerOpen && (
-        <div style={{ width: 320, background: BG.surface, borderLeft: `1px solid ${NEON.purple}15`, display: 'flex', flexDirection: 'column', flexShrink: 0, overflow: 'auto' }}>
-        <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center', gap: 8, borderBottom: `1px solid ${NEON.purple}10` }}>
-        <Database size={14} style={{ color: NEON.purple }} />
-        <span style={{ color: NEON.purple, fontWeight: 700, fontSize: 12, letterSpacing: 1 }}>STATE VIEWER</span>
-        <div style={{ flex: 1 }} />
-        <button onClick={() => setStateDrawerOpen(false)} style={iconBtnStyle}><X size={14} /></button>
-        </div>
-        <div style={{ padding: 8 }}>
-        <StateViewer />
-        </div>
-        </div>
-        )}
         </div>
         );
         }

@@ -690,7 +690,7 @@ db.exec(`
     step_count INTEGER DEFAULT 0,
     error TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (chain_id) REFERENCES skill_chains(id)
+    FOREIGN KEY (chain_id) REFERENCES skill_chains(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_chain_exec_chain_id ON chain_executions(chain_id);
 
@@ -773,6 +773,16 @@ db.exec(`
     if (!skillCols2.includes('invoke_count')) db.exec("ALTER TABLE skills ADD COLUMN invoke_count INTEGER DEFAULT 0");
     if (!skillCols2.includes('execution_backend')) db.exec("ALTER TABLE skills ADD COLUMN execution_backend TEXT DEFAULT 'local'");
   } catch (e) { logger.warn('Skills migration:', e.message); }
+
+  // ─── Provider dedup (NVIDIA vs NVIDIA NIM, etc.) ──────────────────
+  // A provider's identity is (type, base_url). Merge rows that duplicate
+  // the same vendor so the UI never shows two NVIDIA entries again.
+  // Prefer the keeper that owns the current default model; otherwise the
+  // earliest-created provider wins. Models and usage records are moved,
+  // duplicate model rows are dropped.
+  try {
+    mergeDuplicateProviders(db, logger);
+  } catch (e) { logger.warn('Provider dedup:', e.message); }
 
   // ─── Prepared Statements ───────────────────────────────────────────
 const stmts = {
@@ -873,6 +883,7 @@ const stmts = {
       getAll: db.prepare('SELECT id, name, type, api_key, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
       getById: db.prepare('SELECT * FROM llm_providers WHERE id = ?'),
       getByName: db.prepare('SELECT * FROM llm_providers WHERE name = ?'),
+      getByTypeAndUrl: db.prepare('SELECT * FROM llm_providers WHERE type = ? AND base_url = ? ORDER BY created_at ASC'),
       updateApiKey: db.prepare('UPDATE llm_providers SET api_key = ? WHERE id = ?'),
       updateEnabled: db.prepare('UPDATE llm_providers SET enabled = ? WHERE id = ?'),
       updatePing: db.prepare("UPDATE llm_providers SET last_ping = datetime('now'), detected_at = datetime('now') WHERE id = ?"),
@@ -1101,6 +1112,7 @@ const stmts = {
         allPluginsWithHooks: (() => { try { return db.prepare('SELECT id, name, version, enabled, hooks FROM plugins'); } catch { return null; } })(),
         convMsgCounts: (() => { try { return db.prepare('SELECT conversation_id as id, COUNT(*) as c FROM chat_messages GROUP BY conversation_id'); } catch { return null; } })(),
         modelCountsByProvider: (() => { try { return db.prepare('SELECT provider_id, COUNT(*) as c FROM llm_models GROUP BY provider_id'); } catch { return null; } })(),
+        providerUsageCounts: (() => { try { return db.prepare('SELECT provider_id, COUNT(*) as c FROM token_usage WHERE provider_id IS NOT NULL GROUP BY provider_id'); } catch { return null; } })(),
         allModelProviders: (() => { try { return db.prepare('SELECT model_id, display_name, provider_id FROM llm_models'); } catch { return null; } })(),
       },
       // ─── Chain Tables ───────────────────────────────────────────
@@ -1178,6 +1190,7 @@ const stmts = {
         insert: db.prepare('INSERT INTO chain_executions (id, chain_id, success, duration_ms, input, output, step_count, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
         getByChain: db.prepare('SELECT id, success, duration_ms, step_count, error, created_at FROM chain_executions WHERE chain_id = ? ORDER BY created_at DESC LIMIT ?'),
         getRecentByChain: db.prepare('SELECT id, success, duration_ms, step_count, error, created_at FROM chain_executions WHERE chain_id = ? ORDER BY created_at DESC LIMIT 10'),
+        deleteByChain: db.prepare('DELETE FROM chain_executions WHERE chain_id = ?'),
       },
       };
 
@@ -1395,6 +1408,7 @@ const ctx = {
   pluginLoader, fireHook,
   DATA_DIR, PORT,
   matchSkillTrigger,
+  executeSkill,
   getDevSetting, getDevSettings,
   runSandboxed, runSandboxedHybrid,
   executeInDocker, isDockerAvailable,
@@ -1747,12 +1761,47 @@ collectTelemetry();
 // No central "system" star. Entities cluster by functional domain and connect
 // only through real relationships. Edges carry strength so the layout responds
 // proportionally. Each cluster head is the local hub for its domain.
+// ─── Provider Dedup Migration ──────────────────────────────────────
+// A provider's identity is (type, base_url). Merges rows that duplicate
+// the same vendor (e.g. "Nvidia" + "NVIDIA NIM") so the UI shows one.
+// Prefers the keeper that owns the default model, else the earliest
+// provider. Usage + models are re-homed; duplicate model rows dropped.
+export function mergeDuplicateProviders(db, logger = console) {
+  const dupGroups = db.prepare(`
+    SELECT type, base_url, COUNT(*) n FROM llm_providers
+    WHERE base_url IS NOT NULL AND base_url != ''
+    GROUP BY type, base_url HAVING COUNT(*) > 1
+  `).all();
+  for (const group of dupGroups) {
+    const rows = db.prepare('SELECT id, name, created_at FROM llm_providers WHERE type = ? AND base_url = ? ORDER BY created_at ASC').all(group.type, group.base_url);
+    if (rows.length < 2) continue;
+    const defaultOwner = db.prepare(`SELECT p.id FROM llm_providers p JOIN llm_models m ON m.provider_id = p.id WHERE p.type = ? AND p.base_url = ? AND m.is_default = 1 LIMIT 1`).get(group.type, group.base_url);
+    let keeperId = (defaultOwner && rows.some(r => r.id === defaultOwner.id)) ? defaultOwner.id : rows[0].id;
+    if (!rows.some(r => r.id === keeperId)) keeperId = rows[0].id;
+    const keeperName = rows.find(r => r.id === keeperId).name;
+    for (const dup of rows) {
+      if (dup.id === keeperId) continue;
+      db.prepare('UPDATE token_usage SET provider_id = ? WHERE provider_id = ?').run(keeperId, dup.id);
+      for (const model of db.prepare('SELECT * FROM llm_models WHERE provider_id = ?').all(dup.id)) {
+        const sameOnKeeper = db.prepare('SELECT * FROM llm_models WHERE provider_id = ? AND model_id = ?').get(keeperId, model.model_id);
+        if (sameOnKeeper) {
+          if (model.is_default) db.prepare('UPDATE llm_models SET is_default = 1 WHERE id = ?').run(sameOnKeeper.id);
+          db.prepare('DELETE FROM llm_models WHERE id = ?').run(model.id);
+        } else {
+          db.prepare('UPDATE llm_models SET provider_id = ?, id = ? WHERE id = ?').run(keeperId, `${keeperId}:${model.model_id}`, model.id);
+        }
+      }
+      db.prepare('DELETE FROM llm_providers WHERE id = ?').run(dup.id);
+      logger.info(`Merged duplicate LLM provider "${dup.name}" (${dup.id}) into "${keeperName}"`);
+    }
+  }
+}
+
 // ─── Audit Log Helper ──────────────────────────────────────────────
 // Writes to the governance audit_log table via stmts.governance.audit.
 // Column mapping: actor=userId, action=action, target=resourceType:resourceId,
 // details=details, trace_id=null
-function audit(action, resourceType, resourceId, userId, details = {}) {
- try {
+function audit(action, resourceType, resourceId, userId, details = {}) { try {
   const target = resourceId ? `${resourceType}:${resourceId}` : resourceType;
   stmts.governance.audit.insert.run(userId || 'system', action, target, JSON.stringify(details), null);
  } catch (err) {

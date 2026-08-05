@@ -4,7 +4,7 @@ import { cachedFetch } from './dataCache';
 import { useWebSocket } from './useWebSocket';
 import { ActivityFeed, useActivityFeed, useActivityPulses } from './ActivityOverlay';
 import { usePolling } from './usePolling';
-import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity, RotateCcw } from 'lucide-react';
+import { Network, RefreshCw, Search, X, Eye, EyeOff, Filter, ZoomIn, ZoomOut, Maximize2, Minimize2, Pin, PinOff, Lock, Unlock, AlertTriangle, Activity, RotateCcw, Brain, Zap } from 'lucide-react';
 import { LayoutEngine } from './graph/LayoutEngine.js';
 import {
   NEON, BG, GROUP_STYLE, LINK_COLORS, STATUS_COLORS,
@@ -17,6 +17,9 @@ const CLUSTER_MODES = {
  density:     { label: 'By Density', icon: '◉' },
  activity:    { label: 'By Activity', icon: '◎' },
 };
+
+// Domain cluster ids — mirrored from GET /graph CLUSTERS on the server.
+const CLUSTER_IDS = ['runtime', 'models', 'interface', 'integrate', 'infra'];
 
 // ─── Convex hull helpers ───────────────────────────────────────────
 function convexHull(points) {
@@ -303,9 +306,20 @@ export default function NeuralMap() {
  const [showHulls, setShowHulls] = useState(true);
  const [pathStart, setPathStart] = useState(null);
  const [pathResult, setPathResult] = useState(null);
- const [lodLevel, setLodLevel] = useState(2); // 0=minimal, 1=basic, 2=full
- const containerRef = useRef();
- const animTimeRef = useRef(0);
+  const [lodLevel, setLodLevel] = useState(2); // 0=minimal, 1=basic, 2=full
+  const containerRef = useRef();
+  const animTimeRef = useRef(0);
+
+  // ─── Declutter state ─────────────────────────────────────────────
+  // Collapsed clusters: satellite nodes of a collapsed domain are hidden,
+  // leaving just the labeled hub (Graphify-style). Zoom in expands, zoom
+  // out collapses. Clicking a hub toggles just that cluster.
+  const [collapsedClusters, setCollapsedClusters] = useState(() => new Set(CLUSTER_IDS));
+  // Hide providers with zero token_usage AND no live 'uses' edge (agent/conv).
+  const [hideUnusedProviders, setHideUnusedProviders] = useState(true);
+  // Ambient neuron firing: pseudo-random pulses on idle so the map feels
+  // alive without a real event — real activity fires bright on top of it.
+  const [ambientFiring, setAmbientFiring] = useState(true);
 
  // ─── Layout Engine ──────────────────────────────────────────────
  // The engine runs its own internal RAF loop and manages ALL layout:
@@ -424,6 +438,39 @@ export default function NeuralMap() {
  const pulsesRef = useRef([]);
  useEffect(() => { pulsesRef.current = pulses; }, [pulses]);
 
+ // ─── Ambient neuron firing ────────────────────────────────────────
+ // Pseudo-random pulses on idle nodes (weighted toward "thinking" nodes:
+ // agents/tasks/skills/convs) so the map breathes like a brain. Real
+ // activity fires bright on top via useActivityPulses + edgeHighlightRef.
+ const ambientPulsesRef = useRef([]);
+ const ambientFiringRef = useRef(ambientFiring);
+ useEffect(() => { ambientFiringRef.current = ambientFiring; }, [ambientFiring]);
+ useEffect(() => {
+  if (!ambientFiring) return;
+  const CORE_GROUPS = new Set(['agent', 'task', 'skill', 'conversation', 'schedule', 'dag', 'mcp', 'node', 'tool']);
+  const iv = setInterval(() => {
+   const nodes = graphDataRef.current.nodes;
+   if (!nodes.length) return;
+   const core = nodes.filter(n => CORE_GROUPS.has(n.group) || n.group === 'system');
+   const pool = (Math.random() < 0.7 && core.length) ? core : nodes;
+   const count = Math.random() < 0.3 ? 2 : 1;
+   for (let i = 0; i < count; i++) {
+    const n = pool[Math.floor(Math.random() * pool.length)];
+    if (!n) continue;
+    ambientPulsesRef.current.push({
+     nodeId: n.id,
+     startTime: Date.now(),
+     duration: 600 + Math.random() * 700,
+     color: (GROUP_STYLE[n.group] || GROUP_STYLE.system).color,
+    });
+   }
+   const now = Date.now();
+   ambientPulsesRef.current = ambientPulsesRef.current.filter(p => now - p.startTime < p.duration);
+   if (ambientPulsesRef.current.length > 40) ambientPulsesRef.current = ambientPulsesRef.current.slice(-40);
+  }, 1100);
+  return () => clearInterval(iv);
+ }, [ambientFiring]);
+
  // Edge animation state — map of "srcId→tgtId" → highlight expiry
  const edgeHighlightRef = useRef(new Map());
  const { lastMsg } = useWebSocket();
@@ -480,18 +527,52 @@ useEffect(() => {
   fg.d3Force('radial', null);
 }, [graphData.nodes.length]);
 
- // Filter by search + active groups
+ // Per-cluster satellite counts (for hub labels + collapse hints)
+ const clusterSizes = useMemo(() => {
+  const counts = {};
+  for (const n of graphData.nodes) {
+   if (n.group === 'cluster' || n.group === 'system') continue;
+   const cid = n.cluster || (n.id?.startsWith('cluster:') ? n.id.split(':')[1] : null);
+   if (cid) counts[cid] = (counts[cid] || 0) + 1;
+  }
+  return counts;
+ }, [graphData]);
+
+ // Filter by search + active groups + declutter (provider usage, cluster collapse)
  const filteredData = useMemo(() => {
   const searchLower = search.toLowerCase();
+  const searchActive = searchLower.length > 0;
   const matchSearch = (n) => !searchLower || (n.name || '').toLowerCase().includes(searchLower) || (n.group || '').toLowerCase().includes(searchLower);
   const matchGroup = (n) => activeGroups.has(n.group);
 
-  const visibleNodes = graphData.nodes.filter(n => matchSearch(n) && matchGroup(n));
+  // Providers "in use": any live 'uses' edge (agent→provider or conv→provider)
+  // touches them — those must never be hidden.
+  const usedProviderIds = new Set();
+  for (const l of graphData.links) {
+   if (l.type === 'uses') {
+    usedProviderIds.add(l.source?.id ?? l.source);
+    usedProviderIds.add(l.target?.id ?? l.target);
+   }
+  }
+
+  const visibleNodes = graphData.nodes.filter(n => {
+   if (!matchSearch(n) || !matchGroup(n)) return false;
+   // Search always reveals matches — bypass declutter so results show up.
+   if (searchActive) return true;
+   if (n.group === 'provider' && hideUnusedProviders && !n.usageCount && !usedProviderIds.has(n.id)) return false;
+   const cid = n.cluster || (n.id?.startsWith('cluster:') ? n.id.split(':')[1] : null);
+   if (n.group === 'cluster' || n.group === 'system') return true; // hubs + anchor always visible
+   // In-use providers surface even when their domain is collapsed — they're the
+   // important data-flow spines, so the overview keeps them.
+   if (n.group === 'provider' && (n.usageCount || usedProviderIds.has(n.id))) return true;
+   if (cid && collapsedClusters.has(cid)) return false;            // collapsed domain
+   return true;
+  });
   const visibleIds = new Set(visibleNodes.map(n => n.id));
   const visibleLinks = graphData.links.filter(l => visibleIds.has(l.source?.id || l.source) && visibleIds.has(l.target?.id || l.target));
 
   return { nodes: visibleNodes, links: visibleLinks };
- }, [graphData, search, activeGroups]);
+ }, [graphData, search, activeGroups, collapsedClusters, hideUnusedProviders]);
 
  // Memoized 2-hop neighbor map: node id → Set of nodes reachable in ≤2 hops.
  // Built once per filteredData change; O(E) construction, O(1) lookup on hover.
@@ -621,7 +702,7 @@ useEffect(() => {
  }, [filteredData, showHulls]);
 
  // ─── Custom Canvas Renderer ─────────────────────────────────────
-  const nodePaint = useCallback(({ id, name, group, status, isDefault, modelCount, x, y }, ctx, globalScale) => {
+  const nodePaint = useCallback(({ id, name, group, status, isDefault, modelCount, x, y, cluster }, ctx, globalScale) => {
    const style = GROUP_STYLE[group] || GROUP_STYLE.system;
   const isHovered = hoverNode?.id === id;
   const isNeighbor = hoverNode ? hoverNeighbors.has(id) : true;
@@ -677,8 +758,8 @@ useEffect(() => {
    ctx.fill();
   }
 
-  // Live execution overlay — pulse ring from activity events
-  const activePulses = pulsesRef.current.filter(p => p.nodeId === id);
+  // Live + ambient pulses — pulse ring from activity events and idle neuron firing
+  const activePulses = [...(pulsesRef.current || []), ...(ambientPulsesRef.current || [])].filter(p => p.nodeId === id);
   for (const ap of activePulses) {
    const elapsed = Date.now() - ap.startTime;
    if (elapsed >= ap.duration) continue;
@@ -690,6 +771,18 @@ useEffect(() => {
    ctx.strokeStyle = (ap.color || NEON.cyan) + Math.floor(pulseAlpha * 255).toString(16).padStart(2, '0');
    ctx.lineWidth = 2;
    ctx.stroke();
+  }
+
+  // Collapsed-cluster hub hint — dashed ring + "+" badge so it reads as expandable
+  const isCollapsedHub = group === 'cluster' && collapsedClusters.has(cluster || id.split(':')[1]);
+  if (isCollapsedHub && opacity > 0.3) {
+   ctx.beginPath();
+   ctx.arc(0, 0, r + 6, 0, 2 * Math.PI);
+   ctx.setLineDash([3, 3]);
+   ctx.strokeStyle = style.color + '55';
+   ctx.lineWidth = 1;
+   ctx.stroke();
+   ctx.setLineDash([]);
   }
 
   // Main circle
@@ -720,7 +813,7 @@ useEffect(() => {
   }
 
   // Label (respect LOD — hide labels at LOD 0)
-  const showLabel = !useLOD && (globalScale > 1.2 || isHovered || isSelected || isPathStart || isOnPath || group === 'system' || group === 'provider' || group === 'user' || group === 'agent' || group === 'node');
+  const showLabel = !useLOD && (globalScale > 1.2 || isHovered || isSelected || isPathStart || isOnPath || group === 'system' || group === 'cluster' || group === 'provider' || group === 'user' || group === 'agent' || group === 'node');
   if (showLabel && opacity > 0.2) {
    const fontSize = Math.max(7, 10 / globalScale);
    ctx.font = `${isHovered || isSelected ? 'bold ' : ''}${fontSize}px "Share Tech Mono", "Fira Code", monospace`;
@@ -728,13 +821,18 @@ useEffect(() => {
    ctx.textBaseline = 'top';
    const labelAlpha = isHovered || isSelected ? 1 : Math.min(1, opacity * 0.7);
    ctx.fillStyle = `rgba(220,220,240,${labelAlpha})`;
-   // Show model count on providers
+   // Show model count on providers, member count + expand hint on cluster hubs
    let label = name.length > 18 ? name.slice(0, 16) + '…' : name;
    if (group === 'provider' && modelCount) label += ` (${modelCount})`;
+   if (group === 'cluster') {
+    const mc = clusterSizes[cluster || id.split(':')[1]] || 0;
+    if (mc) label += ` · ${mc}`;
+    label += isCollapsedHub ? ' ⊕' : ' −';
+   }
    ctx.fillText(label, 0, r + 4);
   }
   ctx.restore();
- }, [hoverNode, hoverNeighbors, selectedNode, pathStart, pathResult, computedLOD]);
+ }, [hoverNode, hoverNeighbors, selectedNode, pathStart, pathResult, computedLOD, collapsedClusters, clusterSizes]);
 
  // ─── Custom Link Renderer ────────────────
  const neighborMapRef = useRef(neighborMap);
@@ -790,6 +888,28 @@ useEffect(() => {
    particles = true;
   }
 
+  // Ambient synapse firing — idle edges fire periodically (neuron shiver)
+  // unless the map is being focused by hover or a real event is lighting it.
+  if (!edgeBoost && !hoverNode && ambientFiringRef.current && alpha === '18') {
+   // Skip static attachment edges — only fire along edges that carry flow.
+   if (type !== 'bridge' && type !== 'hosts') {
+    const s = String(src.id); const t = String(tgt.id);
+    let h = 0; for (let i = 0; i < s.length + t.length; i++) {
+     h = (h * 31 + (i < s.length ? s.charCodeAt(i) : t.charCodeAt(i - s.length))) >>> 0;
+    }
+    const period = 5000 + (h % 3500);   // 5–8.5s cycle
+    const dur = 350 + (h % 300);        // 350–650ms firing window
+    const pos = (time % period) / period;
+    const fireWindow = dur / period;
+    if (pos < fireWindow) {
+     const boost = 1 - pos / fireWindow; // fade out over the window
+     alpha = Math.floor(0x4d * boost).toString(16).padStart(2, '0');
+     width = 0.5 + boost * 1.3;
+     particles = boost > 0.3;
+    }
+   }
+  }
+
   const color = baseColor + alpha;
   drawRope(ctx, src.x, src.y, tgt.x, tgt.y, ropeLen, color, width, globalScale, alpha === 'a0' || alpha === '48' || edgeBoost > 0.3, particles, time, type);
  }, [hoverNode]);
@@ -811,6 +931,18 @@ useEffect(() => {
    const path = findPath(pathStart.id, node.id);
    setPathResult(path ? { path, nodes: path.map(id => filteredData.nodes.find(n => n.id === id)).filter(Boolean) } : { path: [], nodes: [] });
    setPathStart(null);
+   return;
+  }
+  // Cluster hub click → toggle that domain collapsed/expanded
+  if (node.group === 'cluster') {
+   const cid = node.cluster || String(node.id).split(':')[1];
+   if (cid) {
+    setCollapsedClusters(prev => {
+     const next = new Set(prev);
+     if (next.has(cid)) next.delete(cid); else next.add(cid);
+     return next;
+    });
+   }
    return;
   }
   setSelectedNode(prev => prev?.id === node.id ? null : node);
@@ -942,6 +1074,29 @@ useEffect(() => {
        title="Reset layout — re-layout clusters from scratch">
        <RotateCcw size={12} /> Reset Layout
       </button>
+      <div className="w-px h-4 bg-gray-800" />
+      {/* Cluster collapse — Graphify-style hub view */}
+      <button onClick={() => setCollapsedClusters(prev => prev.size > 0 ? new Set() : new Set(CLUSTER_IDS))}
+       className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all"
+       style={{ background: collapsedClusters.size > 0 ? `${NEON.cyan}10` : 'rgba(0,0,0,0.2)', border: `1px solid ${collapsedClusters.size > 0 ? NEON.cyan + '30' : '#222'}`, color: collapsedClusters.size > 0 ? NEON.cyan : '#555' }}
+       title={collapsedClusters.size > 0 ? 'Collapsed clusters — click a hub to expand it' : 'Expanded — collapse domains to hubs'}>
+       {collapsedClusters.size > 0 ? <Maximize2 size={12} /> : <Minimize2 size={12} />}
+       {collapsedClusters.size > 0 ? 'Expand' : 'Collapse'}
+      </button>
+      {/* Hide unused providers */}
+      <button onClick={() => setHideUnusedProviders(v => !v)} className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all"
+       style={{ background: hideUnusedProviders ? `${NEON.green}10` : 'rgba(0,0,0,0.2)', border: `1px solid ${hideUnusedProviders ? NEON.green + '30' : '#222'}`, color: hideUnusedProviders ? NEON.green : '#555' }}
+       title={hideUnusedProviders ? 'Unused providers hidden (no token usage, no live use)' : 'Showing all providers'}>
+       {hideUnusedProviders ? <Eye size={12} /> : <EyeOff size={12} />}
+       Used Only
+      </button>
+      {/* Ambient neuron firing */}
+      <button onClick={() => setAmbientFiring(v => !v)} className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all"
+       style={{ background: ambientFiring ? `${NEON.purple}10` : 'rgba(0,0,0,0.2)', border: `1px solid ${ambientFiring ? NEON.purple + '30' : '#222'}`, color: ambientFiring ? NEON.purple : '#555' }}
+       title={ambientFiring ? 'Neuron firing on — nodes/edges pulse while idle, bright on real activity' : 'Neuron firing off'}>
+       {ambientFiring ? <Brain size={12} /> : <Zap size={12} />}
+       Neurons
+      </button>
      <div className="w-px h-4 bg-gray-800" />
      <div className="relative">
       <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
@@ -1053,6 +1208,15 @@ useEffect(() => {
       enablePanInteraction={true}
       minZoom={0.2}
       maxZoom={12}
+      onZoom={(zoom) => {
+        // Graphify-style: zoom in past 1.5 expands all collapsed domains,
+        // zoom out below 0.6 collapses them back to hubs. Hysteresis keeps
+        // the state churn to exactly one set change per crossing.
+        if (!zoom || typeof zoom.k !== 'number') return;
+        const k = zoom.k;
+        if (k > 1.5) setCollapsedClusters(prev => (prev.size > 0 ? new Set() : prev));
+        else if (k < 0.6) setCollapsedClusters(prev => (prev.size < CLUSTER_IDS.length ? new Set(CLUSTER_IDS) : prev));
+      }}
       // Passive mode — LayoutEngine ownes all positions.
       // Tell ForceGraph2D not to run its own simulation.
       warmupTicks={0}
@@ -1135,7 +1299,7 @@ useEffect(() => {
 
     {/* Hint */}
     <div className="absolute top-3 right-3 text-[10px] text-gray-700 bg-black/50 backdrop-blur-sm px-2 py-1 rounded">
-     Drag to pin · Double-click to release · Right-click to fit all
+     Click hub to expand · Drag to pin · Double-click to release · Right-click to fit all
     </div>
    </div>
 

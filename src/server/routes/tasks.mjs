@@ -354,6 +354,8 @@ function topoSortLayers(nodes, edges) {
     adj.set(n.id, []);
   }
   for (const e of edges) {
+    if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
+    if (!adj.has(e.source) || !adj.has(e.target)) continue;
     adj.get(e.source).push(e.target);
     inDeg.set(e.target, (inDeg.get(e.target) || 0) + 1);
   }

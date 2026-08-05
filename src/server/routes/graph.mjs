@@ -77,11 +77,15 @@ for (let i = 0; i < clusterIds.length; i++) {
  }
 
  // ─── Providers (Models cluster) ─────────────────────────────
- const providers = stmts.providers.getAll.all();
- for (const p of providers) {
+  const providers = stmts.providers.getAll.all();
+  // usage: token_usage rows per provider — lets the client hide unused providers
+  const usageMap = new Map();
+  try { for (const row of (stmts.graph.providerUsageCounts?.all() || [])) usageMap.set(row.provider_id, row.c); } catch {}
+  for (const p of providers) {
    addNode(`provider:${p.id}`, { name: p.name, group: 'provider', cluster: 'models',
      ptype: p.type, status: p.enabled ? 'active' : 'idle',
-     endpoint: p.base_url, lastPing: p.last_ping, detectedAt: p.detected_at });
+     endpoint: p.base_url, lastPing: p.last_ping, detectedAt: p.detected_at,
+     usageCount: usageMap.get(p.id) || 0 });
    addLink(`cluster:models`, `provider:${p.id}`, 'hosts', 2);
    // count: models under provider
    let mc = 0;
@@ -90,7 +94,7 @@ for (let i = 0; i < clusterIds.length; i++) {
      const pn = nodes[nodes.length - 1];
      pn.modelCount = mc;
    }
- }
+  }
 
  // ─── Models (Models cluster, attached to real providers, no individual nodes) ─
  // Per your spec, individual model nodes would be bloat. The provider node

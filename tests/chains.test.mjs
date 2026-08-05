@@ -3,12 +3,19 @@ import request from 'supertest';
 import { getTestServer, cleanupTestServer, adminAuth, userAuth } from './helpers.mjs';
 
 let app;
+let server;
+// Tool chains execute steps by calling back into the API over HTTP
+// (http://localhost:PORT + endpoint), so the test app needs a real listener.
+const TOOL_CHAIN_PORT = 32123;
 
 beforeAll(async () => {
+  process.env.PORT = String(TOOL_CHAIN_PORT); // must be set before the server module loads
   ({ app } = await getTestServer());
+  server = app.listen(TOOL_CHAIN_PORT, '127.0.0.1');
 });
 
 afterAll(() => {
+  if (server) { try { server.close(); } catch {} }
   cleanupTestServer();
 });
 
@@ -306,5 +313,142 @@ describe('Tool Chain API', () => {
         .set(adminAuth());
       expect(getRes.status).toBe(404);
     });
+  });
+});
+
+// ─── Chain Execution ────────────────────────────────────────────
+
+describe('Skill Chain Execution', () => {
+  it('should execute a multi-step skill chain and return the pipeline result', async () => {
+    // Create two script skills
+    const mk = (name, handler) => request(app)
+      .post('/api/skills')
+      .set(adminAuth())
+      .send({ name, handler });
+    const a = await mk(`chain-exec-a-${Date.now()}`, 'async (input) => ({ step: "a", seen: input })');
+    const b = await mk(`chain-exec-b-${Date.now()}`, 'async (input) => ({ step: "b", prev: input?.seen })');
+    expect(a.body.id).toBeTruthy();
+    expect(b.body.id).toBeTruthy();
+
+    // Create a chain referencing the skills by name
+    const chainRes = await request(app)
+      .post('/api/chains/skills')
+      .set(adminAuth())
+      .send({
+        name: `exec-chain-${Date.now()}`,
+        description: 'exec test',
+        steps: [
+          { skill_name: a.body.name, name: 'Step A', input_mapping: { input: '$input' } },
+          { skill_name: b.body.name, name: 'Step B', input_mapping: { input: '$prev.output' } },
+        ],
+      });
+    const chainId = chainRes.body.id;
+    expect(chainId).toBeTruthy();
+
+    const res = await request(app)
+      .post(`/api/chains/skills/${chainId}/execute`)
+      .set(adminAuth())
+      .send({ input: 'chain-input' });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.results[0]).toMatchObject({ stepName: 'Step A', ok: true });
+    expect(res.body.results[1]).toMatchObject({ stepName: 'Step B', ok: true });
+    expect(res.body.final_output).toMatchObject({ step: 'b' });
+
+    // Chain should be marked completed with a stored result
+    const getRes = await request(app)
+      .get(`/api/chains/skills/${chainId}`)
+      .set(adminAuth());
+    expect(getRes.body.status).toBe('completed');
+    expect(getRes.body.last_run_result).toHaveProperty('ok', true);
+  });
+
+  it('should fail fast on a missing skill step', async () => {
+    const chainRes = await request(app)
+      .post('/api/chains/skills')
+      .set(adminAuth())
+      .send({
+        name: `bad-chain-${Date.now()}`,
+        steps: [{ skill_name: 'no-such-skill-xyz', name: 'Boom' }],
+      });
+    const res = await request(app)
+      .post(`/api/chains/skills/${chainRes.body.id}/execute`)
+      .set(adminAuth())
+      .send({ input: {} });
+    expect([200, 500]).toContain(res.status);
+    if (res.status === 200) {
+      expect(res.body.ok).toBe(false);
+      expect(res.body.error).toMatch(/not found/i);
+    }
+  });
+
+  it('should delete a skill chain that has execution history (cascade)', async () => {
+    const mk = (name, handler) => request(app)
+      .post('/api/skills')
+      .set(adminAuth())
+      .send({ name, handler });
+    const a = await mk(`cascade-a-${Date.now()}`, 'async (input) => ({ ok: true })');
+    const chainRes = await request(app)
+      .post('/api/chains/skills')
+      .set(adminAuth())
+      .send({
+        name: `cascade-chain-${Date.now()}`,
+        steps: [{ skill_name: a.body.name, name: 'A' }],
+      });
+    const runRes = await request(app)
+      .post(`/api/chains/skills/${chainRes.body.id}/execute`)
+      .set(adminAuth())
+      .send({ input: {} });
+    expect(runRes.status).toBe(200);
+
+    const delRes = await request(app)
+      .delete(`/api/chains/skills/${chainRes.body.id}`)
+      .set(adminAuth());
+    expect(delRes.status).toBe(200);
+    expect(delRes.body).toMatchObject({ ok: true });
+    expect((await request(app).get(`/api/chains/skills/${chainRes.body.id}`).set(adminAuth())).status).toBe(404);
+  });
+});
+
+describe('Tool Chain Execution', () => {
+  it('should execute a tool chain step against an authenticated internal endpoint', async () => {
+    // Register a tool that points at the auth-protected bash executor
+    const toolName = `chain-tool-${Date.now()}`;
+    const toolRes = await request(app)
+      .post('/api/tools')
+      .set(adminAuth())
+      .send({ name: toolName, description: 'echo via chain', endpoint: '/api/tools/bash', method: 'POST', parameters: {} });
+    expect([200, 201]).toContain(toolRes.status);
+
+    const chainRes = await request(app)
+      .post('/api/chains/tools')
+      .set(adminAuth())
+      .send({
+        name: `tool-exec-chain-${Date.now()}`,
+        steps: [
+          { tool_name: toolName, name: 'Echo', method: 'POST', endpoint: '/api/tools/bash', input_override: { command: 'echo chain-tool-ok' } },
+        ],
+      });
+    const res = await request(app)
+      .post(`/api/chains/tools/${chainRes.body.id}/execute`)
+      .set(adminAuth())
+      .send({ input: {} });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.results[0].ok).toBe(true);
+    expect(res.body.results[0].output).toMatchObject({ exit_code: 0 });
+    expect(JSON.stringify(res.body.results[0].output)).toContain('chain-tool-ok');
+  });
+
+  it('should reject tool chain execution without auth', async () => {
+    const chainRes = await request(app)
+      .post('/api/chains/tools')
+      .set(adminAuth())
+      .send({ name: `noauth-chain-${Date.now()}`, steps: [{ tool_name: 'x', name: 'X' }] });
+    const res = await request(app)
+      .post(`/api/chains/tools/${chainRes.body.id}/execute`)
+      .send({ input: {} });
+    expect(res.status).toBe(401);
   });
 });

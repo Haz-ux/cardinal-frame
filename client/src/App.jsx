@@ -5,6 +5,7 @@ import { prewarm } from './dataCache';
 import Login from './Login';
 import PageLoader from './PageLoader';
 import BootScreen from './BootScreen';
+import BigBangSplash from './BigBangSplash';
 // Lazy-loaded pages — each becomes its own chunk
 const Dashboard = lazy(() => import('./Dashboard'));
 const Tasks = lazy(() => import('./Tasks'));
@@ -39,7 +40,7 @@ function PublicRoute({ children }) {
 }
 function ProtectedRoute({ children }) {
  const { user, loading } = useAuth();
- const [showBoot, setShowBoot] = useState(false);
+ const [bootPhase, setBootPhase] = useState('none'); // 'none' | 'galaxy' | 'boot'
  const bootChecked = React.useRef(false);
 
  useEffect(() => {
@@ -49,7 +50,10 @@ function ProtectedRoute({ children }) {
    const justLoggedIn = sessionStorage.getItem('cf_just_logged_in');
    if (justLoggedIn) {
     sessionStorage.removeItem('cf_just_logged_in');
-    setShowBoot(true);
+    // Boot sequence: galaxy "big bang" splash first, then the typed boot
+    // splash, then the app. On narrow screens the galaxy is skipped (the
+    // explosion needs room) and we fall straight to the boot splash.
+    setBootPhase(window.innerWidth >= 480 ? 'galaxy' : 'boot');
    }
   }
  }, [user]);
@@ -57,8 +61,12 @@ function ProtectedRoute({ children }) {
  if (loading) return <div className="min-h-screen flex items-center justify-center" style={{ background: BG.void }}><Loader size={24} className="animate-spin" style={{ color: NEON.green }} /></div>;
  if (!user) return <Navigate to="/login" replace />;
 
- if (showBoot) {
-  return <BootScreen onDone={() => setShowBoot(false)} />;
+ if (bootPhase === 'galaxy') {
+  return <BigBangSplash onDone={() => setBootPhase('boot')} />;
+ }
+
+ if (bootPhase === 'boot') {
+  return <BootScreen onDone={() => setBootPhase('none')} />;
  }
 
  return children;

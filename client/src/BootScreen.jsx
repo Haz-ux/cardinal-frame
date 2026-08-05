@@ -8,9 +8,11 @@ const NEON = {
   green: '#22c55e',
 };
 
-// Cyberpunk boot sequence lines — typed out one by one
+// Cyberpunk boot sequence lines — typed out one by one.
+// The app version is shown in the galaxy splash (BigBangSplash) — the single
+// source of truth for the version display. It must NOT appear here too.
 const BOOT_LINES = [
-  { text: 'CARDINAL FRAME v0.6.0', color: NEON.cyan, delay: 0 },
+  { text: 'CARDINAL FRAME', color: NEON.cyan, delay: 0 },
   { text: 'Initializing neural substrate…', color: '#666', delay: 300 },
   { text: '[OK] Quantum bus connected', color: NEON.green, delay: 600 },
   { text: '[OK] Agent runtime loaded', color: NEON.green, delay: 800 },

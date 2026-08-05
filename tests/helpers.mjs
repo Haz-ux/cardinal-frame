@@ -22,7 +22,7 @@ export async function getTestServer() {
   process.env.DATA_DIR = _tmpDir;
   process.env.JWT_SECRET = TEST_JWT_SECRET;
   process.env.NODE_ENV = 'test';
-  process.env.PORT = '0'; // don't bind to a real port
+  process.env.PORT = process.env.PORT || '0'; // don't bind to a real port unless a test opts in
 
   // Import the server module (this runs all the schema setup)
   const serverModule = await import('../src/server/server.mjs');

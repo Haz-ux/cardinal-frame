@@ -92,10 +92,10 @@ export default function llmRoutes(ctx) {
     const { name, type, api_key, base_url, enabled } = req.body;
     if (!name || !type) return res.status(400).json({ error: 'name and type required' });
     if (!PROVIDER_TYPES[type] && !base_url) return res.status(400).json({ error: `Unknown provider type: ${type}. Provide base_url or use: ${Object.keys(PROVIDER_TYPES).join(', ')}` });
-    const existing = stmts.providers.getByName.get(name);
+    const url = base_url || PROVIDER_TYPES[type]?.baseUrl || '';
+    const existing = stmts.providers.getByName.get(name) || stmts.providers.getByTypeAndUrl?.get(type, url);
     if (existing) return res.status(409).json({ error: 'Provider already exists' });
     const id = randomUUID();
-    const url = base_url || PROVIDER_TYPES[type]?.baseUrl || '';
     stmts.providers.insert.run(id, name, type, api_key || '', url, enabled !== false ? 1 : 0);
     audit('create', 'llm_provider', id, req.user.id, { name, type });
     logger.info(`LLM provider added: ${name} (${type})`);
@@ -267,7 +267,10 @@ export default function llmRoutes(ctx) {
     }));
     let created = 0;
     for (const seed of seeds) {
-      const existing = stmts.providers.getByName.get(seed.name);
+      // A provider is identified by (type, base_url) — the same vendor must
+      // not be seeded twice under a different display name (e.g. "Nvidia"
+      // vs "NVIDIA NIM").
+      const existing = stmts.providers.getByTypeAndUrl?.get(seed.type, seed.base_url) || stmts.providers.getByName.get(seed.name);
       if (!existing) {
         const id = randomUUID();
         stmts.providers.insert.run(id, seed.name, seed.type, '', seed.base_url, 0);
@@ -287,11 +290,11 @@ export default function llmRoutes(ctx) {
       if (!providerInfo) return res.status(400).json({ error: `Unknown provider type: ${type}` });
 
       // Step 1: Create provider (disabled until tested)
-      const existing = stmts.providers.getByName.get(name);
+      const finalBaseUrl = base_url || providerInfo.baseUrl || '';
+      const existing = stmts.providers.getByName.get(name) || stmts.providers.getByTypeAndUrl?.get(type, finalBaseUrl);
       if (existing) return res.status(409).json({ error: `Provider "${name}" already exists`, provider_id: existing.id });
 
       const id = randomUUID();
-      const finalBaseUrl = base_url || providerInfo.baseUrl || '';
       stmts.providers.insert.run(id, name, type, api_key || '', finalBaseUrl, 0);
       let provider = stmts.providers.getById.get(id);
 

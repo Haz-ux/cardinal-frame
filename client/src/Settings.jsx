@@ -2,7 +2,8 @@ import React, { useEffect, useState, useCallback, memo, useMemo } from 'react';
 import { api } from './AuthContext';
 import { cachedFetch } from './dataCache';
 import { usePolling } from './usePolling';
-import { Shield, Key, Eye, EyeOff, Plus, Trash2, RefreshCw, Save, AlertTriangle, CheckCircle, Zap, Server, Globe, Cpu, Bot, Search, Wifi, WifiOff, ChevronDown, Terminal, ToggleLeft, ToggleRight } from 'lucide-react';
+import { Shield, Key, Eye, EyeOff, Plus, Trash2, RefreshCw, Save, AlertTriangle, CheckCircle, Zap, Server, Globe, Cpu, Bot, Search, Wifi, WifiOff, ChevronDown, Terminal, ToggleLeft, ToggleRight, FileText } from 'lucide-react';
+import { StateViewer } from './ChatComponents';
 
 const NEON = { cyan:'#00f0ff', blue:'#3b82f6', green:'#22c55e', yellow:'#eab308', red:'#ef4444', purple:'#a855f7', orange:'#f97316', pink:'#ec4899', magenta:'#ff00ff', teal:'#14b8a6' };
 
@@ -523,6 +524,16 @@ export default function Settings() {
             />
           ))}
         </div>
+      </div>
+
+      {/* ─── State Files Section ──────────────────────────────────────── */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <FileText size={16} style={{ color: NEON.teal }} />
+          <h3 className="text-sm font-bold" style={{ color: NEON.teal }}>State Files</h3>
+          <span className="text-[10px] text-gray-600">Edit MEMORY.md, PERSONA.md & AGENTS.md — persistent agent state</span>
+        </div>
+        <StateViewer />
       </div>
 
       {/* ─── Dev Settings Section ─────────────────────────────────────── */}

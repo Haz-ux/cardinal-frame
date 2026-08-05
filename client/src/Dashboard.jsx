@@ -758,9 +758,6 @@ export default function Dashboard() {
      <span className="flex items-center gap-1">
       <Shield size={10} style={{ color: NEON.green }} /> Secure
      </span>
-     <span className="flex items-center gap-1">
-      <Hash size={10} style={{ color: NEON.cyan }} /> Cardinal Frame v0.6
-     </span>
     </div>
     <div className="flex items-center gap-4">
      <span className="font-code">SQLite WAL</span>

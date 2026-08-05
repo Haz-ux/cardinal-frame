@@ -116,7 +116,7 @@ export async function executeSkillChain(chain, input, executeSkillFn, broadcastF
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const stepStart = Date.now();
-    const stepName = step.skill_name || step.name || `Step ${i + 1}`;
+    const stepName = step.name || step.skill_name || `Step ${i + 1}`;
 
     // ─── Governance: permission check before execution ───
     if (checkPermission && persona) {
@@ -245,7 +245,7 @@ export async function executeToolChain(chain, input, callToolFn, broadcastFn = n
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const stepStart = Date.now();
-    const stepName = step.tool_name || step.name || `Step ${i + 1}`;
+    const stepName = step.name || step.tool_name || `Step ${i + 1}`;
 
     // ─── Governance: permission check before execution ───
     if (checkPermission && persona) {
