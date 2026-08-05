@@ -55,9 +55,15 @@
 }
 
 @keyframes neonPulse {
-  0%, 100% { opacity: 1; text-shadow: 0 0 8px currentColor; }
-  50% { opacity: 0.7; text-shadow: 0 0 16px currentColor, 0 0 32px currentColor; }
+   0%, 100% { opacity: 1; text-shadow: 0 0 8px currentColor; }
+   50% { opacity: 0.7; text-shadow: 0 0 16px currentColor, 0 0 32px currentColor; }
 }
+
+@keyframes cfDotBlink {
+   0%, 100% { opacity: 0.2; }
+   50% { opacity: 1; }
+}
+.cf-dot { animation: cfDotBlink 1.2s infinite; }
 
 @keyframes glitchClip {
   0% { clip-path: inset(40% 0 61% 0); transform: translate(-2px, 0); }

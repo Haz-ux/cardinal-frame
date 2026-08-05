@@ -349,8 +349,13 @@ export default function AimiCanvasCompanion() {
  ]);
  const [input, setInput] = useState('');
  const [xp, setXp] = useState(() => parseInt(localStorage.getItem('aimi_xp_points') || '0', 10));
- const [streaming, setStreaming] = useState(false);
- const [streamBuf, setStreamBuf] = useState('');
+  const [streaming, setStreaming] = useState(false);
+  const [streamBuf, setStreamBuf] = useState('');
+  const [thinking, setThinking] = useState('');
+  const recvRef = useRef('');        // full received content (from delta.content)
+  const commitRef = useRef(false);   // stream ended, typewriter should commit soon
+  const lenRef = useRef(0);          // chars of recvRef shown in streamBuf
+  const typewriterRef = useRef(null);
  const [expanded, setExpanded] = useState(false);
  const [showQuickActions, setShowQuickActions] = useState(true);
   const chatEndRef = useRef(null);
@@ -402,7 +407,36 @@ export default function AimiCanvasCompanion() {
  const stage = getStage(xp);
 
  useEffect(() => { localStorage.setItem('aimi_xp_points', String(xp)); }, [xp]);
- useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, streamBuf]);
+ useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, streamBuf, thinking]);
+
+  // ─── Typewriter: reveal received tokens a few chars at a time so it is
+  // always visually obvious Aimi is responding, even when the provider
+  // returns the whole reply in one chunk. When the stream ends it keeps
+  // running until the buffer catches up, then commits the message.
+  useEffect(() => {
+    if (!streaming && !commitRef.current) return;
+    if (typewriterRef.current) return;
+    typewriterRef.current = setInterval(() => {
+      const target = recvRef.current;
+      const shown = lenRef.current;
+      if (shown < target.length) {
+        const remaining = target.length - shown;
+        const step = remaining > 120 ? 6 : remaining > 40 ? 3 : 1;
+        lenRef.current = shown + step;
+        setStreamBuf(target.slice(0, lenRef.current));
+      } else if (commitRef.current) {
+        clearInterval(typewriterRef.current);
+        typewriterRef.current = null;
+        commitRef.current = false;
+        lenRef.current = 0;
+        const final = target.trim() ? target : '⚠ Aimi received your message but returned an empty response.';
+        setStreamBuf('');
+        setThinking('');
+        setMessages(prev => [...prev, { role: 'aimi', text: final }]);
+      }
+    }, 24);
+    return () => { clearInterval(typewriterRef.current); typewriterRef.current = null; };
+  }, [streaming]);
 
  const quickActions = [
   { label: 'Status', cmd: 'Give me a system status report', icon: <Radio size={10} /> },
@@ -411,14 +445,25 @@ export default function AimiCanvasCompanion() {
   { label: 'Models', cmd: 'What LLM models are available?', icon: <Sparkles size={10} /> },
  ];
 
- const handleSend = useCallback(async (overrideText) => {
-  const text = (overrideText || input).trim();
-  if (!text || streaming) return;
+  const handleSend = useCallback(async (overrideText) => {
+   const text = (overrideText || input).trim();
+   if (!text || streaming) return;
+
+   // Flush any pending typewriter buffer before starting a new send.
+   if (typewriterRef.current) { clearInterval(typewriterRef.current); typewriterRef.current = null; }
+   if (commitRef.current && recvRef.current.trim()) {
+    setMessages(prev => [...prev, { role: 'aimi', text: recvRef.current }]);
+   }
+
 
   setMessages(prev => [...prev, { role: 'user', text }]);
   setInput('');
   setStreaming(true);
   setStreamBuf('');
+  setThinking('');
+  recvRef.current = '';
+  commitRef.current = false;
+  lenRef.current = 0;
   setXp(prev => prev + 10);
 
   const controller = new AbortController();
@@ -443,7 +488,6 @@ export default function AimiCanvasCompanion() {
 
    const reader = resp.body.getReader();
    const decoder = new TextDecoder();
-   let fullContent = '';
 
    while (true) {
     const { done, value } = await reader.read();
@@ -455,28 +499,37 @@ export default function AimiCanvasCompanion() {
      if (data === '[DONE]') continue;
      try {
       const parsed = JSON.parse(data);
-      if (parsed.error) { fullContent += `\n⚠ ${parsed.error.message}`; continue; }
+      if (parsed.error) { recvRef.current += `\n⚠ ${parsed.error.message}`; continue; }
       if (parsed.tool_result) {
        const resultStr = JSON.stringify(parsed.tool_result.result, null, 2);
-       fullContent += `\n\n🔧 **${parsed.tool_result.tool}** →\n\`\`\`json\n${resultStr.slice(0, 800)}\n\`\`\``;
+       recvRef.current += `\n\n🔧 **${parsed.tool_result.tool}** →\n\`\`\`json\n${resultStr.slice(0, 800)}\n\`\`\``;
+       continue;
       }
-      const delta = parsed.choices?.[0]?.delta?.content;
-      if (delta) fullContent += delta;
+      const delta = parsed.choices?.[0]?.delta;
+      if (delta?.reasoning_content) setThinking(prev => (prev + delta.reasoning_content).slice(-900));
+      if (delta?.content) recvRef.current += delta.content;
      } catch {}
     }
-    setStreamBuf(fullContent);
    }
 
-   setMessages(prev => [...prev, { role: 'aimi', text: fullContent }]);
-   setStreamBuf('');
-   setXp(prev => prev + 20);
+   // Stream ended — let the typewriter catch up, then commit.
+   commitRef.current = true;
+   setStreaming(false);
   } catch (e) {
    if (e.name !== 'AbortError') {
-    setMessages(prev => [...prev, { role: 'aimi', text: `⚠ Connection error: ${e.message}` }]);
+    if (recvRef.current.trim()) {
+     setStreamBuf('');
+     setThinking('');
+     lenRef.current = 0;
+     setMessages(prev => [...prev, { role: 'aimi', text: recvRef.current + '\n\n⚠ Connection interrupted: ' + e.message }]);
+    } else {
+     setMessages(prev => [...prev, { role: 'aimi', text: `⚠ Connection error: ${e.message}` }]);
+    }
    }
+   setStreaming(false);
   }
-  setStreaming(false);
   abortRef.current = null;
+  setXp(prev => prev + 20);
  }, [input, streaming]);
 
  const lastMsg = messages[messages.length - 1]?.text || '';
@@ -564,12 +617,21 @@ export default function AimiCanvasCompanion() {
       </div>
      </div>
     ))}
-    {streamBuf && (
+    {(streaming || streamBuf || thinking) && (
      <div className="flex justify-start">
       <div className="max-w-[90%] px-2.5 py-1.5 rounded-lg rounded-bl-sm text-xs leading-relaxed" style={{ background: `${AIMI.shell}22`, color: '#bbb', border: `1px solid ${AIMI.shell}33`, whiteSpace: 'pre-wrap' }}>
        <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>Aimi</span>
-       {streamBuf}
-       <span className="neon-pulse" style={{ display: 'inline-block', width: 4, height: 12, background: AIMI.core, marginLeft: 2, verticalAlign: 'middle', borderRadius: 1 }} />
+       {thinking && (
+        <div className="mb-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap' }}>▸ {thinking}{thinking.length >= 900 ? '…' : ''}</div>
+       )}
+       {streamBuf ? (
+        <>{streamBuf}<span className="neon-pulse" style={{ display: 'inline-block', width: 4, height: 12, background: AIMI.core, marginLeft: 2, verticalAlign: 'middle', borderRadius: 1 }} /></>
+       ) : streaming ? (
+        <span className="inline-flex items-center gap-1 text-[11px]" style={{ color: AIMI.accent }}>
+         <span className="cf-dot">●</span><span className="cf-dot" style={{ animationDelay: '0.2s' }}>●</span><span className="cf-dot" style={{ animationDelay: '0.4s' }}>●</span>
+         <span className="ml-1 opacity-60">thinking</span>
+        </span>
+       ) : null}
       </div>
      </div>
     )}
