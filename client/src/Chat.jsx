@@ -17,8 +17,11 @@ export default function Chat() {
  const [streamBuf, setStreamBuf] = useState('');
  const [tools, setTools] = useState([]);
  const [skills, setSkills] = useState([]);
- const [models, setModels] = useState([]);
- const [selectedModel, setSelectedModel] = useState('');
+  const [models, setModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState('');
+  const [personas, setPersonas] = useState([]);
+  const [selectedPersona, setSelectedPersona] = useState('aimi');
+  const [showPersonaPicker, setShowPersonaPicker] = useState(false);
  const [sidebarOpen, setSidebarOpen] = useState(true);
  const [stateDrawerOpen, setStateDrawerOpen] = useState(false);
  const [attachments, setAttachments] = useState([]);
@@ -45,6 +48,11 @@ export default function Chat() {
       setModels(list);
       const def = list.find(m2 => m2.is_default);
       if (def) setSelectedModel(def.model_id);
+    }).catch(() => {});
+    api('/api/personas').then(d => {
+      const list = Array.isArray(d?.personas) ? d.personas : [];
+      setPersonas(list);
+      if (d?.default && list.some(p => p.id === d.default)) setSelectedPersona(d.default);
     }).catch(() => {});
   }, []);
 
@@ -166,6 +174,7 @@ export default function Chat() {
           model: selectedModel || undefined,
           conversation_id: conv.id,
           stream: true,
+          persona: selectedPersona || undefined,
         }),
         signal: controller.signal,
       });
@@ -346,7 +355,7 @@ export default function Chat() {
       toast.error('Agent error: ' + (e.message || e.error || 'Unknown'));
     }
     setStreaming(false);
-  }, [input, activeConv, selectedModel, streaming, agentMode, toast]);
+  }, [input, activeConv, selectedModel, selectedPersona, streaming, agentMode, toast]);
 
   // Handle approve/reject from WorkPanel
   const handleAgentAction = useCallback(async (type, actionId) => {
@@ -473,6 +482,42 @@ export default function Chat() {
       }} title="State Viewer">
       <Database size={13} /> State
       </button>
+          {/* Persona picker */}
+          <div style={{ position: 'relative' }}>
+            <button onClick={() => setShowPersonaPicker(!showPersonaPicker)} style={{
+              ...pillBtnStyle, background: `${NEON.purple}10`, border: `1px solid ${NEON.purple}25`,
+              color: NEON.purple, display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: (personas.find(p => p.id === selectedPersona)?.color) || '#888', display: 'inline-block' }} />
+              {personas.find(p => p.id === selectedPersona)?.name || 'Direct'} <ChevronDown size={12} />
+            </button>
+            {showPersonaPicker && (
+            <div style={{ position: 'absolute', right: 0, top: '100%', width: 260, maxHeight: 320, overflow: 'auto', background: BG.card, border: `1px solid ${NEON.purple}30`, borderRadius: 8, zIndex: 60, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
+            {personas.map(p => (
+            <div key={p.id} onClick={() => { setSelectedPersona(p.id); setShowPersonaPicker(false); }} style={{
+            padding: '8px 12px', cursor: 'pointer', fontSize: 12,
+            background: selectedPersona === p.id ? `${NEON.purple}15` : 'transparent',
+            borderBottom: `1px solid #ffffff06`,
+            }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: p.color, display: 'inline-block' }} />
+            <span style={{ fontWeight: 600, color: selectedPersona === p.id ? NEON.purple : '#fff' }}>{p.name}</span>
+            {selectedPersona === p.id && <span style={{ marginLeft: 'auto', color: NEON.purple, fontSize: 10 }}>ACTIVE</span>}
+            </div>
+            <div style={{ color: '#888', fontSize: 10, marginTop: 2, marginLeft: 14 }}>{p.tagline}</div>
+            </div>
+            ))}
+            <div onClick={() => { setSelectedPersona(''); setShowPersonaPicker(false); }} style={{
+            padding: '8px 12px', cursor: 'pointer', fontSize: 12, color: '#888',
+            background: selectedPersona === '' ? `${NEON.cyan}15` : 'transparent',
+            borderTop: `1px solid #ffffff0a`,
+            }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#666', display: 'inline-block' }} /> Direct (no persona)</span>
+            </div>
+            {personas.length === 0 && <div style={{ padding: 16, color: '#555', fontSize: 12, textAlign: 'center' }}>No personas available.</div>}
+            </div>
+            )}
+          </div>
           {/* Model picker */}
           <div style={{ position: 'relative' }}>
             <button onClick={() => setShowModelPicker(!showModelPicker)} style={{

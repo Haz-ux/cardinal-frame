@@ -1,6 +1,7 @@
 import express from 'express';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { getModelCost } from './costs.mjs';
+import { applyPersona, listPersonas } from '../personas.mjs';
 
 /**
  * Chat completions proxy: routes chat requests to the user's selected
@@ -68,12 +69,24 @@ export function autoObserve(stmts, broadcast, logger, randomUUID, conversation_i
 }
 
 export default function chatCompletionsRoutes(ctx) {
-  const { db, stmts, logger, authMiddleware, apiLimiter, audit, broadcast, randomUUID, fireHook } = ctx;
+  const { db, stmts, logger, authMiddleware, optionalAuth, apiLimiter, audit, broadcast, randomUUID, fireHook } = ctx;
   const router = express.Router();
 
+  router.get('/personas', optionalAuth, (_req, res) => {
+    res.json({ personas: listPersonas(), default: 'aimi' });
+  });
+
   router.post('/chat/completions', authMiddleware, apiLimiter, async (req, res) => {
-    const { messages, model, conversation_id, stream = true } = req.body;
+    let { messages, model, conversation_id, stream = true, persona } = req.body;
     if (!messages || !messages.length) return res.status(400).json({ error: 'messages required' });
+
+    let activePersona = null;
+    if (persona) {
+      const applied = applyPersona(messages, persona);
+      messages = applied.messages;
+      activePersona = applied.persona;
+      if (activePersona) logger.info(`Chat via persona "${activePersona.name}"`);
+    }
 
     let provider, modelRecord;
     if (model) {
