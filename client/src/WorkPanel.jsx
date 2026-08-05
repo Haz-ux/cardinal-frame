@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from './AuthContext';
 import { usePolling } from './usePolling';
+import { usePersonas } from './PersonaContext';
 import { NEON, BG, GLOW } from './theme';
 import { CheckCircle, XCircle, Loader, FileText, Terminal, ChevronDown, ChevronRight, Brain, Zap, Eye, Code } from 'lucide-react';
 
-// ─── WorkPanel: Collapsible branch showing Aimi agent actions ──────
+// ─── WorkPanel: Collapsible branch showing companion agent actions ─
 // Shows plan steps, file diffs, terminal output, approve/reject buttons
 export default function WorkPanel({ sessionId, mode, onAction }) {
+  const { companionName } = usePersonas();
   const [expanded, setExpanded] = useState(true);
   const [session, setSession] = useState(null);
   const [actions, setActions] = useState([]);
@@ -76,7 +78,7 @@ export default function WorkPanel({ sessionId, mode, onAction }) {
         {expanded ? <ChevronDown size={14} style={{ color: NEON.cyan }} /> : <ChevronRight size={14} style={{ color: NEON.cyan }} />}
         <Brain size={14} style={{ color: NEON.cyan }} />
         <span style={{ color: NEON.cyan, fontWeight: 700, fontSize: 11, letterSpacing: 1, textTransform: 'uppercase' }}>
-          Aimi Work Panel
+          {companionName} Work Panel
         </span>
         <span style={{
           color: mode === 'agent' ? NEON.green : NEON.magenta,
@@ -129,7 +131,7 @@ export default function WorkPanel({ sessionId, mode, onAction }) {
           {/* Actions log */}
           <div style={{ color: '#666', fontSize: 10, fontWeight: 700, marginBottom: 4, letterSpacing: 1 }}>ACTIONS</div>
           {actions.length === 0 && (
-            <div style={{ color: '#444', fontSize: 11, padding: '4px 0' }}>No actions yet — waiting for Aimi to start...</div>
+            <div style={{ color: '#444', fontSize: 11, padding: '4px 0' }}>No actions yet — waiting for {companionName} to start...</div>
           )}
           {actions.map((action, i) => (
             <ActionRow key={action.id || i} action={action} mode={mode} onAction={onAction} />

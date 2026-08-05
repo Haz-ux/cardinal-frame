@@ -61,18 +61,96 @@ export const PERSONAS = {
 
 export const DEFAULT_PERSONA = 'aimi';
 
-export function getPersona(id) {
-  return PERSONAS[id] || PERSONAS[DEFAULT_PERSONA];
+// Render a persona's system prompt with the current name applied.
+// The prompt may use a {{NAME}} placeholder (preferred) and/or the
+// persona's original name literally — both are rewritten to match the
+// current name so a rename updates the AI's self-identity everywhere.
+export function renderPrompt(systemPrompt, defaultName, currentName) {
+  let p = systemPrompt || '';
+  p = p.replace(/\{\{NAME\}\}/g, currentName);
+  if (currentName && defaultName && currentName !== defaultName) {
+    p = p.split(defaultName).join(currentName);
+  }
+  return p;
 }
 
-export function listPersonas() {
-  return Object.values(PERSONAS).map(({ id, name, tagline, color }) => ({ id, name, tagline, color }));
+function getOverrides(stmts) {
+  if (!stmts?.personaOverrides?.getAll) return {};
+  try {
+    const rows = stmts.personaOverrides.getAll.all() || [];
+    return rows.reduce((acc, r) => { acc[r.persona_id] = r; return acc; }, {});
+  } catch { return {}; }
 }
 
-export function applyPersona(messages, personaId) {
-  const persona = personaId ? getPersona(personaId) : null;
+function getOverride(stmts, id) {
+  if (!stmts?.personaOverrides?.get) return null;
+  try { return stmts.personaOverrides.get.get(id) || null; } catch { return null; }
+}
+
+export function getPersona(stmtsOrId, maybeId) {
+  const stmts = typeof stmtsOrId === 'object' && stmtsOrId ? stmtsOrId : null;
+  const id = typeof stmtsOrId === 'string' ? stmtsOrId : maybeId;
+  const base = PERSONAS[id] || PERSONAS[DEFAULT_PERSONA];
+  const ov = getOverride(stmts, base.id);
+  return {
+    ...base,
+    name: ov?.name || base.name,
+    tagline: ov?.tagline || base.tagline,
+    color: ov?.color || base.color,
+    systemPrompt: ov?.system_prompt != null ? ov.system_prompt : base.systemPrompt,
+  };
+}
+
+export function listPersonas(stmtsOrId, maybeId) {
+  const stmts = typeof stmtsOrId === 'object' && stmtsOrId ? stmtsOrId : null;
+  return Object.values(PERSONAS).map(({ id }) => {
+    const persona = getPersona(stmts, id);
+    return { id: persona.id, name: persona.name, tagline: persona.tagline, color: persona.color };
+  });
+}
+
+// Full detail (includes the rendered system prompt) for the persona editor.
+export function getPersonaDetail(stmts, id) {
+  const persona = getPersona(stmts, id);
+  const base = PERSONAS[persona.id];
+  return {
+    ...persona,
+    systemPrompt: renderPrompt(persona.systemPrompt, base.name, persona.name),
+    overridden: Boolean(getOverride(stmts, persona.id)),
+  };
+}
+
+export function savePersonaOverride(stmts, id, fields) {
+  const persona = getPersona(stmts, id);
+  const name = (fields.name != null && String(fields.name).trim()) ? String(fields.name).trim() : persona.name;
+  const tagline = (fields.tagline != null && String(fields.tagline).trim()) ? String(fields.tagline).trim() : persona.tagline;
+  const color = (fields.color != null && String(fields.color).trim()) ? String(fields.color).trim() : persona.color;
+  const systemPrompt = fields.system_prompt != null && String(fields.system_prompt).trim() ? String(fields.system_prompt).trim() : persona.systemPrompt;
+  stmts.personaOverrides.upsert.run(persona.id, name, tagline, color, systemPrompt);
+  return getPersonaDetail(stmts, persona.id);
+}
+
+export function resetPersona(stmts, id) {
+  const base = PERSONAS[id];
+  if (!base) return null;
+  stmts.personaOverrides.delete.run(base.id);
+  return getPersonaDetail(stmts, base.id);
+}
+
+export function applyPersona(stmtsOrMessages, maybeMessages, maybePersonaId) {
+  let stmts = null;
+  let messages = stmtsOrMessages;
+  let personaId = maybeMessages;
+  if (typeof stmtsOrMessages === 'object' && stmtsOrMessages && !Array.isArray(stmtsOrMessages)) {
+    stmts = stmtsOrMessages;
+    messages = maybeMessages;
+    personaId = maybePersonaId;
+  }
+  const persona = personaId ? getPersona(stmts, personaId) : null;
   if (!persona) return { messages, persona: null };
   const filtered = messages.filter(m => m.role !== 'system');
-  filtered.unshift({ role: 'system', content: persona.systemPrompt });
-  return { messages: filtered, persona };
+  const base = PERSONAS[persona.id];
+  const rendered = renderPrompt(persona.systemPrompt, base.name, persona.name);
+  filtered.unshift({ role: 'system', content: rendered });
+  return { messages: filtered, persona: { ...persona, systemPrompt: rendered } };
 }

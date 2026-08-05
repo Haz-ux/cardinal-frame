@@ -309,6 +309,15 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_personas_agent ON personas(agent_id);
 
+  CREATE TABLE IF NOT EXISTS persona_overrides (
+  persona_id TEXT PRIMARY KEY,
+  name TEXT,
+  tagline TEXT,
+  color TEXT,
+  system_prompt TEXT,
+  updated_at TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL,
@@ -981,6 +990,12 @@ const stmts = {
         insert: db.prepare('INSERT INTO skill_validations (id, skill_id, test_input, expected_output, actual_output, passed, exit_code, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
         getBySkill: db.prepare('SELECT * FROM skill_validations WHERE skill_id = ? ORDER BY created_at DESC'),
         getPassRate: db.prepare('SELECT SUM(passed) as passed, COUNT(*) as total FROM skill_validations WHERE skill_id = ?'),
+      },
+      personaOverrides: {
+        get: db.prepare('SELECT * FROM persona_overrides WHERE persona_id = ?'),
+        getAll: db.prepare('SELECT * FROM persona_overrides'),
+        upsert: db.prepare("INSERT INTO persona_overrides (persona_id, name, tagline, color, system_prompt, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(persona_id) DO UPDATE SET name = excluded.name, tagline = excluded.tagline, color = excluded.color, system_prompt = excluded.system_prompt, updated_at = excluded.updated_at"),
+        delete: db.prepare('DELETE FROM persona_overrides WHERE persona_id = ?'),
       },
       // ─── Agent Session Tables ───────────────────────────────────
       agentSessions: {

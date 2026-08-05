@@ -29,6 +29,7 @@ import { ToastProvider } from './ToastContext';
 import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Link2 } from 'lucide-react';
 import AimiCanvasCompanion from './AimiCanvas';
 import { NEON, BG, FONTS } from './theme';
+import { PersonaProvider, usePersonas } from './PersonaContext';
 
 function PublicRoute({ children }) {
  const { user, loading } = useAuth();
@@ -65,6 +66,7 @@ function ProtectedRoute({ children }) {
 function Layout() {
  const { user, logout } = useAuth();
  const navigate = useNavigate();
+ const { companionName } = usePersonas();
  const [mobileOpen, setMobileOpen] = useState(false);
  const [desktopCollapsed, setDesktopCollapsed] = useState(false);
  const closeMobile = useCallback(() => setMobileOpen(false), []);
@@ -83,7 +85,7 @@ function Layout() {
   { to: '/llm', icon: Cpu, label: 'LLM Models', color: NEON.cyan },
   { to: '/neural', icon: Network, label: 'Neural Map', color: NEON.magenta },
   { to: '/skills', icon: Wrench, label: 'Skills & Tools', color: NEON.orange },
-  { to: '/learn', icon: Brain, label: 'Aimi Learn', color: NEON.purple },
+  { to: '/learn', icon: Brain, label: `${companionName} Learn`, color: NEON.purple },
   { to: '/plugins', icon: Puzzle, label: 'Plugins', color: NEON.pink },
   { to: '/settings', icon: ShieldCheck, label: 'Settings', color: NEON.cyan },
   ...(user?.role === 'admin' ? [
@@ -304,10 +306,12 @@ export default function App() {
   <BrowserRouter>
    <AuthProvider>
     <ToastProvider>
-     <Routes>
-      <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
-      <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
-     </Routes>
+     <PersonaProvider>
+      <Routes>
+       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
+       <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
+      </Routes>
+     </PersonaProvider>
     </ToastProvider>
    </AuthProvider>
   </BrowserRouter>

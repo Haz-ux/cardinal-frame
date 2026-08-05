@@ -2,6 +2,7 @@ import express from 'express';
 import { randomUUID } from 'crypto';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload, detectModelsFromProvider } from './llm-helpers.mjs';
 import { autoObserve } from '../learn.mjs';
+import { getPersona } from '../personas.mjs';
 
 /**
  * Aimi routes: built-in system tools, system prompt builder, and the smart
@@ -66,7 +67,9 @@ export function buildAimiSystemPrompt(stmts, userId) {
   const pendingTasks = tasks.filter(t => t.status === 'pending').length;
   const runningTasks = tasks.filter(t => t.status === 'running').length;
 
-  return `You are Aimi, the AI companion and system operator for Cardinal Frame — a cyberpunk-themed AI orchestration platform. You are intelligent, helpful, and deeply integrated into the system.
+  const name = getPersona(stmts, 'aimi').name;
+
+  return `You are ${name}, the AI companion and system operator for Cardinal Frame — a cyberpunk-themed AI orchestration platform. You are intelligent, helpful, and deeply integrated into the system.
 
  ## Current System State
  - Agents: ${agents.length} total, ${activeAgents} active

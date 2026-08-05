@@ -2,10 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { api } from './AuthContext';
 import { cachedFetch } from './dataCache';
 import { useToast } from './ToastContext';
+import { usePersonas } from './PersonaContext';
 import { NEON, BG, GLOW, STATUS } from './theme';
 import { Wrench, Sparkles, Plus, Trash2, ToggleLeft, ToggleRight, Cpu, Zap, Settings, ChevronDown, ExternalLink } from 'lucide-react';
 
 export default function SkillsTools({ initialTab }) {
+  const { companionName } = usePersonas();
   const [tab, setTab] = useState(initialTab || 'tools');
   const [tools, setTools] = useState([]);
   const [skills, setSkills] = useState([]);
@@ -124,7 +126,7 @@ export default function SkillsTools({ initialTab }) {
         </div>
         <div>
           <h1 style={{ color: '#fff', fontSize: 20, fontWeight: 700, margin: 0 }}>Skills & Tools</h1>
-          <p style={{ color: '#666', fontSize: 12, margin: 0 }}>Manage Aimi's capabilities — system tools, custom skills, and API endpoints</p>
+          <p style={{ color: '#666', fontSize: 12, margin: 0 }}>Manage {companionName}'s capabilities — system tools, custom skills, and API endpoints</p>
         </div>
         <div style={{ flex: 1 }} />
         <span style={{ color: '#555', fontSize: 11 }}>{tools.length} tools · {skills.length} skills</span>
@@ -154,7 +156,7 @@ export default function SkillsTools({ initialTab }) {
         <div>
           {/* Add tool button */}
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-            <span style={{ color: '#888', fontSize: 12 }}>System tools Aimi can invoke to interact with Cardinal Frame</span>
+            <span style={{ color: '#888', fontSize: 12 }}>System tools {companionName} can invoke to interact with Cardinal Frame</span>
             <button onClick={() => setShowAddTool(!showAddTool)} style={{
               ...pillBtn, background: `${NEON.magenta}15`, border: `1px solid ${NEON.magenta}30`, color: NEON.magenta,
             }}>

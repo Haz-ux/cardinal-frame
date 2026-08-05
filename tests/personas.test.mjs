@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
 import { getTestServer, cleanupTestServer, adminAuth } from './helpers.mjs';
-import { PERSONAS, DEFAULT_PERSONA, getPersona, listPersonas, applyPersona } from '../src/server/personas.mjs';
+import { PERSONAS, DEFAULT_PERSONA, getPersona, listPersonas, applyPersona, renderPrompt } from '../src/server/personas.mjs';
 
 vi.mock('../src/server/llm/provider-runtime.mjs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -114,6 +114,26 @@ describe('personas module', () => {
     expect(persona).toBeNull();
     expect(out).toEqual(messages);
   });
+
+  it('renderPrompt substitutes {{NAME}} and the original default name', () => {
+    expect(renderPrompt('You are {{NAME}}, operator.', 'Aimi', 'Jarvis')).toBe('You are Jarvis, operator.');
+    expect(renderPrompt('You are Aimi, operator.', 'Aimi', 'Jarvis')).toBe('You are Jarvis, operator.');
+    expect(renderPrompt('You are Aimi, operator.', 'Aimi', 'Aimi')).toBe('You are Aimi, operator.');
+    expect(renderPrompt(null, 'Aimi', 'Jarvis')).toBe('');
+  });
+
+  it('applyPersona applies DB overrides when given stmts', () => {
+    const stmts = {
+      personaOverrides: {
+        get: { get: (id) => ({ persona_id: id, name: 'Jarvis', system_prompt: 'You are {{NAME}}.' }) },
+        getAll: { all: () => [] },
+      },
+    };
+    const { messages: out, persona } = applyPersona(stmts, [{ role: 'user', content: 'hi' }], 'aimi');
+    expect(persona.name).toBe('Jarvis');
+    expect(out[0].role).toBe('system');
+    expect(out[0].content).toContain('You are Jarvis.');
+  });
 });
 
 describe('persona API', () => {
@@ -164,5 +184,52 @@ describe('persona API', () => {
     const sent = JSON.parse(call[1].body);
     expect(sent.messages[0].role).toBe('user');
     expect(sent.messages).toHaveLength(1);
+  });
+
+  it('GET /api/personas/:id returns full detail including rendered system prompt', async () => {
+    const res = await request(app).get('/api/personas/aimi');
+    expect(res.status).toBe(200);
+    expect(res.body.persona.name).toBe('Aimi');
+    expect(res.body.persona.systemPrompt).toContain('You are Aimi');
+    expect(res.body.persona.systemPrompt).not.toContain('{{NAME}}');
+    expect(res.body.persona.overridden).toBe(false);
+  });
+
+  it('PUT /api/personas/:id renames a persona and rewrites its self-identity', async () => {
+    const res = await request(app)
+      .put('/api/personas/aimi')
+      .set(adminAuth())
+      .send({ name: 'Jarvis' });
+    expect(res.status).toBe(200);
+    expect(res.body.persona.name).toBe('Jarvis');
+    expect(res.body.persona.systemPrompt).toContain('You are Jarvis');
+
+    const list = await request(app).get('/api/personas');
+    expect(list.body.personas.find(p => p.id === 'aimi').name).toBe('Jarvis');
+
+    fetchMock.mockClear();
+    await request(app)
+      .post('/api/chat/completions')
+      .set(adminAuth())
+      .send({ messages: [{ role: 'user', content: 'who are you?' }], model: 'gpt-4o', stream: true });
+    const call = fetchMock.mock.calls.find(c => String(c[0]).includes('/chat/completions'));
+    const sent = JSON.parse(call[1].body);
+    expect(sent.messages[0].content).toContain('You are Jarvis');
+  });
+
+  it('POST /api/personas/:id/reset reverts to the default identity', async () => {
+    await request(app).put('/api/personas/aimi').set(adminAuth()).send({ name: 'Jarvis' });
+    const res = await request(app).post('/api/personas/aimi/reset').set(adminAuth());
+    expect(res.status).toBe(200);
+    expect(res.body.persona.name).toBe('Aimi');
+    expect(res.body.persona.systemPrompt).toContain('You are Aimi');
+
+    const list = await request(app).get('/api/personas');
+    expect(list.body.personas.find(p => p.id === 'aimi').name).toBe('Aimi');
+  });
+
+  it('unknown persona endpoints return 404', async () => {
+    const res = await request(app).get('/api/personas/nope');
+    expect(res.status).toBe(404);
   });
 });

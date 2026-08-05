@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { X, Send, Sparkles, Cpu, Radio, ChevronRight, Wrench, Loader, Zap, Paperclip, Image, FileText, Code, XCircle } from 'lucide-react';
+import { usePersonas } from './PersonaContext';
 
 // ─── Aimi Color Palette ────────────────────────────────────────────
 const AIMI = {
@@ -43,18 +44,24 @@ function getExpression(msg, streaming) {
 }
 
 // ─── Stage Definitions ─────────────────────────────────────────────
-const STAGES = [
- { name: 'Spawn', level: 1, minXP: 0, status: 'AIMI SPAWN v0.1', color: AIMI.shell },
- { name: 'Aimi Core', level: 2, minXP: 100, status: 'AIMI CORE v2.1', color: AIMI.core },
- { name: 'Aimi Sentinel', level: 3, minXP: 500, status: 'AIMI-SENTINEL v3.0', color: AIMI.accent },
- { name: 'Omni-Aimi', level: 4, minXP: 2000, status: 'OMNI-AIMI v∞.0', color: AIMI.gold },
-];
+function buildStages(name) {
+ const n = name || 'Aimi';
+ const up = n.toUpperCase();
+ return [
+  { name: 'Spawn', level: 1, minXP: 0, status: `${up} SPAWN v0.1`, color: AIMI.shell },
+  { name: `${n} Core`, level: 2, minXP: 100, status: `${up} CORE v2.1`, color: AIMI.core },
+  { name: `${n} Sentinel`, level: 3, minXP: 500, status: `${up}-SENTINEL v3.0`, color: AIMI.accent },
+  { name: `Omni-${n}`, level: 4, minXP: 2000, status: `OMNI-${up} v∞.0`, color: AIMI.gold },
+ ];
+}
+const STAGES = buildStages('Aimi');
 
-function getStage(xp) {
- for (let i = STAGES.length - 1; i >= 0; i--) {
-  if (xp >= STAGES[i].minXP) return STAGES[i];
+function getStage(xp, name) {
+ const stages = buildStages(name);
+ for (let i = stages.length - 1; i >= 0; i--) {
+  if (xp >= stages[i].minXP) return stages[i];
  }
- return STAGES[0];
+ return stages[0];
 }
 
 // ─── Canvas2D Skeletal Renderer ────────────────────────────────────
@@ -339,13 +346,14 @@ function AimiCanvas({ expression = 'idle', stage = 1, streaming = false, size = 
  );
 }
 
-export { AimiCanvas, getExpression, getStage, STAGES, AIMI };
+export { AimiCanvas, getExpression, getStage, buildStages, STAGES, AIMI };
 
 // ─── Aimi Chat Panel (uses AimiCanvas) ─────────────────────────────
 export default function AimiCanvasCompanion() {
+ const { companionName } = usePersonas();
  const [open, setOpen] = useState(false);
  const [messages, setMessages] = useState([
-  { role: 'aimi', text: 'Hello, Operator. Aimi online. I can manage agents, create tasks, check system status, and more. What do you need?' }
+  { role: 'aimi', text: `Hello, Operator. ${companionName} online. I can manage agents, create tasks, check system status, and more. What do you need?` }
  ]);
  const [input, setInput] = useState('');
  const [xp, setXp] = useState(() => parseInt(localStorage.getItem('aimi_xp_points') || '0', 10));
@@ -404,7 +412,7 @@ export default function AimiCanvasCompanion() {
   }, []);
 
 
- const stage = getStage(xp);
+ const stage = getStage(xp, companionName);
 
  useEffect(() => { localStorage.setItem('aimi_xp_points', String(xp)); }, [xp]);
  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, streamBuf, thinking]);
@@ -429,14 +437,14 @@ export default function AimiCanvasCompanion() {
         typewriterRef.current = null;
         commitRef.current = false;
         lenRef.current = 0;
-        const final = target.trim() ? target : '⚠ Aimi received your message but returned an empty response.';
+        const final = target.trim() ? target : `⚠ ${companionName} received your message but returned an empty response.`;
         setStreamBuf('');
         setThinking('');
         setMessages(prev => [...prev, { role: 'aimi', text: final }]);
       }
     }, 24);
     return () => { clearInterval(typewriterRef.current); typewriterRef.current = null; };
-  }, [streaming]);
+  }, [streaming, companionName]);
 
  const quickActions = [
   { label: 'Status', cmd: 'Give me a system status report', icon: <Radio size={10} /> },
@@ -546,7 +554,7 @@ export default function AimiCanvasCompanion() {
      onPointerCancel={onDragEnd}
      className="fixed z-50 w-14 h-14 rounded-full group aimi-float flex items-center justify-center"
      style={{ left: mascotPos.left, top: mascotPos.top, background: `linear-gradient(135deg, ${AIMI.shell}, ${AIMI.core})`, boxShadow: `0 0 20px ${AIMI.core}44, 0 0 40px ${AIMI.shell}22`, touchAction: 'none', cursor: 'move' }}
-     title="Open Aimi"
+     title={`Open ${companionName}`}
     >
      <AimiCanvas expression={currentExpr} stage={stage.level} streaming={streaming} size={56} />
      <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 56 56">
@@ -612,7 +620,7 @@ export default function AimiCanvasCompanion() {
         border: `1px solid ${msg.role === 'user' ? AIMI.core + '20' : AIMI.shell + '33'}`,
         whiteSpace: 'pre-wrap',
        }}>
-       {msg.role === 'aimi' && <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>Aimi</span>}
+        {msg.role === 'aimi' && <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>{companionName}</span>}
        {msg.text}
       </div>
      </div>
@@ -620,7 +628,7 @@ export default function AimiCanvasCompanion() {
     {(streaming || streamBuf || thinking) && (
      <div className="flex justify-start">
       <div className="max-w-[90%] px-2.5 py-1.5 rounded-lg rounded-bl-sm text-xs leading-relaxed" style={{ background: `${AIMI.shell}22`, color: '#bbb', border: `1px solid ${AIMI.shell}33`, whiteSpace: 'pre-wrap' }}>
-       <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>Aimi</span>
+        <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>{companionName}</span>
        {thinking && (
         <div className="mb-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap' }}>▸ {thinking}{thinking.length >= 900 ? '…' : ''}</div>
        )}
@@ -657,7 +665,7 @@ export default function AimiCanvasCompanion() {
      value={input}
      onChange={e => setInput(e.target.value)}
      onKeyDown={e => { if (e.key === 'Enter') handleSend(); }}
-     placeholder="Ask Aimi to do something..."
+      placeholder={`Ask ${companionName} to do something...`}
      className="flex-1 px-2 py-1.5 rounded text-xs text-white placeholder-gray-600 outline-none"
      style={{ background: `${AIMI.dark}`, border: `1px solid ${AIMI.core}20` }}
      disabled={streaming}

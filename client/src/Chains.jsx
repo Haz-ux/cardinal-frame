@@ -3,6 +3,7 @@ import { Link2, Play, Plus, Trash2, Sparkles, ChevronDown, ChevronRight, Zap, Lo
 import { NEON, BG, FONTS } from './theme';
 import { useAuth } from './AuthContext';
 import { useWebSocket } from './useWebSocket';
+import { usePersonas } from './PersonaContext';
 
 const API = '/api/chains';
 
@@ -77,8 +78,9 @@ function PipelineViz({ chain, type, runState }) {
   );
 }
 
-// ─── Aimi Intent Input ───────────────────────────────────────
+// ─── Intent Designer Input ──────────────────────────────────
 function AimiIntentBox({ type, onGenerated }) {
+  const { companionName } = usePersonas();
   const [prompt, setPrompt] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -138,7 +140,7 @@ function AimiIntentBox({ type, onGenerated }) {
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
         <Sparkles size={16} style={{ color: NEON.purple }} />
-        <span style={{ fontSize: '13px', fontWeight: 600, color: NEON.purple }}>Aimi Chain Designer</span>
+        <span style={{ fontSize: '13px', fontWeight: 600, color: NEON.purple }}>{companionName} Chain Designer</span>
       </div>
       <textarea
         value={prompt}
@@ -314,6 +316,7 @@ const miniBtn = (color) => ({
 // ─── Main Page ────────────────────────────────────────────────
 export default function Chains() {
   const { user } = useAuth();
+  const { companionName } = usePersonas();
   const [tab, setTab] = useState('skill'); // 'skill' or 'tool'
   const [chains, setChains] = useState({ skill: [], tool: [] });
   const [skills, setSkills] = useState([]);
@@ -453,7 +456,7 @@ export default function Chains() {
 
           <div style={{ marginTop: '12px' }}>
             {currentChains.length === 0 && (
-              <div style={{ color: '#666', fontSize: '12px', padding: '16px 0' }}>No chains yet. Use Aimi above or create one manually.</div>
+              <div style={{ color: '#666', fontSize: '12px', padding: '16px 0' }}>No chains yet. Use {companionName} above or create one manually.</div>
             )}
             {currentChains.map(chain => (
               <div key={chain.id} onClick={() => { setSelected(chain); setCreating(false); setRunState(null); }}

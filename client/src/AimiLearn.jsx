@@ -2,9 +2,12 @@ import { useState, useEffect, useCallback } from 'react';
 import { NEON, BG, GLOW } from './theme';
 import { cachedFetch, invalidateCache } from './dataCache';
 import { usePolling } from './usePolling';
+import { usePersonas } from './PersonaContext';
+import PersonasPanel from './PersonasPanel';
 import { Brain, Target, Zap, TrendingUp, CheckCircle, XCircle, Sparkles, Eye, Cpu } from 'lucide-react';
 
 export default function AimiLearn() {
+  const { companionName } = usePersonas();
   const [stats, setStats] = useState(null);
   const [patterns, setPatterns] = useState([]);
   const [observations, setObservations] = useState([]);
@@ -50,7 +53,7 @@ export default function AimiLearn() {
         invalidateCache('/api/learn/stats');
         load();
         if (result.id) {
-          alert(`Aimi proposed skill: ${result.name}\nBased on ${result.based_on?.observation_count} observations of intent: ${result.based_on?.intent}`);
+          alert(`${companionName} proposed skill: ${result.name}\nBased on ${result.based_on?.observation_count} observations of intent: ${result.based_on?.intent}`);
         } else {
           alert(result.message || 'No new skills to propose — need more recurring patterns.');
         }
@@ -136,7 +139,7 @@ export default function AimiLearn() {
           <h1 className="flex items-center gap-2 text-xl font-bold tracking-wider font-hud"
             style={{ color: NEON.cyan, filter: `drop-shadow(0 0 8px ${NEON.cyan}60)` }}>
             <Brain size={24} />
-            Aimi Self-Learning
+            {companionName} Self-Learning
           </h1>
           <p className="text-[11px] mt-1" style={{ color: '#555' }}>
             Pattern detection → skill proposal → validation → confidence loop
@@ -162,11 +165,14 @@ export default function AimiLearn() {
         </button>
       </div>
 
+      {/* ── Identities (persona editor) ── */}
+      <PersonasPanel />
+
       {/* ── Stats row ── */}
       <div className="flex flex-wrap gap-3">
         <StatCard icon={Eye} label="Observations" value={stats?.total_observations ?? 0} color={NEON.cyan} />
         <StatCard icon={TrendingUp} label="Patterns" value={stats?.total_patterns ?? 0} color={NEON.magenta} sub="detected from observations" />
-        <StatCard icon={Sparkles} label="Auto-Proposed" value={stats?.auto_proposed_skills ?? 0} color={NEON.purple} sub="skills proposed by Aimi" />
+        <StatCard icon={Sparkles} label="Auto-Proposed" value={stats?.auto_proposed_skills ?? 0} color={NEON.purple} sub={`skills proposed by ${companionName}`} />
         <StatCard icon={CheckCircle} label="Validated" value={stats?.validated_skills ?? 0} color={NEON.green} sub="skills passing validation" />
         <StatCard icon={Cpu} label="Avg Confidence" value={`${Math.round((stats?.avg_pattern_confidence ?? 0) * 100)}%`} color={NEON.yellow} />
       </div>
@@ -186,7 +192,7 @@ export default function AimiLearn() {
           <div className="flex-1 overflow-auto p-3 flex flex-col gap-2" style={{ maxHeight: '400px' }}>
             {patterns.length === 0 && !loading && (
               <div className="text-center py-12 text-[11px]" style={{ color: '#444' }}>
-                No patterns yet. Aimi observes interactions and detects recurring patterns over time.
+                No patterns yet. {companionName} observes interactions and detects recurring patterns over time.
               </div>
             )}
             {patterns.map(p => (
@@ -232,7 +238,7 @@ export default function AimiLearn() {
           <div className="flex-1 overflow-auto p-3 flex flex-col gap-2" style={{ maxHeight: '400px' }}>
             {observations.length === 0 && !loading && (
               <div className="text-center py-12 text-[11px]" style={{ color: '#444' }}>
-                No observations recorded yet. Observations are logged when Aimi processes user interactions.
+                No observations recorded yet. Observations are logged when {companionName} processes user interactions.
               </div>
             )}
             {observations.map(o => (
@@ -274,7 +280,7 @@ export default function AimiLearn() {
           <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: NEON.green }}>Skill Validation Sandbox</span>
         </div>
         <p className="text-[10px]" style={{ color: '#555' }}>
-          Test Aimi's auto-proposed skills against inputs. Pass/fail updates confidence scores in real time.
+          Test {companionName}'s auto-proposed skills against inputs. Pass/fail updates confidence scores in real time.
         </p>
         <div className="flex gap-2 items-center">
           <input
@@ -315,7 +321,7 @@ export default function AimiLearn() {
         ))}
         <div className="flex gap-2 items-center text-[10px]" style={{ color: '#555' }}>
           <span className="px-2 py-1 rounded" style={{ background: `${NEON.cyan}08` }}>
-            💡 Aimi runs the skill handler in a sandboxed eval. Pass results adjust confidence via incremental Bayesian update.
+            💡 {companionName} runs the skill handler in a sandboxed eval. Pass results adjust confidence via incremental Bayesian update.
           </span>
         </div>
       </div>

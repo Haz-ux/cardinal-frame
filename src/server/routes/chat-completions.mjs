@@ -1,7 +1,7 @@
 import express from 'express';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { getModelCost } from './costs.mjs';
-import { applyPersona, DEFAULT_PERSONA, listPersonas } from '../personas.mjs';
+import { PERSONAS, applyPersona, DEFAULT_PERSONA, getPersonaDetail, listPersonas, savePersonaOverride, resetPersona } from '../personas.mjs';
 import { autoObserve } from '../learn.mjs';
 
 export { autoObserve };
@@ -39,7 +39,33 @@ export default function chatCompletionsRoutes(ctx) {
   const router = express.Router();
 
   router.get('/personas', optionalAuth, (_req, res) => {
-    res.json({ personas: listPersonas(), default: 'aimi' });
+    res.json({ personas: listPersonas(stmts), default: 'aimi' });
+  });
+
+  router.get('/personas/:id', optionalAuth, (req, res) => {
+    if (!PERSONAS[req.params.id]) return res.status(404).json({ error: 'Unknown persona' });
+    res.json({ persona: getPersonaDetail(stmts, req.params.id) });
+  });
+
+  router.put('/personas/:id', authMiddleware, (req, res) => {
+    const id = req.params.id;
+    if (!PERSONAS[id]) return res.status(404).json({ error: 'Unknown persona' });
+    const { name, tagline, color, system_prompt } = req.body || {};
+    const persona = savePersonaOverride(stmts, id, { name, tagline, color, system_prompt });
+    audit('persona.update', 'persona', id, req.user.id, { name: persona.name, color: persona.color });
+    broadcast('persona:updated', { personaId: id, name: persona.name, color: persona.color });
+    logger.info(`Persona "${id}" updated → "${persona.name}"`);
+    res.json({ persona });
+  });
+
+  router.post('/personas/:id/reset', authMiddleware, (req, res) => {
+    const id = req.params.id;
+    if (!PERSONAS[id]) return res.status(404).json({ error: 'Unknown persona' });
+    const persona = resetPersona(stmts, id);
+    audit('persona.reset', 'persona', id, req.user.id, { name: persona.name });
+    broadcast('persona:updated', { personaId: id, name: persona.name, color: persona.color });
+    logger.info(`Persona "${id}" reset to default "${persona.name}"`);
+    res.json({ persona });
   });
 
   router.post('/chat/completions', authMiddleware, apiLimiter, async (req, res) => {
@@ -49,7 +75,7 @@ export default function chatCompletionsRoutes(ctx) {
     let activePersona = null;
     const direct = persona === 'direct' || persona === 'none' || persona === '';
     if (!direct) {
-      const applied = applyPersona(messages, persona || DEFAULT_PERSONA);
+      const applied = applyPersona(stmts, messages, persona || DEFAULT_PERSONA);
       messages = applied.messages;
       activePersona = applied.persona;
       if (activePersona) logger.info(`Chat via persona "${activePersona.name}"`);
