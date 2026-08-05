@@ -15,7 +15,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    host: '127.0.0.1', // bind IPv4 so mobile webviews resolving localhost to 127.0.0.1 can connect
+    host: '::1', // IPv6 loopback: browsers here resolve localhost to ::1 (a wildcard host like '::' would also call os.networkInterfaces(), which the proot sandbox blocks)
     strictPort: true, // fail hard if 5173 is busy instead of silently bumping to 5174+
     proxy: {
       '/api': { target: 'http://localhost:8080', changeOrigin: true, secure: false },

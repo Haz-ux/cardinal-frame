@@ -372,20 +372,42 @@ export default function AimiCanvasCompanion() {
   // ─── Draggable position (persisted across reloads) ──────────────
   const MASCOT_POS_KEY = 'aimi_mascot_pos';
   const ORB_SIZE = 56;
+  // Keep the orb on-screen for the current viewport. clampPos is safe to
+  // call during render/init because it only reads window dimensions.
   const clampPos = (left, top) => ({
-    left: Math.max(0, Math.min(left, window.innerWidth - ORB_SIZE)),
-    top: Math.max(0, Math.min(top, window.innerHeight - ORB_SIZE)),
+    left: Math.max(0, Math.min(left, Math.max(0, window.innerWidth - ORB_SIZE))),
+    top: Math.max(0, Math.min(top, Math.max(0, window.innerHeight - ORB_SIZE))),
   });
 
   const [mascotPos, setMascotPos] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(MASCOT_POS_KEY));
-      if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') return saved;
+      if (saved && typeof saved.left === 'number' && typeof saved.top === 'number') return clampPos(saved.left, saved.top);
     } catch {}
     return { left: window.innerWidth - 20 - ORB_SIZE, top: window.innerHeight - 20 - ORB_SIZE };
   });
   const mascotPosRef = useRef(mascotPos);
   useEffect(() => { mascotPosRef.current = mascotPos; }, [mascotPos]);
+  // Re-clamp when the viewport changes (desktop ↔ mobile view toggle,
+  // rotation, zoom). A position saved in the desktop-width coordinate
+  // space would otherwise leave the orb off-screen and unrecoverable.
+  useEffect(() => {
+    const onViewportChange = () => {
+      setMascotPos(prev => {
+        const next = clampPos(prev.left, prev.top);
+        if (next.left !== prev.left || next.top !== prev.top) {
+          try { localStorage.setItem(MASCOT_POS_KEY, JSON.stringify(next)); } catch {}
+        }
+        return next;
+      });
+    };
+    window.addEventListener('resize', onViewportChange);
+    window.addEventListener('orientationchange', onViewportChange);
+    return () => {
+      window.removeEventListener('resize', onViewportChange);
+      window.removeEventListener('orientationchange', onViewportChange);
+    };
+  }, []);
   const dragRef = useRef(null); // { startX, startY, left, top }
   const movedRef = useRef(false);
 

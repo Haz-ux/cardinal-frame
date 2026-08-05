@@ -1968,7 +1968,7 @@ function gracefulShutdown(signal) {
 
 // ─── Boot ──────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.argv[1]}`) {
-  server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, '::', () => {
    logger.info(`Server running on http://localhost:${PORT} (SQLite + JWT + WS + bcrypt + rate-limit + RBAC + log-stream + health-monitor + agent-loop + job-queue)`);
    fireHook('onServerStart', { port: PORT, version: APP_VERSION });
 
