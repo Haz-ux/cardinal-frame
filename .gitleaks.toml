@@ -15,6 +15,7 @@ regexes = [
   '''REDACTED''',
   '''your-api-key-here''',
   '''YOUR_API_KEY''',
+  '''nvapi-secret-key-1234567890''',
 ]
 
 # Custom rules for known provider patterns that gitleaks might miss

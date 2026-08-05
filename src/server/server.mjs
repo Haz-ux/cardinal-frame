@@ -1380,7 +1380,7 @@ const ctx = {
   getDevSetting, getDevSettings,
   runSandboxed, runSandboxedHybrid,
   executeInDocker, isDockerAvailable,
-  getModelCost, buildAimiSystemPrompt,
+  getModelCost, buildAimiSystemPrompt: (userId) => buildAimiSystemPrompt(stmts, userId),
   checkPermission, auditLog,
   // These are populated later (declared with const/let below)
   get collectTelemetry() { return collectTelemetry; },

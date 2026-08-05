@@ -1,6 +1,6 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
+import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload, detectModelsFromProvider } from './llm-helpers.mjs';
 
 /**
  * Aimi routes: built-in system tools, system prompt builder, and the smart
@@ -52,7 +52,7 @@ export function autoRegisterSystemTools(stmts, randomUUID, logger) {
 
 // ─── Aimi System Prompt Builder ──────────────────────────────────
 // Builds Aimi's system prompt dynamically with current system state + available tools
-export function buildAimiSystemPrompt(userId) {
+export function buildAimiSystemPrompt(stmts, userId) {
   const agents = stmts.agents.getAll.all();
   const tasks = stmts.tasks.getAll.all();
   const providers = stmts.providers.getAll.all().filter(p => p.enabled);
@@ -127,6 +127,19 @@ export default function aimiRoutes(ctx) {
       modelRecord = stmts.models.getDefault.get();
       if (modelRecord) provider = stmts.providers.getById.get(modelRecord.provider_id);
     }
+    // Fall back to an enabled provider with a real API key when no default
+    // model is set (e.g. the user saved a key but never detected models).
+    // Prefer one that already has models, then any keyed provider (we auto-
+    // detect its models below), then local Ollama.
+    if (!provider) {
+      const usable = stmts.providers.getAll.all()
+        .filter(p => p.enabled && (p.type === 'ollama' || (p.api_key && p.api_key.length > 10 && !p.api_key.includes('*'))))
+        .map(p => stmts.providers.getById.get(p.id))
+        .filter(Boolean);
+      const hasModels = p => db.prepare('SELECT COUNT(*) AS n FROM llm_models WHERE provider_id = ?').get(p.id).n > 0;
+      const keyed = p => p.api_key && p.api_key.length > 10 && !p.api_key.includes('*');
+      provider = usable.find(hasModels) || usable.find(keyed) || usable.find(p => p.type === 'ollama') || null;
+    }
     if (!provider || !provider.api_key) {
       return res.status(400).json({ error: 'No LLM provider with API key configured. Set one up in LLM Models page.' });
     }
@@ -135,7 +148,21 @@ export default function aimiRoutes(ctx) {
       return res.status(400).json({ error: `Provider "${provider.name}" has no API key set.` });
     }
 
-    const systemPrompt = buildAimiSystemPrompt(req.user.id);
+    // Pick a model: the provider's default, else its first model, else detect.
+    if (!modelRecord) {
+      modelRecord = db.prepare('SELECT * FROM llm_models WHERE provider_id = ? ORDER BY is_default DESC, rowid ASC LIMIT 1').get(provider.id);
+      if (!modelRecord) {
+        try {
+          await detectModelsFromProvider(db, provider);
+          modelRecord = db.prepare('SELECT * FROM llm_models WHERE provider_id = ? ORDER BY rowid ASC LIMIT 1').get(provider.id);
+        } catch { /* detection failed — clear error below */ }
+        if (!modelRecord) {
+          return res.status(400).json({ error: `No models detected for provider "${provider.name}". Run Detect Models on the LLM Models page.` });
+        }
+      }
+    }
+
+    const systemPrompt = buildAimiSystemPrompt(stmts, req.user.id);
 
     // Build message history (include system prompt + user message)
     const chatMessages = [
