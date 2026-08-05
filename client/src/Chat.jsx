@@ -174,7 +174,7 @@ export default function Chat() {
           model: selectedModel || undefined,
           conversation_id: conv.id,
           stream: true,
-          persona: selectedPersona || undefined,
+          persona: selectedPersona || 'direct',
         }),
         signal: controller.signal,
       });

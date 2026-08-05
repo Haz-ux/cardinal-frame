@@ -139,12 +139,26 @@ describe('persona API', () => {
     expect(sent.messages).toHaveLength(2);
   });
 
-  it('POST /api/chat/completions without persona keeps messages raw', async () => {
+  it('POST /api/chat/completions without persona defaults to the Aimi persona', async () => {
     fetchMock.mockClear();
     const res = await request(app)
       .post('/api/chat/completions')
       .set(adminAuth())
       .send({ messages: [{ role: 'user', content: 'hi' }], model: 'gpt-4o', stream: true });
+    expect(res.status).toBe(200);
+    const call = fetchMock.mock.calls.find(c => String(c[0]).includes('/chat/completions'));
+    const sent = JSON.parse(call[1].body);
+    expect(sent.messages[0].role).toBe('system');
+    expect(sent.messages[0].content).toContain('AI companion and system operator');
+    expect(sent.messages).toHaveLength(2);
+  });
+
+  it('POST /api/chat/completions with persona "direct" keeps messages raw', async () => {
+    fetchMock.mockClear();
+    const res = await request(app)
+      .post('/api/chat/completions')
+      .set(adminAuth())
+      .send({ messages: [{ role: 'user', content: 'hi' }], persona: 'direct', model: 'gpt-4o', stream: true });
     expect(res.status).toBe(200);
     const call = fetchMock.mock.calls.find(c => String(c[0]).includes('/chat/completions'));
     const sent = JSON.parse(call[1].body);

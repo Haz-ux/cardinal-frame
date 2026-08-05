@@ -1,7 +1,7 @@
 import express from 'express';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { getModelCost } from './costs.mjs';
-import { applyPersona, listPersonas } from '../personas.mjs';
+import { applyPersona, DEFAULT_PERSONA, listPersonas } from '../personas.mjs';
 
 /**
  * Chat completions proxy: routes chat requests to the user's selected
@@ -81,8 +81,9 @@ export default function chatCompletionsRoutes(ctx) {
     if (!messages || !messages.length) return res.status(400).json({ error: 'messages required' });
 
     let activePersona = null;
-    if (persona) {
-      const applied = applyPersona(messages, persona);
+    const direct = persona === 'direct' || persona === 'none' || persona === '';
+    if (!direct) {
+      const applied = applyPersona(messages, persona || DEFAULT_PERSONA);
       messages = applied.messages;
       activePersona = applied.persona;
       if (activePersona) logger.info(`Chat via persona "${activePersona.name}"`);
