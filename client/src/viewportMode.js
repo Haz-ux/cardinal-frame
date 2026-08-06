@@ -18,11 +18,40 @@ export function isDesktopMode() {
   return localStorage.getItem(KEY) === 'desktop';
 }
 
+// Detect the viewing browser's own mode rather than the physical device:
+// mobile browsers advertise Mobile/Android/iPhone (or userAgentData.mobile);
+// "Desktop site" / desktop browsers do not. Touch + narrow viewport is a
+// fallback for webviews that omit the mobile UA token.
+export function detectBrowserMode() {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return 'mobile';
+  const uad = navigator.userAgentData;
+  if (uad && typeof uad.mobile === 'boolean') return uad.mobile ? 'mobile' : 'desktop';
+  const ua = navigator.userAgent || '';
+  if (/Mobi|Android|iPhone|iPad|iPod|Windows Phone|Mobile/i.test(ua)) return 'mobile';
+  const touch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  if (touch && window.innerWidth < 768) return 'mobile';
+  return 'desktop';
+}
+
+export function getViewportMode() {
+  const saved = localStorage.getItem(KEY);
+  return saved === 'mobile' || saved === 'desktop' ? saved : detectBrowserMode();
+}
+
 export function applyViewportMode() {
   if (typeof document === 'undefined') return;
   const meta = document.querySelector('meta[name="viewport"]');
   if (!meta) return;
-  meta.setAttribute('content', isDesktopMode() ? `width=${DESKTOP_WIDTH}, initial-scale=1` : MOBILE_CONTENT);
+  meta.setAttribute('content', getViewportMode() === 'desktop' ? `width=${DESKTOP_WIDTH}, initial-scale=1` : MOBILE_CONTENT);
+}
+
+// Boot-time applier for the pre-auth screens (login + splash): always follows
+// the browser's detected mode, ignoring any stale persisted preference.
+export function applyDetectedViewport() {
+  if (typeof document === 'undefined') return;
+  const meta = document.querySelector('meta[name="viewport"]');
+  if (!meta) return;
+  meta.setAttribute('content', detectBrowserMode() === 'desktop' ? `width=${DESKTOP_WIDTH}, initial-scale=1` : MOBILE_CONTENT);
 }
 
 export function toggleDesktopMode() {
