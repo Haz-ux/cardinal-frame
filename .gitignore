@@ -34,6 +34,7 @@ gemini_api_key.txt
 !README.md
 !ARCHITECTURE.md
 !CONTRIBUTING.md
+!AUDIT_AND_PLAN.md
 !docs/adr/
 !docs/adr/**
 !ROADMAP.md
