@@ -48,10 +48,15 @@ function ProtectedRoute({ children }) {
    if (!bootChecked.current && user) {
     bootChecked.current = true;
     prewarm(['/api/dashboard/summary', '/api/llm/models', '/api/llm/providers', '/api/graph', '/api/agents', '/api/tasks', '/api/tools', '/api/skills']);
+    const justLoggedIn = sessionStorage.getItem('cf_just_logged_in');
     sessionStorage.removeItem('cf_just_logged_in');
-    // Boot cinematic on every startup (skippable): galaxy "big bang" splash,
-    // then the typed boot splash, then the app.
-    setBootPhase('galaxy');
+    // Galaxy "big bang" splash plays right after a real login (once per
+    // session), then the typed boot splash, then the app. Plain page reloads
+    // skip straight to the app so the cinematic can't stall startup on
+    // constrained/mobile devices.
+    if (justLoggedIn) {
+      setBootPhase('galaxy');
+    }
    }
   }, [user]);
 
