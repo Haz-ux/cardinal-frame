@@ -44,20 +44,20 @@ export default function BigBangSplash({ onDone }) {
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas ? canvas.getContext('2d') : null;
 
     let W = 0;
     let H = 0;
     let dpr = 1;
     const resize = () => {
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       W = window.innerWidth;
       H = window.innerHeight;
       canvas.width = W * dpr;
       canvas.height = H * dpr;
       canvas.style.width = W + 'px';
       canvas.style.height = H + 'px';
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     resize();
     window.addEventListener('resize', resize);
@@ -115,9 +115,30 @@ export default function BigBangSplash({ onDone }) {
       { t: 1200, peak: 0.35, decay: 260 },
     ];
 
+    // If the 2D context is unavailable (constrained/low-memory webview) skip
+    // the animation entirely — the timers below still advance the sequence.
     let raf = 0;
     let last = performance.now();
     const t0 = last;
+    if (!ctx) {
+      const logoTimer = setTimeout(() => setLogoIn(true), 250);
+      const fadeTimer = setTimeout(() => setFading(true), FADE_START_MS);
+      const doneTimer = setTimeout(finish, TOTAL_MS);
+      const onKey = (e) => {
+        if (e.key === 'Escape' || e.key === ' ' || e.key === 'Enter') {
+          e.preventDefault();
+          finish();
+        }
+      };
+      window.addEventListener('keydown', onKey);
+      return () => {
+        clearTimeout(logoTimer);
+        clearTimeout(fadeTimer);
+        clearTimeout(doneTimer);
+        window.removeEventListener('resize', resize);
+        window.removeEventListener('keydown', onKey);
+      };
+    }
 
     function drawParticle(p, alpha) {
       const x = cx + Math.cos(p.angle) * p.dist;
@@ -253,8 +274,10 @@ export default function BigBangSplash({ onDone }) {
     <div
       ref={wrapRef}
       className="fixed inset-0 overflow-hidden"
+      onClick={finish}
       style={{
         background: '#000',
+        cursor: 'pointer',
         zIndex: 9999,
         opacity: fading ? 0 : 1,
         transition: 'opacity 0.65s ease',

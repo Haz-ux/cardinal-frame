@@ -76,9 +76,14 @@ export function api(path, opts = {}) {
   const token = localStorage.getItem('cf_token');
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  return fetch(path, { ...opts, headers, cache: 'no-store' }).then(r => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  return fetch(path, { ...opts, headers, cache: 'no-store', signal: controller.signal }).then(r => {
     if (!r.ok) return r.json().then(e => Promise.reject(new Error(e.error || `Request failed: ${r.status}`)));
     return r.json();
+  }).finally(() => clearTimeout(timer)).catch(err => {
+    if (err.name === 'AbortError') throw new Error('Request timed out — check the server connection and try again');
+    throw err;
   });
 }
 

@@ -90,6 +90,7 @@ function AimiCanvas({ expression = 'idle', stage = 1, streaming = false, size = 
   const canvas = canvasRef.current;
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
+  if (!ctx) return;
   const dpr = window.devicePixelRatio || 1;
   canvas.width = size * dpr;
   canvas.height = size * dpr;

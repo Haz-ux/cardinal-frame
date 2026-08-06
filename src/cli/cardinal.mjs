@@ -135,7 +135,7 @@ async function run(args) {
   }
 
   // Start the server (stable entrypoint — no file watcher)
-  const serverProc = spawn('node', ['src/server/server.mjs'], {
+  const serverProc = spawn('node', ['--max-old-space-size=512', 'src/server/server.mjs'], {
     cwd: CF_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

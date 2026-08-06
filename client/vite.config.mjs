@@ -12,13 +12,41 @@ export default defineConfig({
     // package.json at build time so it can never drift out of date again.
     __APP_VERSION__: JSON.stringify(rootPkg.version),
   },
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: 'request-logger',
+      configureServer(server) {
+        server.httpServer.on('request', (req, res) => {
+          console.log(`[vite] ${req.method} ${req.url} (host=${req.headers.host || '-'}, origin=${req.headers.origin || '-'}, conn=${req.headers.connection || '-'})`);
+        });
+      },
+    },
+  ],
   server: {
     port: 5173,
-    host: '::1', // IPv6 loopback: browsers here resolve localhost to ::1 (a wildcard host like '::' would also call os.networkInterfaces(), which the proot sandbox blocks)
+    host: '::1', // this phone's browser resolves localhost → ::1 (IPv6); vite must listen there or localhost:5173 refuses to connect
     strictPort: true, // fail hard if 5173 is busy instead of silently bumping to 5174+
     proxy: {
-      '/api': { target: 'http://localhost:8080', changeOrigin: true, secure: false },
+      '/api': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+        secure: false,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            console.log(`[api-proxy] -> target ${req.method} ${req.url} (origin=${req.headers.origin || '-'}, conn=${req.headers.connection || '-'})`);
+          });
+          proxy.on('proxyReqError', (err, req) => {
+            console.error(`[api-proxy] req ERROR ${err.code || err.message} ${req.method} ${req.url}`);
+          });
+          proxy.on('proxyRes', (proxyRes, req) => {
+            console.log(`[api-proxy] <- ${req.method} ${req.url} => ${proxyRes.statusCode}`);
+          });
+          proxy.on('error', (err, req) => {
+            console.error(`[api-proxy] error ${err.code || err.message} ${req.method} ${req.url}`);
+          });
+        },
+      },
       '/ws': { target: 'ws://localhost:8080', ws: true },
     },
   },

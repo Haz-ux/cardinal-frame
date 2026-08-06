@@ -95,6 +95,8 @@ const corsOrigins = [
   'http://127.0.0.1:8080',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
+  'http://[::1]:8080',
+  'http://[::1]:5173',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : []),
 ];
 app.use(cors({
@@ -1242,7 +1244,7 @@ db.exec(`
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info) => {
   const origin = info.req.headers.origin;
-  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1')) {
+  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://[::1]')) {
     logger.warn(`WS rejected origin: ${origin}`);
     return false;
   }

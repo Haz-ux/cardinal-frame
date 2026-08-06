@@ -337,16 +337,49 @@ function ProtectedRoute({ children }) {
   </div>
  );
 }
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error('Cardinal Frame crashed:', error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6" style={{ background: BG.void }}>
+          <div className="max-w-md w-full text-center">
+            <div className="font-hud text-lg tracking-widest mb-2" style={{ color: NEON.red }}>CARDINAL FRAME — RUNTIME ERROR</div>
+            <div className="font-code text-xs mb-5" style={{ color: '#888', wordBreak: 'break-word' }}>{String(this.state.error.message || this.state.error)}</div>
+            <button
+              onClick={() => window.location.reload()}
+              className="px-5 py-2 font-hud text-xs tracking-widest transition-all"
+              style={{ color: NEON.green, border: `1px solid ${NEON.green}40`, background: `${NEON.green}08` }}
+            >RELOAD</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
  return (
   <BrowserRouter>
    <AuthProvider>
     <ToastProvider>
      <PersonaProvider>
-      <Routes>
-       <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
-       <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
-      </Routes>
+      <ErrorBoundary>
+       <Routes>
+        <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
+        <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
+       </Routes>
+      </ErrorBoundary>
      </PersonaProvider>
     </ToastProvider>
    </AuthProvider>
