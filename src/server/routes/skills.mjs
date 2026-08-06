@@ -457,7 +457,7 @@ export default function skillsRoutes(ctx) {
   });
 
   // POST /api/skills/proposals/:id/accept — accept a proposal, update the skill
-  router.post('/skills/proposals/:id/accept', authMiddleware, requireRole, (req, res) => {
+  router.post('/skills/proposals/:id/accept', authMiddleware, requireRole('admin'), (req, res) => {
     try {
       const proposal = stmts.skillProposals.getById.get(req.params.id);
       if (!proposal) return res.status(404).json({ error: 'Proposal not found' });

@@ -69,9 +69,14 @@ No hardcoded keys in tracked source. No secrets in server logs, DB chat/memory/r
 | Area | Item | Priority |
 |------|------|----------|
 | Auth | JWT is long-lived (24h) with **no refresh or logout endpoint** (`POST /api/auth/logout` absent). Logout is client-side token discard. Consider short-lived access tokens + refresh flow for production multi-user deployments. | Medium |
-| Auth | `POST /api/skills/proposals/:id/accept` passes bare `requireRole` (no role argument) — the middleware's `roles` array is empty, so the endpoint always returns `403` and never calls `next()`. Admin skill-proposal acceptance is currently broken. | High |
 | Docs | `ARCHITECTURE.md` states "API 100/min" rate limit and "5s timeout / 100KB maxBuffer" sandbox — actual values are 50/min (`apiLimiter = writeLimiter`) and the skill VM sandbox uses 30s (configurable via `sandboxTimeout`) with a 1MB `execSync` buffer. Only `POST /api/sandbox/execute` uses 5s/100KB. | Low |
 | Schema | `skill_hub_sources.type` CHECK constraint declares `('git','tarball','http')` but routes insert `'github'`/`'url'`. Constraint predates actual usage. | Low |
+
+## Resolved
+
+| Area | Item | Priority |
+|------|------|----------|
+| Auth | `POST /api/skills/proposals/:id/accept` passed bare `requireRole` (no role argument) — empty `roles` array meant the endpoint always returned `403` and never called `next()`. Fixed to `requireRole('admin')` (`src/server/routes/skills.mjs:460`). Audited all route modules for the same misuse — no other occurrences. | High |
 
 ## Verification
 
