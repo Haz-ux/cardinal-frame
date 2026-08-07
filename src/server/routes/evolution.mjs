@@ -4,6 +4,7 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { buildDistillPrompt, buildEvolutionPrompt, scanSkillHandler, shouldEvolveChain } from '../evolution.mjs';
 import { safeFetch } from '../safe-fetch.mjs';
+import { skillNameFromPhrases, uniqueSkillName, sanitizeSkillName } from '../learn.mjs';
 
 /**
  * Evolution routes: auto-skill distill, chain promotion, skill hub install/export.
@@ -157,6 +158,12 @@ export default function evolutionRoutes(ctx) {
         return res.status(403).json({ error: 'Generated skill handler blocked by security scanner', scan });
       }
 
+      // Name must identify what the skill does; never a placeholder, and must
+      // be unique (skills.name has a UNIQUE constraint).
+      let skillName = sanitizeSkillName(skillDef.name) || skillNameFromPhrases([skillDef.description || skillDef.trigger || sourceRef], { maxWords: 5 }) || 'Distilled Skill';
+      skillName = uniqueSkillName(stmts, skillName);
+      skillDef.name = skillName;
+
       // Save as auto-proposed skill
       const skillId = randomUUID();
       const handler = skillDef.handler_type === 'script' ? skillDef.handler
@@ -164,7 +171,7 @@ export default function evolutionRoutes(ctx) {
         : `template:${skillDef.handler}`;
 
       stmts.skills.insertWithConfidence.run(
-        skillId, skillDef.name, skillDef.description, skillDef.category || 'general',
+        skillId, skillName, skillDef.description, skillDef.category || 'general',
         handler, JSON.stringify(skillDef.parameters || {}), 1,
         skillDef.confidence || 0.7, 1
       );
@@ -260,11 +267,15 @@ export default function evolutionRoutes(ctx) {
         return res.status(403).json({ error: `Evolved handler failed security scan: ${scan.verdict}`, scan });
       }
 
+      let skillName = sanitizeSkillName(evoDef.skill_name) || skillNameFromPhrases([chain.name], { maxWords: 5 }) || 'Evolved Skill';
+      skillName = uniqueSkillName(stmts, skillName);
+      evoDef.skill_name = skillName;
+
       const skillId = randomUUID();
       const handler = evoDef.handler_type === 'hybrid' ? `hybrid:${evoDef.handler}` : evoDef.handler;
 
       stmts.skills.insertWithConfidence.run(
-        skillId, evoDef.skill_name, evoDef.skill_description, 'evolved',
+        skillId, skillName, evoDef.skill_description, 'evolved',
         handler, JSON.stringify({}), 1, evoDef.confidence || 0.8, 1
       );
 

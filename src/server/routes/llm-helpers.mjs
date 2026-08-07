@@ -23,8 +23,10 @@ export { getModelCost, getModelMeta, getContextWindow, hasCapability, listKnownM
 // directly. They'll be phased out as those routes migrate to executeChat.
 
 import { PROVIDER_TYPES, getProviderInterface } from '../llm/provider-runtime.mjs';
+import { decryptProvider } from './settings.mjs';
 
 export function buildProviderAuth(provider, url) {
+  decryptProvider(provider); // api_key is encrypted at rest in llm_providers
   const iface = getProviderInterface(provider.type);
   return iface ? iface.buildAuth(provider, url) : { headers: { 'Content-Type': 'application/json' }, url };
 }

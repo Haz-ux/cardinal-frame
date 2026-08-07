@@ -6,7 +6,7 @@
  * ship disabled until an admin enables them). A daemon runs this on an interval;
  * POST /learn/run-loop triggers a pass on demand.
  */
-import { LEARN_MIN_OCCURRENCES, LEARN_MIN_CONFIDENCE } from './learn.mjs';
+import { LEARN_MIN_OCCURRENCES, LEARN_MIN_CONFIDENCE, skillNameFromPhrases, uniqueSkillName, sanitizeSkillName } from './learn.mjs';
 
 /** Patterns eligible for promotion: mature, recurring, and not yet promoted. */
 export function findPromotionCandidates(stmts, { minOccurrences = LEARN_MIN_OCCURRENCES, minConfidence = LEARN_MIN_CONFIDENCE } = {}) {
@@ -15,12 +15,16 @@ export function findPromotionCandidates(stmts, { minOccurrences = LEARN_MIN_OCCU
     .sort((a, b) => (b.confidence - a.confidence) || (b.occurrence_count - a.occurrence_count));
 }
 
-/** Build a deterministic auto-learned skill definition from a pattern. */
+/**
+ * Build a deterministic auto-learned skill definition from a pattern.
+ * Named after the recurring phrase (what the user keeps asking to do),
+ * not the coarse intent category.
+ */
 export function buildAutoSkillFromPattern(pattern, { now = Date.now() } = {}) {
-  const slug = (pattern.pattern_type || 'general').replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
-  const name = `auto-${slug}-${now.toString(36)}`;
+  const phrase = pattern.pattern_key || pattern.pattern_type || 'general';
+  const name = skillNameFromPhrases([phrase], { maxWords: 5 }) || `Auto ${pattern.pattern_type || 'Skill'}`;
   const handler = `async (input) => {\n  // Auto-learned by Cardinal Frame from a recurring pattern\n  // Pattern: ${pattern.pattern_key}\n  return { handled: true, intent: '${pattern.pattern_type || 'general'}', learned_pattern: ${JSON.stringify(pattern.pattern_key)} };\n}`;
-  const description = `Auto-learned skill for recurring intent "${pattern.pattern_type}" (pattern seen ${pattern.occurrence_count}x, confidence ${Math.round((pattern.confidence || 0) * 100)}%).`;
+  const description = `Auto-learned skill for the recurring request "${phrase}" (seen ${pattern.occurrence_count}x, confidence ${Math.round((pattern.confidence || 0) * 100)}%).`;
   return {
     name,
     description,
@@ -28,6 +32,23 @@ export function buildAutoSkillFromPattern(pattern, { now = Date.now() } = {}) {
     patternKey: pattern.pattern_key,
     parameters: { auto_generated: true, pattern_key: pattern.pattern_key, occurrence_count: pattern.occurrence_count },
   };
+}
+
+/**
+ * Best-effort: ask Aimi (LLM) to name a skill from the recurring phrase.
+ * Returns null when no LLM is available or it fails — caller falls back
+ * to the deterministic name.
+ */
+async function llmSkillName(ctx, phrase) {
+  if (!ctx?.callAgentLLM) return null;
+  try {
+    const result = await ctx.callAgentLLM([
+      { role: 'system', content: 'You are Aimi, naming a reusable skill for Cardinal Frame. Based on the recurring user request below, reply with ONLY a concise human-readable skill name, 2-5 words, no quotes, no punctuation, no "skill" suffix. Example: for "check cardinal frame system health" reply "Check System Health".' },
+      { role: 'user', content: `Recurring request: "${String(phrase || '').slice(0, 200)}"` },
+    ]);
+    return sanitizeSkillName(result?.content);
+  } catch { /* fall back to deterministic name */ }
+  return null;
 }
 
 /**
@@ -40,20 +61,24 @@ export async function runLearnLoop(ctx, opts = {}) {
     const candidate = findPromotionCandidates(stmts, opts)[0];
     if (!candidate) return null;
     const auto = buildAutoSkillFromPattern(candidate, opts);
+    let name = auto.name;
+    const llmName = await llmSkillName(ctx, candidate.pattern_key || auto.name);
+    if (llmName) name = llmName;
+    name = uniqueSkillName(stmts, name);
     const id = randomUUID();
     stmts.skills.insertWithConfidence.run(
-      id, auto.name, auto.description, 'auto-learned',
+      id, name, auto.description, 'auto-learned',
       auto.handler, JSON.stringify(auto.parameters), 0, 0.3, 1
     );
     stmts.patterns.updateConfidence.run(candidate.confidence, id, candidate.id);
     if (audit) audit('auto-promote', 'skill', id, null, {
-      name: auto.name, pattern_id: candidate.id, pattern_key: candidate.pattern_key, occurrences: candidate.occurrence_count,
+      name, pattern_id: candidate.id, pattern_key: candidate.pattern_key, occurrences: candidate.occurrence_count,
     });
     if (broadcast) broadcast('learn:promoted', {
-      id, name: auto.name, pattern_id: candidate.id, pattern_key: candidate.pattern_key, confidence: 0.3,
+      id, name, pattern_id: candidate.id, pattern_key: candidate.pattern_key, confidence: 0.3,
     });
-    if (logger?.info) logger.info(`[learn-loop] Promoted pattern "${candidate.pattern_key}" -> skill "${auto.name}"`);
-    return { id, name: auto.name, pattern: candidate };
+    if (logger?.info) logger.info(`[learn-loop] Promoted pattern "${candidate.pattern_key}" -> skill "${name}"`);
+    return { id, name, pattern: candidate };
   } catch (err) {
     if (logger?.error) logger.error('[learn-loop] Promotion error:', err.message);
     return null;

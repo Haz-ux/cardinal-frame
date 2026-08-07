@@ -3,6 +3,7 @@ import request from 'supertest';
 import { getTestServer, cleanupTestServer, adminAuth } from './helpers.mjs';
 import { detectIntent, buildPatternKey, reinforcePattern } from '../src/server/learn.mjs';
 import { findPromotionCandidates, buildAutoSkillFromPattern } from '../src/server/learning-loop.mjs';
+import { buildPatternKey, skillNameFromPhrases, sanitizeSkillName } from '../src/server/learn.mjs';
 import { buildAimiSystemPrompt } from '../src/server/routes/aimi.mjs';
 
 vi.mock('../src/server/llm/provider-runtime.mjs', async (importOriginal) => {
@@ -88,12 +89,27 @@ describe('learning primitives', () => {
     expect(buildPatternKey('   ')).toBe('');
   });
 
-  it('buildAutoSkillFromPattern produces a deterministic, safe skill', () => {
+  it('buildAutoSkillFromPattern names the skill after what the user asks', () => {
     const pattern = { pattern_type: 'create', pattern_key: 'create automated inventory report', occurrence_count: 4, confidence: 0.6 };
     const auto = buildAutoSkillFromPattern(pattern, { now: 1000 });
-    expect(auto.name).toMatch(/^auto-create-/);
+    expect(auto.name).toBe('Create Automated Inventory Report');
     expect(auto.handler).toContain('create automated inventory report');
     expect(auto.parameters.pattern_key).toBe(pattern.pattern_key);
+  });
+
+  it('skillNameFromPhrases derives a readable name from recurring requests', () => {
+    expect(skillNameFromPhrases(['check system health', 'check cardinal frame system health'])).toBe('Check System Health');
+    expect(skillNameFromPhrases(['ok run a audit and report back', 'run system audit on our framework'])).toBe('Run Audit Report Back');
+    expect(skillNameFromPhrases(['aimi', '?', 'ok'])).toBeNull();
+  });
+
+  it('sanitizeSkillName rejects placeholders and accepts descriptive names', () => {
+    expect(sanitizeSkillName('Check System Health')).toBe('Check System Health');
+    expect(sanitizeSkillName('"Summarize Audit Results"')).toBe('Summarize Audit Results');
+    expect(sanitizeSkillName('skill-name-kebab-case')).toBeNull();
+    expect(sanitizeSkillName('evolved-skill-name')).toBeNull();
+    expect(sanitizeSkillName('new-skill')).toBeNull();
+    expect(sanitizeSkillName('  ')).toBeNull();
   });
 
   it('findPromotionCandidates filters immature or already-promoted patterns', () => {
@@ -189,11 +205,18 @@ describe('learning loop integration', () => {
       schedules: { getAll: { all: () => [] } },
       patterns: { getAll: { all: () => [{ pattern_key: 'create automated inventory report', pattern_type: 'create', occurrence_count: 7, confidence: 0.65 }] } },
       skills: { getAutoProposed: { all: () => [{ name: 'auto-create-x', description: 'desc', success_count: 1 }] } },
+      skillChains: { getAll: { all: () => [{ name: 'research-and-summarize', description: 'Research a topic' }] } },
+      toolChains: { getAll: { all: () => [{ name: 'system-health-overview', description: 'Check system health' }] } },
     };
     const prompt = buildAimiSystemPrompt(stmts, 'user-1');
     expect(prompt).toContain('## What You\'ve Learned');
     expect(prompt).toContain('create automated inventory report');
     expect(prompt).toContain('auto-create-x');
+    expect(prompt).toContain('## Available Skill Chains (pipelines)');
+    expect(prompt).toContain('research-and-summarize');
+    expect(prompt).toContain('## Available Tool Chains (pipelines)');
+    expect(prompt).toContain('system-health-overview');
+    expect(prompt).toContain('skill_chain_execute');
   });
 
   it('reinforcePattern is a no-op when no pattern links the skill', () => {

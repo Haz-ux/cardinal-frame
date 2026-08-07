@@ -31,6 +31,96 @@ export function buildPatternKey(text) {
   return words.slice(0, 4).join(' ');
 }
 
+const NAME_STOPWORDS = new Set([
+  'aimi', 'ok', 'okay', 'please', 'can', 'could', 'would', 'should', 'will', 'want',
+  'need', 'like', 'make', 'give', 'get', 'go', 'look', 'tell', 'ask', 'reply', 'answer',
+  'the', 'a', 'an', 'and', 'or', 'of', 'to', 'for', 'on', 'in', 'at', 'with', 'by',
+  'from', 'into', 'about', 'as', 'if', 'then', 'so', 'but', 'this', 'that', 'these',
+  'those', 'is', 'are', 'was', 'were', 'be', 'been', 'it', 'its', 'your', 'you', 'my',
+  'me', 'we', 'our', 'i', 'what', 'how', 'why', 'when', 'where', 'who', 'does', 'do',
+  'did', 'just', 'out', 'up', 'all', 'some', 'more', 'very', 'over', 'really', 'now',
+]);
+
+/** Clean a phrase into significant words (no stopwords, no punctuation). */
+function cleanPhraseWords(phrase) {
+  return String(phrase || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !NAME_STOPWORDS.has(w));
+}
+
+/**
+ * Derive a human-readable skill name from recurring user phrases — i.e. name
+ * the skill after what it actually does. Picks the most frequent recurring
+ * phrase (tie-broken by length) and title-cases it.
+ * Returns null when nothing meaningful can be derived.
+ */
+export function skillNameFromPhrases(phrases, { maxWords = 5 } = {}) {
+  const counts = new Map();
+  let bestKey = '';
+  let bestScore = 0;
+  for (const phrase of phrases || []) {
+    const words = cleanPhraseWords(phrase);
+    if (!words.length) continue;
+    const key = words.slice(0, maxWords).join(' ');
+    const n = (counts.get(key) || 0) + 1;
+    counts.set(key, n);
+    if (n > bestScore || (n === bestScore && key.length < bestKey.length && bestKey.length > 0)) {
+      bestScore = n;
+      bestKey = key;
+    }
+  }
+  if (!bestKey) return null;
+  return bestKey.split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+}
+
+/** Make a skill name unique against existing skills (append " 2", " 3", ...). */
+export function uniqueSkillName(stmts, base, maxTries = 50) {
+  const cleaned = String(base || 'Skill').trim().slice(0, 60);
+  if (!stmts?.skills?.getByName) return cleaned;
+  let name = cleaned;
+  let n = 2;
+  while (n < maxTries && stmts.skills.getByName.get(name)) {
+    name = `${cleaned} ${n}`;
+    n += 1;
+  }
+  return name;
+}
+
+// Generic/placeholder names a model might emit instead of a real skill name.
+const GENERIC_NAMES = new Set([
+  'skill', 'skills', 'name', 'untitled', 'unnamed', 'placeholder', 'example',
+  'kebab-case', 'skill-name', 'skill-name-kebab-case', 'evolved-skill',
+  'evolved-skill-name', 'new-skill', 'my-skill', 'auto-skill',
+]);
+
+function isGenericName(name) {
+  const norm = String(name).toLowerCase().replace(/\s+/g, '-');
+  if (GENERIC_NAMES.has(norm)) return true;
+  if (/kebab[- ]case|placeholder/.test(norm)) return true;
+  if (/^(new|my|auto)[- ]skill$/.test(norm)) return true;
+  if (/^evolved[- ]skill/.test(norm)) return true;
+  if (/^skill[- ]name/.test(norm)) return true;
+  return false;
+}
+
+/**
+ * Validate a candidate skill name. Returns the cleaned name, or null when it
+ * is missing, too long, or a generic placeholder (so callers can fall back to
+ * a name derived from what the skill actually does).
+ */
+export function sanitizeSkillName(name) {
+  const cleaned = String(name || '')
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .slice(0, 60);
+  if (cleaned.length < 3) return null;
+  if (isGenericName(cleaned)) return null;
+  return cleaned;
+}
+
 /**
  * Record an observation for a chat exchange and grow/increment any matching
  * recurring pattern. Shared by the Chat proxy and the Aimi companion so both

@@ -33,7 +33,7 @@ Available in the skill context:
 
 Respond as JSON:
 {
-  "name": "skill-name-kebab-case",
+  "name": "a short name that says what the skill does (2-5 words, kebab-case, e.g. \"check-system-health\")",
   "description": "What this skill does",
   "category": "general|coding|research|automation|web|data",
   "handler_type": "script|hybrid|template",
@@ -53,7 +53,8 @@ Respond as JSON:
 2. Use "hybrid:" prefix for handlers that need LLM calls
 3. Use "template:" for simple prompt-based skills
 4. Include good triggers — keywords that would match this skill in natural language
-5. Set confidence based on how clearly the pattern emerged (0.5-0.9)`;
+5. Set confidence based on how clearly the pattern emerged (0.5-0.9)
+6. The "name" MUST describe what the skill does based on the source material. Never use placeholder or example names like "skill", "skill-name-kebab-case", "new-skill", or "my-skill" — the name must identify the actual function.`;
 }
 
 /**
@@ -87,7 +88,7 @@ Respond as JSON:
 {
   "should_promote": true/false,
   "reason": "Why or why not",
-  "skill_name": "evolved-skill-name",
+  "skill_name": "a name that says what the evolved skill does (2-5 words, kebab-case, e.g. \"chain-audit-report\")",
   "skill_description": "What the evolved skill does",
   "handler_type": "hybrid",
   "handler": "The hybrid handler code that replicates the chain's logic as a single skill function",
@@ -99,7 +100,8 @@ Respond as JSON:
 2. The handler should replicate the chain's data flow internally
 3. Keep it under 80 lines
 4. Use llmCall() for any LLM steps
-5. The handler receives input and should return the final output`;
+5. The handler receives input and should return the final output
+6. The "skill_name" MUST describe what the evolved skill does. Never use placeholder or example names like "skill", "evolved-skill-name", "new-skill", or "my-skill" — the name must identify the actual function.`;
 }
 
 /**
