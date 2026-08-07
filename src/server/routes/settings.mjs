@@ -60,6 +60,18 @@ export function decryptValue(val, isEncrypted) {
   return xorDecipher(val);
 }
 
+// ─── Decrypt a provider row's api_key in place (if it is encrypted) ──
+// Idempotent: after decrypting, flips `encrypted` to 0 so a second pass is
+// a no-op. Providers written by the API are encrypted at rest (encrypted=1);
+// legacy plaintext rows (encrypted=0) pass through untouched.
+export function decryptProvider(provider) {
+  if (!provider || provider.encrypted !== 1 || !provider.api_key) return provider;
+  const dec = decryptValue(provider.api_key, 1);
+  if (dec && dec !== provider.api_key) provider.api_key = dec;
+  provider.encrypted = 0;
+  return provider;
+}
+
 export function getDevSetting(db, key, fallback) {
   try {
     const row = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get(key);

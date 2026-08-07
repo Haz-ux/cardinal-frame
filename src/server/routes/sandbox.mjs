@@ -24,10 +24,12 @@ import vm from 'node:vm';
 import { execSync as _execSync } from 'node:child_process';
 
 // ─── execSync allowlist ────────────────────────────────────────────────────
+// Read-only inspection tools only. No mutating/privilege-escalating binaries.
 const EXEC_ALLOWLIST = new Set([
-  'echo', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'uptime',
+  'echo', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'uptime', 'who', 'last',
   'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'sort', 'uniq',
-  'jq', 'xq', 'yq', 'tree', 'file', 'stat', 'du', 'df',
+  'jq', 'xq', 'yq', 'tree', 'file', 'stat', 'du', 'df', 'find', 'ps', 'pgrep',
+  'ss', 'netstat', 'arp', 'ip', 'ifconfig', 'ping',
   'git', 'node', 'npm', 'npx', 'uv', 'python3', 'python',
   'curl', 'wget',
   'mkdir', 'cp', 'mv',

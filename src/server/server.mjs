@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './preload-env.mjs'; // MUST run before route modules so settings.mjs sees ENCRYPT_SECRET at import time
 import compression from 'compression';
 import express from 'express';
 import cors from 'cors';
@@ -38,7 +39,7 @@ import costsRoutes, { getModelCost } from './routes/costs.mjs';
 import memoryRoutes from './routes/memory.mjs';
 import systemRoutes from './routes/system.mjs';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './routes/llm-helpers.mjs';
-import settingsRoutes, { getDevSetting, getDevSettings, decryptValue } from './routes/settings.mjs';
+import settingsRoutes, { getDevSetting, getDevSettings, decryptValue, encryptSecret } from './routes/settings.mjs';
 import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
@@ -56,6 +57,7 @@ import commsRoutes from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
 import nodesRoutes from './routes/nodes.mjs';
+import compressionRoutes from './routes/compression.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { evaluate as wardenEvaluate } from './warden.mjs';
@@ -97,6 +99,8 @@ const corsOrigins = [
   'http://127.0.0.1:5173',
   'http://[::1]:8080',
   'http://[::1]:5173',
+  'http://192.168.1.127:8080',
+  'http://192.168.1.127:5173',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : []),
 ];
 app.use(cors({
@@ -351,6 +355,7 @@ db.exec(`
   name TEXT NOT NULL UNIQUE,
   type TEXT NOT NULL DEFAULT 'openai',
   api_key TEXT,
+  encrypted INTEGER DEFAULT 0,
   base_url TEXT,
   enabled INTEGER DEFAULT 1,
   detected_at TEXT,
@@ -538,7 +543,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
-    category TEXT DEFAULT 'memory' CHECK(category IN ('user','project','memory','preference','fact','correction')),
+    category TEXT DEFAULT 'memory' CHECK(category IN ('user','project','memory','preference','fact','correction','compressed-context')),
     content TEXT NOT NULL,
     source TEXT DEFAULT 'manual',
     confidence REAL DEFAULT 1.0,
@@ -715,6 +720,20 @@ db.exec(`
   if (!agentCols.includes('system_prompt')) db.exec('ALTER TABLE agents ADD COLUMN system_prompt TEXT DEFAULT \'\'');
   if (!agentCols.includes('model')) db.exec('ALTER TABLE agents ADD COLUMN model TEXT DEFAULT \'\'');
 
+  // ─── LLM provider secret-at-rest migration ─────────────────────
+  const providerCols = db.prepare("PRAGMA table_info(llm_providers)").all().map(c => c.name);
+  if (!providerCols.includes('encrypted')) db.exec('ALTER TABLE llm_providers ADD COLUMN encrypted INTEGER DEFAULT 0');
+  // Encrypt any legacy plaintext keys now that a stable ENCRYPT_SECRET exists.
+  const legacyProviderKeys = db.prepare("SELECT id, api_key FROM llm_providers WHERE api_key IS NOT NULL AND api_key != '' AND encrypted = 0").all();
+  for (const row of legacyProviderKeys) {
+    try {
+      db.prepare('UPDATE llm_providers SET api_key = ?, encrypted = 1 WHERE id = ?').run(encryptSecret(row.api_key), row.id);
+      logger.info(`Encrypted at-rest api_key for llm_provider ${row.id} (legacy plaintext migration)`);
+    } catch (e) {
+      logger.warn(`Failed to encrypt llm_provider ${row.id}: ${e.message}`);
+    }
+  }
+
   // ─── Skills confidence + auto_proposed migrations ────────────────
   const skillCols = db.prepare("PRAGMA table_info(skills)").all().map(c => c.name);
   if (!skillCols.includes('confidence')) db.exec('ALTER TABLE skills ADD COLUMN confidence REAL DEFAULT 0.5');
@@ -790,7 +809,7 @@ db.exec(`
 const stmts = {
   agents: {
     insert: db.prepare('INSERT INTO agents (id, name, version, capabilities, status) VALUES (?, ?, ?, ?, ?)'),
-    getAll: db.prepare('SELECT id, name, status, capabilities FROM agents'),
+    getAll: db.prepare('SELECT id, name, version, status, capabilities, registered_at, last_heartbeat FROM agents'),
     getById: db.prepare('SELECT * FROM agents WHERE id = ?'),
     updateHeartbeat: db.prepare("UPDATE agents SET last_heartbeat = datetime('now'), status = 'active' WHERE id = ?"),
     updateStatus: db.prepare('UPDATE agents SET status = ? WHERE id = ?'),
@@ -881,12 +900,12 @@ const stmts = {
       delete: db.prepare('DELETE FROM plugins WHERE id = ?'),
       },
       providers: {
-      insert: db.prepare('INSERT INTO llm_providers (id, name, type, api_key, base_url, enabled) VALUES (?, ?, ?, ?, ?, ?)'),
-      getAll: db.prepare('SELECT id, name, type, api_key, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
+      insert: db.prepare('INSERT INTO llm_providers (id, name, type, api_key, encrypted, base_url, enabled) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+      getAll: db.prepare('SELECT id, name, type, api_key, encrypted, base_url, enabled, detected_at, last_ping, created_at FROM llm_providers ORDER BY created_at DESC'),
       getById: db.prepare('SELECT * FROM llm_providers WHERE id = ?'),
       getByName: db.prepare('SELECT * FROM llm_providers WHERE name = ?'),
       getByTypeAndUrl: db.prepare('SELECT * FROM llm_providers WHERE type = ? AND base_url = ? ORDER BY created_at ASC'),
-      updateApiKey: db.prepare('UPDATE llm_providers SET api_key = ? WHERE id = ?'),
+      updateApiKey: db.prepare('UPDATE llm_providers SET api_key = ?, encrypted = ? WHERE id = ?'),
       updateEnabled: db.prepare('UPDATE llm_providers SET enabled = ? WHERE id = ?'),
       updatePing: db.prepare("UPDATE llm_providers SET last_ping = datetime('now'), detected_at = datetime('now') WHERE id = ?"),
       delete: db.prepare('DELETE FROM llm_providers WHERE id = ?'),
@@ -1120,7 +1139,7 @@ const stmts = {
       // ─── Chain Tables ───────────────────────────────────────────
       skillChains: {
         insert: db.prepare('INSERT INTO skill_chains (id, name, description, steps, status, created_by) VALUES (?, ?, ?, ?, ?, ?)'),
-        getAll: db.prepare('SELECT id, name, description, status, created_at, updated_at, last_run_at FROM skill_chains ORDER BY created_at DESC'),
+        getAll: db.prepare('SELECT id, name, description, steps, status, last_run_result, created_at, updated_at, last_run_at FROM skill_chains ORDER BY created_at DESC'),
         getById: db.prepare('SELECT * FROM skill_chains WHERE id = ?'),
         getByName: db.prepare('SELECT * FROM skill_chains WHERE name = ?'),
         update: db.prepare("UPDATE skill_chains SET name = ?, description = ?, steps = ?, status = ?, updated_at = datetime('now') WHERE id = ?"),
@@ -1129,7 +1148,7 @@ const stmts = {
       },
       toolChains: {
         insert: db.prepare('INSERT INTO tool_chains (id, name, description, steps, status, created_by) VALUES (?, ?, ?, ?, ?, ?)'),
-        getAll: db.prepare('SELECT id, name, description, status, created_at, updated_at, last_run_at FROM tool_chains ORDER BY created_at DESC'),
+        getAll: db.prepare('SELECT id, name, description, steps, status, last_run_result, created_at, updated_at, last_run_at FROM tool_chains ORDER BY created_at DESC'),
         getById: db.prepare('SELECT * FROM tool_chains WHERE id = ?'),
         getByName: db.prepare('SELECT * FROM tool_chains WHERE name = ?'),
         update: db.prepare("UPDATE tool_chains SET name = ?, description = ?, steps = ?, status = ?, updated_at = datetime('now') WHERE id = ?"),
@@ -1244,7 +1263,7 @@ db.exec(`
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info) => {
   const origin = info.req.headers.origin;
-  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://[::1]')) {
+  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://[::1]') && !origin.startsWith('http://192.168.1.')) {
     logger.warn(`WS rejected origin: ${origin}`);
     return false;
   }
@@ -1414,7 +1433,7 @@ const ctx = {
   getDevSetting, getDevSettings,
   runSandboxed, runSandboxedHybrid,
   executeInDocker, isDockerAvailable,
-  getModelCost, buildAimiSystemPrompt: (userId) => buildAimiSystemPrompt(stmts, userId),
+  getModelCost, buildAimiSystemPrompt: (userId) => buildAimiSystemPrompt(stmts, userId, db),
   checkPermission, auditLog,
   // These are populated later (declared with const/let below)
   get collectTelemetry() { return collectTelemetry; },
@@ -1472,6 +1491,7 @@ app.use('/api', commsRoutes(ctx));
 app.use('/api', tracesRoutes(ctx));
 app.use('/api', governanceRoutes(ctx));
 app.use('/api', nodesRoutes(ctx));
+app.use('/api', compressionRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
@@ -1692,18 +1712,150 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── Device Classification (PC / phone / SBC / container …) ──────
+// Best-effort, async, no shell. Computed once at boot and merged into
+// live telemetry so the dashboard can show what kind of system runs it.
+let deviceInfo = null;
+async function detectDeviceInfo() {
+  try {
+    const { readFile, readdir, access } = await import('fs/promises');
+    const read = async (p) => { try { return (await readFile(p, 'utf-8')).trim(); } catch { return ''; } };
+    const has = async (p) => { try { await access(p); return true; } catch { return false; } };
+
+    const osRelease = (await read('/etc/os-release')).split('\n')
+      .map(l => { const m = l.match(/^PRETTY_NAME="?([^"]*)"?/); return m && m[1] ? m[1] : null; })
+      .find(Boolean) || process.platform;
+    const dtModel = await read('/proc/device-tree/model');
+    const cpuInfo = await read('/proc/cpuinfo');
+    const cpuName = (cpuInfo.match(/^model name\s*:\s*(.+)$/m) || [])[1]
+      || (cpuInfo.match(/^Hardware\s*:\s*(.+)$/m) || [])[1] || '';
+
+    let powerDirs = [];
+    try { powerDirs = await readdir('/sys/class/power_supply'); } catch {}
+    const hasBattery = powerDirs.some(d => d.startsWith('BAT'));
+
+    const isAndroid = !!(process.env.ANDROID_DATA || process.env.ANDROID_ROOT || process.env.ANDROID_TZ);
+    const hasSystemDir = await has('/system');
+    const inContainer = !!process.env.container
+      || await has('/.dockerenv') || await has('/run/.containerenv');
+
+    let cls = 'unknown', label = 'Device';
+    if (dtModel) {
+      if (/jetson/i.test(dtModel)) { cls = 'jetson'; label = 'NVIDIA Jetson'; }
+      else if (/raspberry pi/i.test(dtModel)) { cls = 'sbc'; label = 'Raspberry Pi'; }
+      else if (/tablet/i.test(dtModel)) { cls = 'tablet'; label = 'Tablet'; }
+      else if (/phone|pixel|galaxy|xiaomi|oneplus|oppo|huawei/i.test(dtModel)) { cls = 'phone'; label = 'Phone'; }
+      else { cls = 'sbc'; label = 'Single-Board Computer'; }
+    } else if (isAndroid && hasSystemDir) {
+      cls = hasBattery ? 'phone' : 'mobile';
+      label = 'Android Device';
+    } else if (inContainer) {
+      cls = 'container'; label = 'Container';
+    } else if (hasBattery) {
+      cls = 'laptop'; label = 'Laptop';
+    } else {
+      cls = 'desktop'; label = cpuName ? 'Desktop PC' : 'Server';
+    }
+
+    const memTotal = (await read('/proc/meminfo')).match(/MemTotal:\s+(\d+)/);
+    deviceInfo = {
+      class: cls,
+      label,
+      model: dtModel || cpuName,
+      arch: process.arch,
+      cores: _cores,
+      os: osRelease,
+      ram_mb: Math.round((parseInt(memTotal?.[1] || '0')) / 1024),
+    };
+  } catch {}
+}
+detectDeviceInfo();
+
 // ─── Live Telemetry (async — no execSync) ────────────────────────
-let telemetryCache = { cpu: 0, mem: 0, gpu: 0, npu: 0, temp: 0, uptime: 0, wsClients: 0, ts: Date.now() };
+let telemetryCache = { cpu: 0, mem: 0, gpu: null, npu: null, temp: 0, uptime: 0, wsClients: 0, device: null, ts: Date.now() };
 const _cores = parseInt(execSync('nproc').toString().trim()) || 4; // one-time at boot
+
+const { readFile: readFileMod } = await import('fs/promises');
+async function readFileSafe(p) { try { return (await readFileMod(p, 'utf-8')).trim(); } catch { return ''; } }
+
+// CPU samples for delta-based utilization (works where /proc/stat is readable)
+let cpuPrev = null;
+// cpufreq time_in_state sample cache (Android/proot where /proc/stat is denied)
+let freqPrev = null;
+async function readCpuUtil() {
+  // 1) /proc/stat deltas (standard Linux)
+  const stat = await readFileSafe('/proc/stat');
+  if (stat) {
+    const parts = stat.split('\n')[0].split(/\s+/);
+    if (parts[0] === 'cpu' && parts.length >= 5) {
+      const user = +parts[1], nice = +parts[2], sys = +parts[3], idle = +parts[4],
+        iowait = +parts[5] || 0, irq = +parts[6] || 0, soft = +parts[7] || 0, steal = +parts[8] || 0;
+      const busy = user + nice + sys + irq + soft + steal;
+      const total = busy + idle + iowait;
+      if (cpuPrev && total >= cpuPrev.total) {
+        const dTotal = total - cpuPrev.total, dBusy = busy - cpuPrev.busy;
+        cpuPrev = { busy, total };
+        if (dTotal > 0) return Math.min(100, Math.max(0, Math.round((dBusy / dTotal) * 100)));
+      } else {
+        cpuPrev = { busy, total };
+      }
+      if (total > 0) return Math.min(100, Math.round((busy / total) * 100));
+    }
+  }
+  // 2) cpufreq time_in_state deltas (Android / proot without /proc/stat)
+  const freqs = await readFileSafe('/sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state');
+  if (freqs) {
+    const map = {};
+    let totalMs = 0;
+    for (const line of freqs.split('\n')) {
+      const m = line.trim().split(/\s+/);
+      if (m.length === 2 && +m[1] > 0) { map[m[0]] = parseInt(m[1]); totalMs += map[m[0]]; }
+    }
+    const usedFreqs = Object.keys(map).sort((a, b) => +a - +b);
+    const idleFreq = usedFreqs[0];
+    if (freqPrev && idleFreq) {
+      let dTotal = 0, dIdle = 0;
+      for (const [f, v] of Object.entries(map)) {
+        const d = v - (freqPrev.map[f] || 0);
+        if (d > 0) dTotal += d;
+      }
+      const prevIdle = freqPrev.map[idleFreq] || 0;
+      dIdle = Math.max(0, (map[idleFreq] || 0) - prevIdle);
+      freqPrev = { map };
+      if (dTotal > 0) return Math.min(100, Math.max(0, Math.round(((dTotal - dIdle) / dTotal) * 100)));
+    } else {
+      freqPrev = { map };
+    }
+    // First sample — lifetime idle ratio as a baseline
+    if (totalMs > 0 && idleFreq) {
+      return Math.min(100, Math.max(0, Math.round(((totalMs - map[idleFreq]) / totalMs) * 100)));
+    }
+  }
+  return 0;
+}
+
+async function readGpuUtil() {
+  // 1) Adreno (Qualcomm / most Android phones)
+  const gp = await readFileSafe('/sys/class/kgsl/kgsl-3d0/gpubusy');
+  const gm = gp.match(/(\d+)\s+(\d+)/);
+  if (gm) {
+    const busy = parseInt(gm[1]), total = parseInt(gm[2]);
+    if (total > 0) return Math.min(100, Math.round((busy / total) * 100));
+  }
+  // 2) Mali / Panfrost (MediaTek, Rockchip, Raspberry Pi, …)
+  const gb = await readFileSafe('/sys/kernel/gpu/gpu_busy');
+  const mm = gb.match(/(\d+)\s*%/);
+  if (mm) return Math.min(100, parseInt(mm[1]));
+  return null;
+}
+
 async function collectTelemetry() {
   try {
     const { readFile } = await import('fs/promises');
     const read = async (p) => { try { return (await readFile(p, 'utf-8')).trim(); } catch { return ''; } };
 
-    // CPU from /proc/loadavg (no shell)
-    let cpuLoad = 0;
-    const loadavg = await read('/proc/loadavg');
-    if (loadavg) { const load = parseFloat(loadavg.split(' ')[0]) || 0; cpuLoad = Math.min(100, Math.round((load / _cores) * 100)); }
+    // CPU — /proc/stat delta with cpufreq fallback (see above)
+    const cpuLoad = await readCpuUtil();
 
     // Memory from /proc/meminfo (no shell)
     let memUsage = 0;
@@ -1714,12 +1866,12 @@ async function collectTelemetry() {
       if (total) memUsage = Math.round(((total - avail) / total) * 100);
     }
 
-    // GPU/NPU temp from sysfs (no shell)
-    let gpuUtil = deviceStateCache.gpu_util, npuUtil = 0, tempC = deviceStateCache.cpu_temp;
+    // GPU / NPU / temp
+    let gpuUtil = null, npuUtil = null, tempC = deviceStateCache.cpu_temp;
     const zoneTemp = await read('/sys/class/thermal/thermal_zone0/temp');
     if (zoneTemp) tempC = parseInt(zoneTemp) / 1000;
 
-    // tegrastats (non-blocking)
+    // tegrastats (Jetson only — non-blocking)
     try {
       const { exec: execCb } = await import('child_process');
       const { promisify } = await import('util');
@@ -1730,7 +1882,10 @@ async function collectTelemetry() {
       const tempMatch = stdout.match(/(\d+)C/); if (tempMatch) tempC = parseInt(tempMatch[1]);
     } catch {}
 
-    telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, ts: Date.now() };
+    // Generic sysfs GPU sources when not a Jetson
+    if (gpuUtil == null) gpuUtil = await readGpuUtil();
+
+    telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, device: deviceInfo, ts: Date.now() };
   } catch {}
   return telemetryCache;
 }
@@ -2003,10 +2158,10 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
 
    // Start the Aimi learning loop daemon — promotes recurring patterns into
    // auto-learned skills on an interval (throttled per hour).
-   const learnLoop = new LearnLoopDaemon(
-     { stmts, logger, randomUUID, broadcast },
-     { intervalMs: parseInt(process.env.LEARN_LOOP_INTERVAL || '300') * 1000 }
-   );
+    const learnLoop = new LearnLoopDaemon(
+      { stmts, logger, randomUUID, broadcast, callAgentLLM },
+      { intervalMs: parseInt(process.env.LEARN_LOOP_INTERVAL || '300') * 1000 }
+    );
    learnLoop.start();
    globalThis._learnLoop = learnLoop;
   });

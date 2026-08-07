@@ -17,6 +17,7 @@ import * as openaiProvider from './providers/openai.mjs';
 import * as anthropicProvider from './providers/anthropic.mjs';
 import * as googleProvider from './providers/google.mjs';
 import * as ollamaProvider from './providers/ollama.mjs';
+import { decryptProvider } from '../routes/settings.mjs';
 
 // ── Provider registry ──────────────────────────────────────────────
 // Maps provider type → interface module.
@@ -86,6 +87,7 @@ function sleep(ms) {
  * @returns {Promise<{ content, finishReason, promptTokens, completionTokens, raw }>}
  */
 export async function executeChat(provider, modelId, messages, opts = {}) {
+  decryptProvider(provider); // api_key is encrypted at rest in llm_providers
   const iface = getProviderInterface(provider.type);
   if (!iface) throw new Error(`Unknown provider type: ${provider.type}`);
 
@@ -179,6 +181,7 @@ export async function executeChat(provider, modelId, messages, opts = {}) {
  * @returns {AsyncGenerator<{ content: string|null, done: boolean }>}
  */
 export async function* executeChatStream(provider, modelId, messages, opts = {}) {
+  decryptProvider(provider); // api_key is encrypted at rest in llm_providers
   const iface = getProviderInterface(provider.type);
   if (!iface) throw new Error(`Unknown provider type: ${provider.type}`);
 

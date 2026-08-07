@@ -312,8 +312,9 @@ export default function skillsRoutes(ctx) {
   });
 
   // ─── Skill Execution ──────────────────────────────────────────
-  // POST /api/skills/:id/execute — execute a skill with input
-  router.post('/skills/:id/execute', authMiddleware, apiLimiter, async (req, res) => {
+  // POST /api/skills/:id/execute — execute a skill with input (admin-only;
+  // Aimi/chat and the scanner gate invoke skills via executeSkill directly)
+  router.post('/skills/:id/execute', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     try {
       const skill = stmts.skills.getById.get(req.params.id);
       if (!skill) return res.status(404).json({ error: 'Skill not found' });
@@ -337,8 +338,8 @@ export default function skillsRoutes(ctx) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // POST /api/skills/execute/:name — execute by name (convenience)
-  router.post('/skills/execute/:name', authMiddleware, apiLimiter, async (req, res) => {
+  // POST /api/skills/execute/:name — execute by name (convenience, admin-only)
+  router.post('/skills/execute/:name', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     try {
       const skill = stmts.skills.getByName.get(req.params.name);
       if (!skill) return res.status(404).json({ error: 'Skill not found' });

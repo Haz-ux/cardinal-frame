@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { PROVIDER_TYPES, buildProviderAuth, detectOllama, detectModelsFromProvider } from './llm-helpers.mjs';
+import { encryptSecret } from './settings.mjs';
 
 /**
  * LLM routes: provider CRUD, model CRUD, Ollama detection, seed defaults.
@@ -96,7 +97,8 @@ export default function llmRoutes(ctx) {
     const existing = stmts.providers.getByName.get(name) || stmts.providers.getByTypeAndUrl?.get(type, url);
     if (existing) return res.status(409).json({ error: 'Provider already exists' });
     const id = randomUUID();
-    stmts.providers.insert.run(id, name, type, api_key || '', url, enabled !== false ? 1 : 0);
+    const hasKey = !!api_key;
+    stmts.providers.insert.run(id, name, type, hasKey ? encryptSecret(api_key) : '', hasKey ? 1 : 0, url, enabled !== false ? 1 : 0);
     audit('create', 'llm_provider', id, req.user.id, { name, type });
     logger.info(`LLM provider added: ${name} (${type})`);
     res.status(201).json({ id, name, type, base_url: url, enabled: enabled !== false });
@@ -120,7 +122,10 @@ export default function llmRoutes(ctx) {
     const provider = stmts.providers.getById.get(req.params.id);
     if (!provider) return res.status(404).json({ error: 'Provider not found' });
     const { api_key, base_url, enabled } = req.body;
-    if (api_key !== undefined) stmts.providers.updateApiKey.run(api_key, provider.id);
+    if (api_key !== undefined) {
+      const hasKey = !!api_key;
+      stmts.providers.updateApiKey.run(hasKey ? encryptSecret(api_key) : '', hasKey ? 1 : 0, provider.id);
+    }
     if (base_url !== undefined) db.prepare('UPDATE llm_providers SET base_url = ? WHERE id = ?').run(base_url, provider.id);
     if (enabled !== undefined) stmts.providers.updateEnabled.run(enabled ? 1 : 0, provider.id);
     audit('update', 'llm_provider', provider.id, req.user.id, { updated: Object.keys(req.body).join(',') });
@@ -273,7 +278,7 @@ export default function llmRoutes(ctx) {
       const existing = stmts.providers.getByTypeAndUrl?.get(seed.type, seed.base_url) || stmts.providers.getByName.get(seed.name);
       if (!existing) {
         const id = randomUUID();
-        stmts.providers.insert.run(id, seed.name, seed.type, '', seed.base_url, 0);
+        stmts.providers.insert.run(id, seed.name, seed.type, '', 0, seed.base_url, 0);
         created++;
       }
     }
@@ -295,7 +300,8 @@ export default function llmRoutes(ctx) {
       if (existing) return res.status(409).json({ error: `Provider "${name}" already exists`, provider_id: existing.id });
 
       const id = randomUUID();
-      stmts.providers.insert.run(id, name, type, api_key || '', finalBaseUrl, 0);
+      const hasKey = !!api_key;
+      stmts.providers.insert.run(id, name, type, hasKey ? encryptSecret(api_key) : '', hasKey ? 1 : 0, finalBaseUrl, 0);
       let provider = stmts.providers.getById.get(id);
 
       const result = { provider_id: id, steps: [] };

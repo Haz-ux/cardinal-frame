@@ -10,6 +10,7 @@
 
 import express from 'express';
 import { safeFetch } from '../safe-fetch.mjs';
+import { runScannerGate } from '../skill-scanner-gate.mjs';
 
 export default function skillHubRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, randomUUID } = ctx;
@@ -131,6 +132,14 @@ export default function skillHubRoutes(ctx) {
         }
       }
 
+      // Pre-ingest scan gate — run the `skill-scanner` skill against the source
+      // before persisting. Blocked = refuse.
+      if (verdict === 'blocked') return res.status(403).json({ error: 'Security verdict blocked — skill rejected' });
+      const gate = await runScannerGate(ctx, skillContent, skill_name, req.user);
+      if (gate.blocked) {
+        return res.status(403).json({ error: 'Skill blocked by skill-scanner pre-ingest gate', verdict: gate.verdict, details: gate.details });
+      }
+
       const id = randomUUID();
       const skillId = skill.id || skill_name;
       db.prepare(`INSERT INTO skills (id, skill_id, name, description, content, enabled, source)
@@ -203,6 +212,12 @@ export default function skillHubRoutes(ctx) {
         } catch (e) {
           return res.status(502).json({ error: `Failed to fetch skill from ${skill.url}: ${e.message}` });
         }
+      }
+
+      // Pre-ingest scan gate — run the `skill-scanner` skill against source.
+      const gate = await runScannerGate(ctx, skillContent, skill_name, req.user);
+      if (gate.blocked) {
+        return res.status(403).json({ error: 'Skill blocked by skill-scanner pre-ingest gate', verdict: gate.verdict, details: gate.details });
       }
 
       const id = randomUUID();

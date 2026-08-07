@@ -74,6 +74,22 @@ describe('Skill Runtime API', () => {
       expect(res.status).toBe(401);
     });
 
+    it('should reject non-admin users with 403', async () => {
+      const createRes = await request(app)
+        .post('/api/skills')
+        .set(adminAuth())
+        .send({
+          name: 'exec-nonadmin-' + Date.now(),
+          handler: 'async (input) => ({ ok: true })',
+        });
+
+      const res = await request(app)
+        .post(`/api/skills/${createRes.body.id}/execute`)
+        .set(userAuth())
+        .send({ input: 'test' });
+      expect(res.status).toBe(403);
+    });
+
     it('should track invoke count after execution', async () => {
       const createRes = await request(app)
         .post('/api/skills')

@@ -27,6 +27,7 @@ import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
 import { safeFetch } from '../safe-fetch.mjs';
+import { runScannerGate } from '../skill-scanner-gate.mjs';
 
 const PLUGIN_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
 const MAX_CODE_BYTES = 2 * 1024 * 1024; // 2 MB safety cap on plugin source
@@ -251,6 +252,13 @@ export default function pluginMarketRoutes(ctx) {
       const code = await codeResp.text();
       if (Buffer.byteLength(code, 'utf8') > MAX_CODE_BYTES) {
         return { status: 413, error: 'Plugin source exceeds 2 MB limit' };
+      }
+
+      // Pre-ingest scan gate — run the `skill-scanner` skill against the
+      // plugin source BEFORE writing to disk. Blocked = refuse outright.
+      const gate = await runScannerGate(ctx, code, name, req?.user);
+      if (gate.blocked) {
+        return { status: 403, error: 'Plugin blocked by skill-scanner pre-ingest gate', verdict: gate.verdict, details: gate.details };
       }
 
       // Static risk scan before writing to disk

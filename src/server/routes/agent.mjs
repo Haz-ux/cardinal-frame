@@ -4,6 +4,7 @@ import { execSync, spawn } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
+import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 
 /**
@@ -678,6 +679,7 @@ async function callAgentLLMWithTools(messages, toolDefs, modelOverride) {
     if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider || !provider.api_key) throw new Error('No LLM provider with API key configured');
+  decryptProvider(provider); // api_key is encrypted at rest in llm_providers
 
   const modelId = modelRecord?.model_id || 'gpt-3.5-turbo';
   const providerType = PROVIDER_TYPES[provider.type];
@@ -825,6 +827,7 @@ async function callAgentLLM(messages, modelOverride) {
     if (modelRecord) provider = _deps.stmts.providers.getById.get(modelRecord.provider_id);
   }
   if (!provider || !provider.api_key) throw new Error('No LLM provider with API key configured');
+  decryptProvider(provider); // api_key is encrypted at rest in llm_providers
   const modelId = modelRecord?.model_id || 'gpt-3.5-turbo';
   const providerType = PROVIDER_TYPES[provider.type];
   const baseUrl = provider.base_url || providerType?.baseUrl || '';
