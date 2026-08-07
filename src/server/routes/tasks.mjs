@@ -25,15 +25,43 @@ export default function taskRoutes(ctx) {
   const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
 router.post('/agents', authMiddleware, apiLimiter, (req, res) => {
-  const { name, version, capabilities } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name is required' });
-  const id = randomUUID();
-  stmts.agents.insert.run(id, name, version || '1.0', JSON.stringify(capabilities || []), 'active');
-  const agent = stmts.agents.getById.get(id);
-  broadcast('agent:created', { ...agent, capabilities: JSON.parse(agent.capabilities) });
-  logger.info(`Agent registered: ${name} (${id})`);
-  audit('create', 'agent', id, req.user?.id, { name, version: version || '1.0' });
-  res.status(201).json({ ...agent, capabilities: JSON.parse(agent.capabilities) });
+  try {
+    const { name, version, capabilities } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+    const caps = Array.isArray(capabilities) ? capabilities : [];
+    const id = randomUUID();
+    stmts.agents.insert.run(id, name.trim(), version || '1.0', JSON.stringify(caps), 'active');
+    const agent = stmts.agents.getById.get(id);
+    const payload = { ...agent, capabilities: JSON.parse(agent.capabilities) };
+    broadcast('agent:created', payload);
+    logger.info(`Agent registered: ${name} (${id})`);
+    audit('create', 'agent', id, req.user?.id, { name, version: version || '1.0' });
+    res.status(201).json(payload);
+  } catch (e) {
+    logger.error(`Agent register failed: ${e.message}`);
+    res.status(500).json({ error: `Agent registration failed: ${e.message}` });
+  }
+});
+
+// Update an agent (status toggle, model, system_prompt)
+router.put('/agents/:id', authMiddleware, apiLimiter, (req, res) => {
+  try {
+    const agent = stmts.agents.getById.get(req.params.id);
+    if (!agent) return res.status(404).json({ error: 'Agent not found' });
+    const { status, model, system_prompt } = req.body;
+    if (status !== undefined) {
+      if (!['active', 'inactive', 'offline'].includes(status)) return res.status(400).json({ error: 'Invalid status — use active, inactive, or offline' });
+      stmts.agents.updateStatus.run(status, req.params.id);
+    }
+    if (typeof model === 'string') db.prepare('UPDATE agents SET model = ? WHERE id = ?').run(model, req.params.id);
+    if (typeof system_prompt === 'string') db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(system_prompt, req.params.id);
+    const updated = stmts.agents.getById.get(req.params.id);
+    broadcast('agent:updated', { ...updated, capabilities: JSON.parse(updated.capabilities) });
+    res.json({ ...updated, capabilities: JSON.parse(updated.capabilities) });
+  } catch (e) {
+    logger.error(`Agent update failed: ${e.message}`);
+    res.status(500).json({ error: `Agent update failed: ${e.message}` });
+  }
 });
 
 router.get('/agents', apiLimiter, optionalAuth, (req, res) => {

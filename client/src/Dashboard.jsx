@@ -4,7 +4,7 @@ import { cachedFetch } from './dataCache';
 import { usePolling } from './usePolling';
 import { useWsResource } from './useWsResource';
 import { useWebSocket } from './useWebSocket';
-import { Activity, Cpu, HardDrive, Users, ListTodo, GitBranch, Radio, Clock, Bot, Play, AlertTriangle, Trash2, Plus, Server, Zap, TrendingUp, DollarSign, BarChart3, Shield, Wifi, WifiOff, Timer, Hash, Sparkles, Plug, ShieldAlert, X } from 'lucide-react';
+import { Activity, Cpu, HardDrive, Users, ListTodo, GitBranch, Radio, Clock, Bot, Play, AlertTriangle, Trash2, Plus, Server, Zap, TrendingUp, DollarSign, BarChart3, Shield, Wifi, WifiOff, Timer, Hash, Sparkles, Plug, ShieldAlert, X, Smartphone, Tablet, Monitor, Box, Laptop } from 'lucide-react';
 import { NEON, BG, FONTS, GLOW } from './theme';
 
 // ─── Event icons ────────────────────────────────────────────────────
@@ -419,7 +419,7 @@ const ProviderStatusBar = memo(function ProviderStatusBar({ summary }) {
 
 // ─── Live Telemetry Bar (WebSocket-pushed) ────────────────────────
 const TelemetryBar = memo(function TelemetryBar() {
- const [telemetry, setTelemetry] = useState({ cpu: 0, mem: 0, gpu: 0, npu: 0, temp: 0, uptime: 0, wsClients: 0 });
+ const [telemetry, setTelemetry] = useState({ cpu: 0, mem: 0, gpu: null, npu: null, temp: 0, uptime: 0, wsClients: 0, device: null });
  const { lastEvent } = useWebSocket();
 
  useEffect(() => {
@@ -434,6 +434,32 @@ const TelemetryBar = memo(function TelemetryBar() {
    } catch {}
   }
  }, [lastEvent]);
+
+ const deviceIcon = (d) => {
+  if (!d) return Cpu;
+  switch (d.class) {
+   case 'server': return Server;
+   case 'desktop': return Monitor;
+   case 'laptop': return Laptop;
+   case 'phone':
+   case 'mobile': return Smartphone;
+   case 'tablet': return Tablet;
+   case 'container': return Box;
+   default: return Cpu;
+  }
+ };
+ const DeviceIcon = deviceIcon(telemetry.device);
+ const deviceColor = telemetry.device?.class === 'phone' || telemetry.device?.class === 'mobile'
+  ? NEON.purple : telemetry.device?.class === 'container' ? NEON.yellow
+  : telemetry.device?.class === 'desktop' || telemetry.device?.class === 'server' ? NEON.cyan
+  : NEON.teal;
+ const deviceChip = telemetry.device && (
+  <span className="inline-flex items-center gap-1.5 px-2 py-0.5" style={{ background: `${deviceColor}0d`, border: `1px solid ${deviceColor}22`, fontSize: 10 }}>
+   <DeviceIcon size={11} style={{ color: deviceColor, filter: `drop-shadow(0 0 3px ${deviceColor})` }} />
+   <span style={{ color: deviceColor, fontWeight: 700 }}>{telemetry.device.label}</span>
+   <span style={{ color: '#666' }}>{telemetry.device.arch} · {telemetry.device.cores}C · {Math.round(telemetry.device.ram_mb / 1024)}GB</span>
+  </span>
+ );
 
  const gauges = [
   { label: 'CPU', value: telemetry.cpu, max: 100, unit: '%', color: NEON.cyan, icon: Cpu },
@@ -462,19 +488,22 @@ const TelemetryBar = memo(function TelemetryBar() {
     </div>
     <span className="text-[10px] font-code" style={{ color: '#444' }}>Uptime: {formatUptime(telemetry.uptime)}</span>
    </div>
+   {telemetry.device && (
+    <div className="flex items-center justify-end -mt-2 mb-2">{deviceChip}</div>
+   )}
    <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
     {gauges.map(g => {
-     const pct = Math.min(100, (g.value / g.max) * 100);
+     const pct = g.value == null ? 0 : Math.min(100, (g.value / g.max) * 100);
      const Icon = g.icon;
      return (
       <div key={g.label} className="flex flex-col items-center gap-1.5 p-2" style={{ background: `${g.color}04`, border: `1px solid ${g.color}10` }}>
-       <Icon size={12} style={{ color: g.color, filter: `drop-shadow(0 0 3px ${g.color})` }} />
+       <Icon size={12} style={{ color: g.value == null ? '#444' : g.color, filter: `drop-shadow(0 0 3px ${g.color})` }} />
        <div className="w-full h-1.5 overflow-hidden" style={{ background: `${g.color}10`, clipPath: 'polygon(2px 0, calc(100% - 2px) 0, 100% 2px, 100% calc(100% - 2px), calc(100% - 2px) 100%, 2px 100%, 0 calc(100% - 2px), 0 2px)' }}>
         <div className="h-full transition-all duration-700" style={{ width: `${pct}%`, background: `linear-gradient(90deg, ${g.color}88, ${g.color})`, boxShadow: `0 0 6px ${g.color}66` }} />
        </div>
        <div className="flex items-baseline gap-0.5">
-        <span className="text-sm font-bold font-code" style={{ color: g.color, textShadow: `0 0 8px ${g.color}44` }}>{g.value}</span>
-        <span className="text-[9px] font-code" style={{ color: '#444' }}>{g.unit}</span>
+        <span className="text-sm font-bold font-code" style={{ color: g.value == null ? '#555' : g.color, textShadow: `0 0 8px ${g.color}44` }}>{g.value ?? '—'}</span>
+        <span className="text-[9px] font-code" style={{ color: '#444' }}>{g.value == null ? 'n/a' : g.unit}</span>
        </div>
        <span className="text-[9px] uppercase tracking-wider font-hud" style={{ color: '#555' }}>{g.label}</span>
       </div>

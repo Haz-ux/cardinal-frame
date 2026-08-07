@@ -7,7 +7,7 @@ import { NEON, BG, GLOW, STATUS, PROVIDER_COLORS } from './theme';
 import {
   Server, HardDrive, Cpu, MemoryStick, Zap, ChevronDown, ChevronUp,
   CheckCircle2, XCircle, AlertTriangle, Loader2, Minimize2, Maximize2,
-  Shrink, ArrowRightLeft, Gauge, Sparkles, Wifi, WifiOff
+  Shrink, ArrowRightLeft, Gauge, Sparkles, Wifi, WifiOff, Smartphone, Box
 } from 'lucide-react';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -26,6 +26,7 @@ export const HardwareMonitor = memo(function HardwareMonitor({ contextUsage = { 
     tokensPerSec: 0,
   });
   const [deviceState, setDeviceState] = useState(null);
+  const [device, setDevice] = useState(null);
   const fetchCount = useRef(0);
 
   // Initial fetch from API endpoints
@@ -42,6 +43,7 @@ export const HardwareMonitor = memo(function HardwareMonitor({ contextUsage = { 
         gpu: data?.gpu ? { tops: data.gpu.tops || 0, name: data.gpu.name || '' } : prev.gpu,
         tokensPerSec: data?.tokens_per_sec || 0,
       }));
+      if (data?.device) setDevice(data.device);
     }).catch(() => {});
 
     api('/api/device-state').then(data => {
@@ -64,6 +66,8 @@ export const HardwareMonitor = memo(function HardwareMonitor({ contextUsage = { 
         gpu: lastMsg.gpu ? { tops: lastMsg.gpu.tops, name: lastMsg.gpu.name } : prev.gpu,
         tokensPerSec: lastMsg.tokens_per_sec ?? prev.tokensPerSec,
       }));
+      const dev = lastMsg.payload?.device || lastMsg.device;
+      if (dev) setDevice(dev);
     }
     if (lastMsg.type === 'device-state') {
       setDeviceState(lastMsg.payload);
@@ -201,6 +205,21 @@ export const HardwareMonitor = memo(function HardwareMonitor({ contextUsage = { 
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#555', fontSize: 9 }}>
           <Gauge size={9} />
           <span>{deviceState.device_count || 0} devices</span>
+        </div>
+      )}
+      {device && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, paddingLeft: 10, borderLeft: `1px solid ${NEON.cyan}10`, marginLeft: 10 }}>
+          {device.class === 'phone' || device.class === 'mobile'
+            ? <Smartphone size={10} style={{ color: NEON.purple }} />
+            : device.class === 'container'
+              ? <Box size={10} style={{ color: NEON.yellow }} />
+              : <Server size={10} style={{ color: NEON.teal }} />}
+          <span style={{ color: device.class === 'phone' || device.class === 'mobile' ? NEON.purple : NEON.teal, fontWeight: 700 }}>
+            {device.label}
+          </span>
+          <span style={{ color: '#666' }}>
+            {device.arch} · {device.cores}C · {Math.round((device.ram_mb || 0) / 1024)}GB
+          </span>
         </div>
       )}
     </div>

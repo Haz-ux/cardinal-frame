@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from './AuthContext';
 import { cachedFetch } from './dataCache';
 import { useWsResource } from './useWsResource';
+import { usePolling } from './usePolling';
 import { Bot, Search, Trash2, Heart, Activity, Eye, Power, PowerOff, Clock, Cpu, X } from 'lucide-react';
 
 const NEON = { cyan:'#00f0ff', magenta:'#ff00ff', blue:'#3b82f6', purple:'#a855f7', green:'#22c55e', yellow:'#eab308', red:'#ef4444', pink:'#ec4899', orange:'#f97316', teal:'#14b8a6' };
@@ -17,12 +18,16 @@ function healthFromHeartbeat(hb) {
 
 function RegisterModal({ onClose, onCreated }) {
   const [name, setName] = useState('');
-  const [version, setVersion] = useState('0.6');
+  const [version, setVersion] = useState('1.0');
   const [caps, setCaps] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const handleSubmit = async (e) => {
-    e.preventDefault(); if (!name.trim()) return; setLoading(true);
-    try { await api('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, version, capabilities: caps.split(',').map(s => s.trim()).filter(Boolean) }) }); onCreated(); onClose(); } catch (err) { console.error(err); }
+    e.preventDefault(); if (!name.trim()) return; setLoading(true); setError('');
+    try {
+      await api('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, version, capabilities: caps.split(',').map(s => s.trim()).filter(Boolean) }) });
+      onCreated(); onClose();
+    } catch (err) { console.error(err); setError(err.message || 'Registration failed'); }
     setLoading(false);
   };
   return (
@@ -33,6 +38,7 @@ function RegisterModal({ onClose, onCreated }) {
           <div><label className="text-xs text-gray-400 mb-1 block">Name</label><input value={name} onChange={e => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.blue}20` }} placeholder="e.g. data-processor" /></div>
           <div><label className="text-xs text-gray-400 mb-1 block">Version</label><input value={version} onChange={e => setVersion(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.blue}20` }} /></div>
           <div><label className="text-xs text-gray-400 mb-1 block">Capabilities (comma-separated)</label><input value={caps} onChange={e => setCaps(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-white bg-black/40 outline-none" style={{ border: `1px solid ${NEON.blue}20` }} placeholder="e.g. nlp, vision, code-gen" /></div>
+          {error && <div className="text-xs px-3 py-2 rounded-lg" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#fca5a5' }}>{error}</div>}
           <div className="flex gap-2 pt-2">
             <button type="button" onClick={onClose} className="flex-1 py-2 rounded-lg text-sm bg-black/40 border border-gray-700 text-gray-400">Cancel</button>
             <button type="submit" disabled={loading} className="flex-1 py-2 rounded-lg text-sm font-semibold" style={{ background: `${NEON.blue}20`, border: `1px solid ${NEON.blue}40`, color: NEON.blue }}>{loading ? 'Registering...' : 'Register'}</button>
@@ -50,6 +56,9 @@ export default function Agents() {
   const [showRegister, setShowRegister] = useState(false);
   const load = () => api('/api/agents').then(setAgents).catch(() => {});
   useWsResource(load, ['agent:deleted', 'agent:created', 'agent:updated', 'task:status'], 30000);
+  // Safety poll so agents created elsewhere (e.g. by Aimi) appear promptly
+  // even if the WS broadcast is missed or the tab just became visible.
+  usePolling(load, 15000);
   const filtered = agents.filter(a => !search || (a.name || '').toLowerCase().includes(search.toLowerCase()));
   const deleteAgent = async (id) => { await api(`/api/agents/${id}`, { method: 'DELETE' }); load(); };
   const toggleStatus = async (agent) => { await api(`/api/agents/${agent.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: agent.status === 'active' ? 'inactive' : 'active' }) }); load(); };
