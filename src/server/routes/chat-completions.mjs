@@ -1,7 +1,7 @@
 import express from 'express';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { getModelCost } from './costs.mjs';
-import { PERSONAS, applyPersona, DEFAULT_PERSONA, getPersonaDetail, listPersonas, savePersonaOverride, resetPersona } from '../personas.mjs';
+import { PERSONAS, applyPersona, DEFAULT_PERSONA, getPersonaDetail, listPersonas, savePersonaOverride, resetPersona, getActivePersonaId, setActivePersonaId } from '../personas.mjs';
 import { autoObserve } from '../learn.mjs';
 
 export { autoObserve };
@@ -39,7 +39,18 @@ export default function chatCompletionsRoutes(ctx) {
   const router = express.Router();
 
   router.get('/personas', optionalAuth, (_req, res) => {
-    res.json({ personas: listPersonas(stmts), default: 'aimi' });
+    res.json({ personas: listPersonas(stmts), default: getActivePersonaId(db) });
+  });
+
+  router.put('/personas/active', authMiddleware, (req, res) => {
+    const { id } = req.body || {};
+    if (!setActivePersonaId(db, id)) return res.status(400).json({ error: 'Unknown persona' });
+    const persona = getPersonaDetail(stmts, id);
+    audit('persona.activate', 'persona', id, req.user.id, { name: persona.name });
+    broadcast('persona:active', { personaId: id, name: persona.name, color: persona.color });
+    broadcast('persona:updated', { personaId: id, name: persona.name, color: persona.color });
+    logger.info(`Active persona set to "${persona.name}" (${id})`);
+    res.json({ ok: true, active: id, persona });
   });
 
   router.get('/personas/:id', optionalAuth, (req, res) => {

@@ -31,24 +31,27 @@ export function useWsResource(fn, wsType, interval = 10000) {
     }
   }, [lastMsg, wsType]);
 
-  // Fallback polling — only when WS is NOT connected
-  useEffect(() => {
-    if (connected) return; // WS handles updates, skip polling
+  // Polling — always runs so a dropped WS frame never leaves data stale.
+  // When WS is connected we poll at a relaxed cadence (WS usually pushes
+  // updates instantly, this is just a safety net). When disconnected we
+  // poll at the full requested rate as the only source of updates.
+  const pollInterval = connected ? Math.min(Math.max(interval * 2, 15000), 60000) : interval;
 
+  useEffect(() => {
     // Initial load
     fnRef.current();
 
     let id = setInterval(() => {
       if (!document.hidden) fnRef.current();
-    }, interval);
+    }, pollInterval);
 
     const onVisible = () => {
-      if (!document.hidden && !connected) {
+      if (!document.hidden) {
         clearInterval(id);
         fnRef.current();
         id = setInterval(() => {
-          if (!document.hidden && !connected) fnRef.current();
-        }, interval);
+          if (!document.hidden) fnRef.current();
+        }, pollInterval);
       }
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -57,5 +60,5 @@ export function useWsResource(fn, wsType, interval = 10000) {
       clearInterval(id);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [interval, connected, wsType]);
+  }, [pollInterval, wsType]);
 }

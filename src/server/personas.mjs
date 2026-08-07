@@ -61,6 +61,24 @@ export const PERSONAS = {
 
 export const DEFAULT_PERSONA = 'aimi';
 
+// Active/companion persona — the one the Aimi chat and the whole framework
+// treat as "the AI". Persisted in dev_settings so it survives restarts and
+// is shared across every device.
+export function getActivePersonaId(db) {
+  if (!db) return DEFAULT_PERSONA;
+  try {
+    const row = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get('activePersona');
+    return row && PERSONAS[row.value] ? row.value : DEFAULT_PERSONA;
+  } catch { return DEFAULT_PERSONA; }
+}
+
+export function setActivePersonaId(db, id) {
+  if (!db || !PERSONAS[id]) return false;
+  db.prepare(`INSERT INTO dev_settings (key, value, updated_at) VALUES ('activePersona', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')`).run(id);
+  return true;
+}
+
 // Render a persona's system prompt with the current name applied.
 // The prompt may use a {{NAME}} placeholder (preferred) and/or the
 // persona's original name literally — both are rewritten to match the

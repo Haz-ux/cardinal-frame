@@ -2,17 +2,18 @@ import { useState, useCallback } from 'react';
 import { usePersonas } from './PersonaContext';
 import { cachedFetch, invalidateCache } from './dataCache';
 import { NEON, BG } from './theme';
-import { User, Check, RotateCcw, X, RefreshCw, Wand2 } from 'lucide-react';
+import { User, Check, RotateCcw, X, RefreshCw, Wand2, Pencil } from 'lucide-react';
 
 const SWATCHES = ['#00b4d8', '#39ff14', '#ff3860', '#b026ff', '#eab308', '#22c55e', '#ff2a85', '#90e0ef'];
 
 export default function PersonasPanel() {
-  const { personas, companionName, refresh } = usePersonas();
+  const { personas, companionName, activeId, setActive, refresh } = usePersonas();
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ name: '', tagline: '', color: '', system_prompt: '' });
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [activating, setActivating] = useState(null);
 
   const openEditor = useCallback(async (persona) => {
     setEditing(persona.id);
@@ -80,6 +81,17 @@ export default function PersonasPanel() {
     }
   };
 
+  const activate = async (persona) => {
+    if (persona.id === activeId) return;
+    setActivating(persona.id);
+    setStatus('');
+    setError('');
+    const err = await setActive(persona.id);
+    if (err) setError(`Failed to switch: ${err}`);
+    else setStatus(`Companion switched to ${persona.name} — the AI now speaks as ${persona.name} across Cardinal Frame.`);
+    setActivating(null);
+  };
+
   const field = (label, value, onChange, opts = {}) => (
     <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
       <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#666' }}>{label}</span>
@@ -99,29 +111,43 @@ export default function PersonasPanel() {
         <User size={14} style={{ color: NEON.cyan }} />
         <span className="text-[11px] font-bold uppercase tracking-wider" style={{ color: NEON.cyan }}>Identities</span>
         <span className="text-[10px]" style={{ color: '#555' }}>
-          — rename the active persona and the AI's name + self-identity update across the whole framework. Companion is currently <b style={{ color: NEON.cyan }}>{companionName}</b>.
+          — click a persona to make it the active companion, or hit the pencil to edit its identity. Companion is currently <b style={{ color: NEON.cyan }}>{companionName}</b>.
         </span>
       </div>
 
       <div className="flex flex-wrap gap-2 mb-3">
         {personas.map(p => {
-          const active = p.id === 'aimi';
+          const active = p.id === activeId;
           return (
-            <button
+            <div
               key={p.id}
-              onClick={() => openEditor(p)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] transition-all"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] transition-all"
               style={{
-                background: editing === p.id ? `${p.color}18` : BG.surface,
-                border: `1px solid ${p.color}40`,
-                color: '#ddd',
+                background: active ? `${p.color}18` : BG.surface,
+                border: `1px solid ${active ? p.color : `${p.color}40`}`,
                 cursor: 'pointer',
               }}
+              onClick={() => activate(p)}
+              title={active ? `${p.name} is the active companion` : `Make ${p.name} the companion`}
             >
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: p.color, boxShadow: `0 0 6px ${p.color}` }} />
-              {p.name}
-              {active && <span className="text-[9px] px-1.5 py-0.5 rounded" style={{ background: `${p.color}20`, color: p.color }}>companion</span>}
-            </button>
+              <button
+                className="flex items-center gap-1.5"
+                style={{ background: 'none', border: 'none', color: '#ddd', cursor: 'pointer', padding: 0 }}
+                onClick={(e) => { e.stopPropagation(); activate(p); }}
+              >
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: p.color, boxShadow: `0 0 6px ${p.color}` }} />
+                {p.name}
+                {active && <span className="text-[9px] px-1.5 py-0.5 rounded" style={{ background: `${p.color}20`, color: p.color }}>companion</span>}
+                {activating === p.id && <RefreshCw size={10} className="animate-spin" style={{ color: p.color }} />}
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); openEditor(p); }}
+                title={`Edit ${p.name} identity`}
+                style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', padding: 2, display: 'flex' }}
+              >
+                <Pencil size={11} />
+              </button>
+            </div>
           );
         })}
       </div>
