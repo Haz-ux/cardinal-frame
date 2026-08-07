@@ -1,25 +1,35 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from './AuthContext';
-import { cachedFetch } from './dataCache';
 import { useToast } from './ToastContext';
 import { NEON, BG, GLOW, STATUS } from './theme';
 import { MessageSquare, Plus, Trash2, Send, Paperclip, X, Bot, User, Wrench, Sparkles, ChevronLeft, ChevronRight, Cpu, Settings, Image, FileText, Code, Loader, Zap, ChevronDown, BookOpen, PanelRightOpen, PanelRightClose, Brain, Eye } from 'lucide-react';
 import { FTSBreadcrumbs, TerminalAccordion, SubAgentMatrix, CodeSandboxBlock } from './ChatComponents';
 import { HardwareMonitor, EndpointSwitcher, ContextTrimVisualizer } from './ResilienceComponents';
 import { usePersonas } from './PersonaContext';
+import { useChatSession } from './ChatSessionContext';
 import WorkPanel from './WorkPanel';
 
 export default function Chat() {
- const [conversations, setConversations] = useState([]);
- const [activeConv, setActiveConv] = useState(null);
  const [messages, setMessages] = useState([]);
  const [input, setInput] = useState('');
  const [streaming, setStreaming] = useState(false);
  const [streamBuf, setStreamBuf] = useState('');
  const [tools, setTools] = useState([]);
  const [skills, setSkills] = useState([]);
-  const [models, setModels] = useState([]);
-  const [selectedModel, setSelectedModel] = useState('');
+  // Shared session state — models/model picker + conversations/active
+  // conversation stay in sync with the Aimi companion overlay.
+  const {
+    models,
+    selectedModel,
+    setSelectedModel,
+    contextWindow,
+    conversations,
+    setConversations,
+    activeConv,
+    setActiveConv,
+    newConversation,
+    deleteConversation,
+  } = useChatSession();
   const [personas, setPersonas] = useState([]);
   const [selectedPersona, setSelectedPersona] = useState('aimi');
   const [showPersonaPicker, setShowPersonaPicker] = useState(false);
@@ -28,7 +38,16 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
  const [attachments, setAttachments] = useState([]);
  const [showTools, setShowTools] = useState(false);
  const [showModelPicker, setShowModelPicker] = useState(false);
- const [contextUsage, setContextUsage] = useState({ used: 0, total: 32000 });
+  // Context usage derived from the selected model's context window + the
+  // estimated token count of the visible conversation. The trim visualizer
+  // can lower `used` after a compression via onContextUpdate.
+  const [contextUsage, setContextUsage] = useState({ used: 0, total: 32000 });
+
+  // Keep the context meter in sync with the current model + conversation.
+  useEffect(() => {
+    const used = messages.reduce((n, m) => n + (m.content ? Math.ceil(String(m.content).length / 4) : 0), 0);
+    setContextUsage(prev => ({ ...prev, used, total: contextWindow }));
+  }, [messages, contextWindow]);
  // ─── Agent mode state ───
  const [agentMode, setAgentMode] = useState('chat'); // 'chat' | 'agent' | 'suggest'
  const [agentSessionId, setAgentSessionId] = useState(null);
@@ -48,17 +67,10 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
     }
   }, [ctxPersonas]);
 
-  // Load conversations, tools, skills, models
+  // Load tools, skills, personas (models + conversations come from shared session context)
   useEffect(() => {
-    api('/api/chat/conversations').then(setConversations).catch(() => {});
     api('/api/tools/enabled').then(setTools).catch(() => {});
     api('/api/skills/enabled').then(setSkills).catch(() => {});
-    cachedFetch('/api/llm/models').then(m => {
-      const list = Array.isArray(m) ? m : [];
-      setModels(list);
-      const def = list.find(m2 => m2.is_default);
-      if (def) setSelectedModel(def.model_id);
-    }).catch(() => {});
     api('/api/personas').then(d => {
       const list = Array.isArray(d?.personas) ? d.personas : [];
       setPersonas(list);
@@ -83,26 +95,18 @@ const [sidebarOpen, setSidebarOpen] = useState(() => typeof window !== 'undefine
   // New conversation
   const newConv = useCallback(async () => {
     try {
-      const conv = await api('/api/chat/conversations', {
-        method: 'POST',
-        body: JSON.stringify({ title: 'New Chat', model: selectedModel }),
-      });
-      setConversations(prev => [conv, ...prev]);
-      setActiveConv(conv);
-      setMessages([]);
+      await newConversation();
       toast.success('New conversation created');
     } catch (e) { toast.error('Failed to create conversation'); }
-  }, [selectedModel, toast]);
+  }, [newConversation, toast]);
 
   // Delete conversation
   const deleteConv = useCallback(async (id) => {
     try {
-      await api(`/api/chat/conversations/${id}`, { method: 'DELETE' });
-      setConversations(prev => prev.filter(c => c.id !== id));
-      if (activeConv?.id === id) { setActiveConv(null); setMessages([]); }
+      await deleteConversation(id);
       toast.info('Conversation deleted');
     } catch (e) { toast.error('Delete failed'); }
-  }, [activeConv, toast]);
+  }, [deleteConversation, toast]);
 
   // File attachment handler
   const handleFileAttach = useCallback((e) => {

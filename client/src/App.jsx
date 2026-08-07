@@ -32,6 +32,7 @@ import AimiCanvasCompanion from './AimiCanvas';
 import { NEON, BG, FONTS } from './theme';
 import { isDesktopMode, applyViewportMode, toggleDesktopMode } from './viewportMode';
 import { PersonaProvider, usePersonas } from './PersonaContext';
+import { ChatSessionProvider } from './ChatSessionContext';
 
 function PublicRoute({ children }) {
  const { user, loading } = useAuth();
@@ -379,12 +380,14 @@ export default function App() {
    <AuthProvider>
     <ToastProvider>
      <PersonaProvider>
-      <ErrorBoundary>
-       <Routes>
-        <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
-        <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
-       </Routes>
-      </ErrorBoundary>
+      <ChatSessionProvider>
+       <ErrorBoundary>
+        <Routes>
+         <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
+         <Route path="/*" element={<ProtectedRoute><Layout /></ProtectedRoute>} />
+        </Routes>
+       </ErrorBoundary>
+      </ChatSessionProvider>
      </PersonaProvider>
     </ToastProvider>
    </AuthProvider>

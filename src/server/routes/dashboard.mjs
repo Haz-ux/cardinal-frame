@@ -87,8 +87,12 @@ export default function dashboardRoutes(ctx) {
       const promptTokens = row.pt || 0;
       const completionTokens = row.ct || 0;
       const totalTokens = promptTokens + completionTokens;
-      // Rough cost estimates (per 1M tokens): prompt ~$3, completion ~$15 (GPT-4 tier average)
-      const totalCost = (promptTokens / 1_000_000) * 3 + (completionTokens / 1_000_000) * 15;
+      // Prefer actual stored cost; fall back to rough estimate (per 1M tokens:
+      // prompt ~$3, completion ~$15 — GPT-4 tier average) for older records.
+      const storedCost = row.cost_usd || 0;
+      const totalCost = storedCost > 0
+        ? storedCost
+        : (promptTokens / 1_000_000) * 3 + (completionTokens / 1_000_000) * 15;
       res.json({ promptTokens, completionTokens, totalTokens, totalCost: Math.round(totalCost * 10000) / 10000 });
     } catch {
       res.json({ promptTokens: 0, completionTokens: 0, totalTokens: 0, totalCost: 0 });
@@ -118,7 +122,7 @@ export default function dashboardRoutes(ctx) {
       const buckets = [];
       for (let i = hours; i >= 0; i--) {
         const d = new Date(now.getTime() - i * 3600000);
-        const key = d.toISOString().slice(0, 13) + ':00';
+        const key = d.toISOString().slice(0, 13).replace('T', ' ') + ':00'; // space format matches strftime('%Y-%m-%d %H:00')
         const found = rows.find(r => r.hour === key);
         buckets.push({
           hour: key,
@@ -172,7 +176,7 @@ export default function dashboardRoutes(ctx) {
       const buckets = [];
       for (let i = hours; i >= 0; i--) {
         const d = new Date(now.getTime() - i * 3600000);
-        const key = d.toISOString().slice(0, 13) + ':00';
+        const key = d.toISOString().slice(0, 13).replace('T', ' ') + ':00'; // space format matches strftime('%Y-%m-%d %H:00')
         buckets.push({
           hour: key,
           tasks: tasks.find(t => t.hour === key)?.count || 0,

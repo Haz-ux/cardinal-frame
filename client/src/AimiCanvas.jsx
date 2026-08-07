@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { X, Send, Sparkles, Cpu, Radio, ChevronRight, Wrench, Loader, Zap, Paperclip, Image, FileText, Code, XCircle } from 'lucide-react';
+import { X, Send, Sparkles, Cpu, Radio, ChevronRight, ChevronDown, Plus, Wrench, Loader, Zap, Paperclip, Image, FileText, Code, XCircle } from 'lucide-react';
 import { usePersonas } from './PersonaContext';
+import { useChatSession } from './ChatSessionContext';
+import { api } from './AuthContext';
 
 // ─── Aimi Color Palette ────────────────────────────────────────────
 const AIMI = {
@@ -352,23 +354,61 @@ export { AimiCanvas, getExpression, getStage, buildStages, STAGES, AIMI };
 // ─── Aimi Chat Panel (uses AimiCanvas) ─────────────────────────────
 export default function AimiCanvasCompanion() {
  const { companionName } = usePersonas();
+  // Shared session state — same model picker and conversation as the Chat page.
+  const {
+    models,
+    selectedModel,
+    setSelectedModel,
+    activeConv,
+    newConversation,
+  } = useChatSession();
  const [open, setOpen] = useState(false);
- const [messages, setMessages] = useState([
-  { role: 'aimi', text: `Hello, Operator. ${companionName} online. I can manage agents, create tasks, check system status, and more. What do you need?` }
- ]);
+ const greeting = () => `Hello, Operator. ${companionName} online. I can manage agents, create tasks, check system status, and more. What do you need?`;
+ const [messages, setMessages] = useState([{ role: 'aimi', text: greeting() }]);
  const [input, setInput] = useState('');
  const [xp, setXp] = useState(() => parseInt(localStorage.getItem('aimi_xp_points') || '0', 10));
   const [streaming, setStreaming] = useState(false);
   const [streamBuf, setStreamBuf] = useState('');
   const [thinking, setThinking] = useState('');
+  const [thinkingOpen, setThinkingOpen] = useState(false);
+  const [lastUsage, setLastUsage] = useState(null);
+  const [showModelMenu, setShowModelMenu] = useState(false);
   const recvRef = useRef('');        // full received content (from delta.content)
   const commitRef = useRef(false);   // stream ended, typewriter should commit soon
   const lenRef = useRef(0);          // chars of recvRef shown in streamBuf
   const typewriterRef = useRef(null);
+  const streamingRef = useRef(false); // mirrors streaming for effect gating
  const [expanded, setExpanded] = useState(false);
  const [showQuickActions, setShowQuickActions] = useState(true);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
+
+  // ─── Shared conversation sync ─────────────────────────────────────
+  // Keep Aimi's message list mirrored to the active conversation (shared
+  // with the Chat page) so a conversation carries between the two. Reloads
+  // are skipped mid-stream so the typewriter buffer isn't wiped.
+  const reloadMessages = useCallback(async () => {
+    const convId = activeConv?.id;
+    if (!convId) {
+      setMessages([{ role: 'aimi', text: greeting() }]);
+      return;
+    }
+    try {
+      const msgs = await api('/api/chat/conversations/' + convId + '/messages');
+      const mapped = (Array.isArray(msgs) ? msgs : [])
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role === 'assistant' ? 'aimi' : 'user', text: m.content || '' }));
+      setMessages(mapped.length ? mapped : [{ role: 'aimi', text: greeting() }]);
+    } catch { /* keep current list */ }
+  }, [activeConv?.id, companionName]);
+  const reloadRef = useRef(reloadMessages);
+  useEffect(() => { reloadRef.current = reloadMessages; }, [reloadMessages]);
+
+  useEffect(() => {
+    if (streamingRef.current) return;
+    reloadMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConv?.id]);
 
   // ─── Draggable position (persisted across reloads) ──────────────
   const MASCOT_POS_KEY = 'aimi_mascot_pos';
@@ -463,7 +503,14 @@ export default function AimiCanvasCompanion() {
         const final = target.trim() ? target : `⚠ ${companionName} received your message but returned an empty response.`;
         setStreamBuf('');
         setThinking('');
-        setMessages(prev => [...prev, { role: 'aimi', text: final }]);
+        setThinkingOpen(false);
+        if (target.trim()) {
+          // Response was persisted server-side — reload so the shared
+          // conversation (visible on the Chat page) stays in sync.
+          reloadRef.current();
+        } else {
+          setMessages(prev => [...prev, { role: 'aimi', text: final }]);
+        }
       }
     }, 24);
     return () => { clearInterval(typewriterRef.current); typewriterRef.current = null; };
@@ -486,12 +533,30 @@ export default function AimiCanvasCompanion() {
     setMessages(prev => [...prev, { role: 'aimi', text: recvRef.current }]);
    }
 
+   // Gate the active-conversation reload while we stream, so the typewriter
+   // buffer is never wiped by a background sync.
+   streamingRef.current = true;
+
+   // Join the shared conversation (the one visible on the Chat page), or
+   // create one so Aimi and Chat always talk about the same thread.
+   let conv = activeConv;
+   if (!conv) {
+    try {
+     conv = await newConversation(text.slice(0, 40) || 'New Chat');
+    } catch {
+     streamingRef.current = false;
+     setMessages(prev => [...prev, { role: 'aimi', text: '⚠ Could not start a conversation.' }]);
+     return;
+    }
+   }
 
   setMessages(prev => [...prev, { role: 'user', text }]);
   setInput('');
   setStreaming(true);
   setStreamBuf('');
   setThinking('');
+  setThinkingOpen(false);
+  setLastUsage(null);
   recvRef.current = '';
   commitRef.current = false;
   lenRef.current = 0;
@@ -505,7 +570,7 @@ export default function AimiCanvasCompanion() {
    const resp = await fetch('/api/aimi/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-    body: JSON.stringify({ message: text }),
+    body: JSON.stringify({ message: text, conversation_id: conv.id, model: selectedModel || undefined }),
     signal: controller.signal,
    });
 
@@ -514,6 +579,7 @@ export default function AimiCanvasCompanion() {
      const errMsg = (typeof err.error === 'string' ? err.error : err.error?.message) || err.message || 'Request failed';
      setMessages(prev => [...prev, { role: 'aimi', text: `⚠ Error: ${errMsg}` }]);
      setStreaming(false);
+     streamingRef.current = false;
      return;
     }
 
@@ -531,6 +597,7 @@ export default function AimiCanvasCompanion() {
      try {
       const parsed = JSON.parse(data);
       if (parsed.error) { recvRef.current += `\n⚠ ${parsed.error.message}`; continue; }
+      if (parsed.usage) { setLastUsage(parsed.usage); continue; }
       if (parsed.tool_result) {
        const resultStr = JSON.stringify(parsed.tool_result.result, null, 2);
        recvRef.current += `\n\n🔧 **${parsed.tool_result.tool}** →\n\`\`\`json\n${resultStr.slice(0, 800)}\n\`\`\``;
@@ -546,7 +613,9 @@ export default function AimiCanvasCompanion() {
    // Stream ended — let the typewriter catch up, then commit.
    commitRef.current = true;
    setStreaming(false);
+   streamingRef.current = false;
   } catch (e) {
+   streamingRef.current = false;
    if (e.name !== 'AbortError') {
     if (recvRef.current.trim()) {
      setStreamBuf('');
@@ -561,7 +630,7 @@ export default function AimiCanvasCompanion() {
   }
   abortRef.current = null;
   setXp(prev => prev + 20);
- }, [input, streaming]);
+ }, [input, streaming, activeConv, selectedModel, newConversation]);
 
  const lastMsg = messages[messages.length - 1]?.text || '';
  const currentExpr = getExpression(lastMsg, streaming);
@@ -632,6 +701,45 @@ export default function AimiCanvasCompanion() {
     </div>
    </div>
 
+   {/* Toolbar — shared model picker + conversation (synced with Chat page) */}
+   <div className="flex items-center gap-1 px-3 py-1 select-none" style={{ borderBottom: `1px solid ${AIMI.core}10`, background: `${AIMI.dark}88` }}>
+    <div className="relative">
+     <button
+      onClick={() => setShowModelMenu(m => !m)}
+      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors hover:bg-white/5"
+      style={{ color: AIMI.accent, background: `${AIMI.core}12`, border: `1px solid ${AIMI.core}25` }}
+      title="Select model"
+     >
+      <Cpu size={9} /> {(selectedModel || 'model').split('/').pop()}<ChevronDown size={9} />
+     </button>
+     {showModelMenu && (
+      <div className="absolute left-0 top-full mt-1 max-h-44 overflow-auto rounded-lg z-50" style={{ background: AIMI.mid, border: `1px solid ${AIMI.core}35`, boxShadow: `0 8px 24px rgba(0,0,0,0.5)` }}>
+       {models.slice(0, 20).map(m => (
+        <div key={m.id}
+         onClick={() => { setSelectedModel(m.model_id); setShowModelMenu(false); }}
+         className="px-2 py-1 cursor-pointer text-[10px] font-mono"
+         style={{ background: selectedModel === m.model_id ? `${AIMI.core}20` : 'transparent', color: selectedModel === m.model_id ? AIMI.accent : '#999', borderBottom: `1px solid #ffffff08` }}>
+         {m.display_name || m.model_id}
+         {m.is_default && <span style={{ color: AIMI.green, marginLeft: 6 }}>●</span>}
+        </div>
+       ))}
+       {models.length === 0 && <div className="px-2 py-1 text-[10px]" style={{ color: '#666' }}>No models detected</div>}
+      </div>
+     )}
+    </div>
+    <button
+     onClick={async () => { try { await newConversation(); setLastUsage(null); } catch {} }}
+     className="p-1 rounded transition-colors hover:bg-white/5"
+     style={{ color: AIMI.accent }}
+     title="New conversation"
+    >
+     <Plus size={11} />
+    </button>
+    <span className="flex-1 text-[9px] font-mono truncate text-right" style={{ color: '#667' }}>
+     {activeConv?.title || 'no conversation'}
+    </span>
+   </div>
+
    {/* Chat messages */}
    <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ scrollbarWidth: 'thin', scrollbarColor: `${AIMI.core}44 transparent` }}>
     {messages.map((msg, i) => (
@@ -654,7 +762,20 @@ export default function AimiCanvasCompanion() {
       <div className="max-w-[90%] px-2.5 py-1.5 rounded-lg rounded-bl-sm text-xs leading-relaxed" style={{ background: `${AIMI.shell}22`, color: '#bbb', border: `1px solid ${AIMI.shell}33`, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
         <span className="text-[10px] font-bold block mb-0.5" style={{ color: AIMI.core }}>{companionName}</span>
        {thinking && (
-        <div className="mb-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>▸ {thinking}{thinking.length >= 900 ? '…' : ''}</div>
+        <div className="mb-1">
+         <button
+          onClick={() => setThinkingOpen(o => !o)}
+          className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide transition-colors hover:bg-white/5"
+          style={{ color: AIMI.gold, background: `${AIMI.gold}10`, border: `1px solid ${AIMI.gold}25`, borderRadius: 4, padding: '1px 6px' }}
+          title={thinkingOpen ? 'Collapse thoughts' : 'Show thoughts'}
+         >
+          <ChevronRight size={10} style={{ transform: thinkingOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s' }} />
+          ⟡ thinking
+         </button>
+         {thinkingOpen && (
+          <div className="mt-1 text-[11px] italic opacity-70" style={{ color: '#7c9ab8', borderLeft: `2px solid ${AIMI.shell}`, paddingLeft: 6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{thinking}{thinking.length >= 900 ? '…' : ''}</div>
+         )}
+        </div>
        )}
        {streamBuf ? (
         <>{streamBuf}<span className="neon-pulse" style={{ display: 'inline-block', width: 4, height: 12, background: AIMI.core, marginLeft: 2, verticalAlign: 'middle', borderRadius: 1 }} /></>
@@ -665,6 +786,11 @@ export default function AimiCanvasCompanion() {
         </span>
        ) : null}
       </div>
+     </div>
+    )}
+    {lastUsage && !streaming && (
+     <div className="px-1 text-[9px] font-mono" style={{ color: '#556' }}>
+      ⇄ {lastUsage.total_tokens ?? 0} tok · ${(lastUsage.cost_usd || 0).toFixed(4)} · {lastUsage.model || selectedModel || ''}
      </div>
     )}
     <div ref={chatEndRef} />

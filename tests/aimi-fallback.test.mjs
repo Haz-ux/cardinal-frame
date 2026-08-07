@@ -108,4 +108,49 @@ describe('Aimi chat falls back to a keyed provider with no detected models', () 
     expect(res.text).toContain('pong');
     expect(detectCalls()).toBe(1);
   });
+
+  it('carries conversation history, tracks usage, and records cost per turn', async () => {
+    const conv = await request(app)
+      .post('/api/chat/conversations')
+      .set(adminAuth())
+      .send({ title: 'Aimi carryover' });
+    expect(conv.status).toBe(201);
+
+    const first = await request(app)
+      .post('/api/aimi/chat')
+      .set(adminAuth())
+      .send({ message: 'first turn', conversation_id: conv.body.id });
+    expect(first.status).toBe(200);
+    expect(first.text).toContain('"usage"');
+    expect(first.text).toContain('"cost_usd"');
+
+    const second = await request(app)
+      .post('/api/aimi/chat')
+      .set(adminAuth())
+      .send({ message: 'second turn', conversation_id: conv.body.id });
+    expect(second.status).toBe(200);
+
+    // The last model request must include prior turns as message history.
+    const chatCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/chat/completions'));
+    const lastBody = JSON.parse(chatCalls[chatCalls.length - 1][1].body);
+    const messages = lastBody.messages;
+    expect(messages[0].role).toBe('system');
+    expect(messages.some(m => m.role === 'user' && m.content === 'first turn')).toBe(true);
+    expect(messages.some(m => m.role === 'assistant' && m.content === 'pong')).toBe(true);
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'second turn' });
+
+    // Each turn records a token_usage row with real cost for the conversation.
+    const rows = db.prepare('SELECT * FROM token_usage WHERE conversation_id = ? ORDER BY created_at ASC').all(conv.body.id);
+    expect(rows.length).toBe(2);
+    expect(rows.every(r => r.model === 'gpt-4o' && r.cost_usd > 0)).toBe(true);
+  });
+
+  it('dashboard usage reflects stored token_usage cost instead of a flat estimate', async () => {
+    const stored = db.prepare('SELECT COALESCE(SUM(cost_usd),0) AS c FROM token_usage').get().c;
+    expect(stored).toBeGreaterThan(0);
+    const res = await request(app).get('/api/dashboard/usage').set(adminAuth());
+    expect(res.status).toBe(200);
+    expect(res.body.totalCost).toBeCloseTo(Math.round(stored * 10000) / 10000, 4);
+    expect(res.body.totalTokens).toBeGreaterThan(0);
+  });
 });

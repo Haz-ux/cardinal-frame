@@ -1105,7 +1105,7 @@ const stmts = {
         realUsers: db.prepare("SELECT COUNT(*) as c FROM users WHERE username NOT LIKE 'boot_%' AND username NOT LIKE 'noboot_%' AND username NOT LIKE 'token_%' AND username NOT LIKE 'pw_%' AND username NOT LIKE 'chat_%' AND username NOT LIKE 'upload_%' AND username NOT LIKE 'uichat_%' AND username NOT LIKE 'uiskill_%' AND username NOT LIKE 'e2e_%' AND username NOT LIKE 'debug%' AND username NOT LIKE 'test%' AND username NOT LIKE 'auth%'"),
         providerCount: db.prepare('SELECT COUNT(*) as c FROM llm_providers'),
         modelCount: db.prepare('SELECT COUNT(*) as c FROM llm_models'),
-        tokenUsage: db.prepare(`SELECT COALESCE(SUM(prompt_tokens),0) as pt, COALESCE(SUM(completion_tokens),0) as ct FROM token_usage`),
+        tokenUsage: db.prepare(`SELECT COALESCE(SUM(prompt_tokens),0) as pt, COALESCE(SUM(completion_tokens),0) as ct, COALESCE(SUM(cost_usd),0) as cost_usd FROM token_usage`),
       },
       graph: {
         // Per-row statements kept for backward compat with /graph/core & /graph/expand

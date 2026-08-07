@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload, detectModelsFromProvider } from './llm-helpers.mjs';
+import { getModelCost } from './costs.mjs';
 import { autoObserve } from '../learn.mjs';
 import { PERSONAS, getPersona, renderPrompt, getActivePersonaId } from '../personas.mjs';
 import { compressContext } from '../compression.mjs';
@@ -424,9 +425,33 @@ export default function aimiRoutes(ctx) {
 
     const systemPrompt = buildAimiSystemPrompt(stmts, req.user.id, db);
 
-    // Build message history (include system prompt + user message)
+    // Load prior conversation history (shared with the dashboard Chat) so
+    // Aimi has memory across turns and between the overlay and the Chat page.
+    // Only user/assistant turns are sent; capped by count and total chars so
+    // long threads don't blow past the model's context window.
+    const loadConversationHistory = () => {
+      if (!conversation_id) return [];
+      let rows;
+      try { rows = stmts.messages.getByConversation.all(conversation_id); } catch { return []; }
+      const MAX_HISTORY_MSGS = 40;
+      const MAX_HISTORY_CHARS = 24000;
+      const history = [];
+      let chars = 0;
+      for (let i = rows.length - 1; i >= 0 && history.length < MAX_HISTORY_MSGS; i--) {
+        const m = rows[i];
+        if (m.role !== 'user' && m.role !== 'assistant') continue;
+        if (!m.content) continue;
+        if (chars + m.content.length > MAX_HISTORY_CHARS) break;
+        history.unshift({ role: m.role, content: m.content });
+        chars += m.content.length;
+      }
+      return history;
+    };
+
+    // Build message history (include system prompt + prior conversation + user message)
     const chatMessages = [
       { role: 'system', content: systemPrompt },
+      ...loadConversationHistory(),
       { role: 'user', content: message },
     ];
 
@@ -478,6 +503,7 @@ export default function aimiRoutes(ctx) {
         const decoder = new TextDecoder();
         let fullContent = '';
         let streamDone = false;
+        let usage = null;
 
         while (!streamDone) {
           const { done, value } = await reader.read();
@@ -492,6 +518,7 @@ export default function aimiRoutes(ctx) {
               const parsed = JSON.parse(data);
               const delta = parsed.choices?.[0]?.delta?.content;
               if (delta) fullContent += delta;
+              if (parsed.usage) usage = parsed.usage;
             } catch {}
           }
         }
@@ -509,7 +536,7 @@ export default function aimiRoutes(ctx) {
             if (parsed && typeof parsed.tool === 'string') toolCall = parsed;
           }
         } catch {}
-        return { ok: true, content: fullContent, toolCall };
+        return { ok: true, content: fullContent, toolCall, usage };
       };
 
       // Tool-calling loop: relay the model's turn; if it requests a tool,
@@ -520,10 +547,14 @@ export default function aimiRoutes(ctx) {
       const MAX_TOOL_TURNS = 4;
       let messages = chatMessages;
       let fullContent = '';
+      let promptTokens = 0;
+      let completionTokens = 0;
       for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
         const turnResult = await relayTurn(messages);
         if (!turnResult.ok) return;
         fullContent += turnResult.content;
+        promptTokens += turnResult.usage?.prompt_tokens || 0;
+        completionTokens += turnResult.usage?.completion_tokens || 0;
         if (!turnResult.toolCall) break;
         const toolResult = await executeToolCall(turnResult.toolCall);
         if (!toolResult) break;
@@ -535,15 +566,26 @@ export default function aimiRoutes(ctx) {
         ];
       }
 
+      // Track usage/cost. Prefer real usage from the provider stream; fall
+      // back to a character-based estimate so cost tracking works for any
+      // provider.
+      if (!promptTokens) promptTokens = Math.ceil(chatMessages.reduce((n, m) => n + (m.content?.length || 0), 0) / 4);
+      if (!completionTokens) completionTokens = Math.ceil((fullContent || '').length / 4);
+      const cost = getModelCost(modelId, promptTokens, completionTokens);
+      try {
+        stmts.tokenUsage.insert.run(conversation_id || null, modelId, provider.id, promptTokens, completionTokens, cost, 'inference');
+      } catch { /* best-effort */ }
+
       if (conversation_id) {
         const userMsgId = randomUUID();
         stmts.messages.insert.run(userMsgId, conversation_id, 'user', message, '[]', '[]', null, null, 0, 0);
         const asstMsgId = randomUUID();
-        stmts.messages.insert.run(asstMsgId, conversation_id, 'assistant', fullContent, '[]', '[]', null, modelId, 0, 0);
+        stmts.messages.insert.run(asstMsgId, conversation_id, 'assistant', fullContent, '[]', '[]', null, modelId, 0, completionTokens);
         db.prepare("UPDATE chat_conversations SET updated_at = datetime('now') WHERE id = ?").run(conversation_id);
         fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content: fullContent, model: modelId });
       }
       autoObserve(stmts, broadcast, logger, randomUUID, conversation_id, [{ role: 'user', content: message }], fullContent, modelId);
+      res.write(`data: ${JSON.stringify({ usage: { model: modelId, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, cost_usd: cost } })}\n\n`);
       res.end();
     } catch (err) {
       logger.error('Aimi chat error:', err);
