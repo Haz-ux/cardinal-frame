@@ -58,6 +58,10 @@ function formatEvent(msg) {
  return typeMap[msg.type] || msg.type;
 }
 
+// High-frequency WS system chatter (telemetry + dashboard summary broadcast
+// every 5s, heartbeat daemon ticks) — never clutter the feed or heatmap.
+const NOISE_TYPES = new Set(['telemetry', 'dashboard:update', 'heartbeat:tick']);
+
 // ─── Mini sparkline component ───────────────────────────────────────
 // Reusable inline-SVG line chart with a subtle gradient fill under the line.
 // Props: data (number[]), color, height, width, id (unique gradient id).
@@ -212,26 +216,46 @@ const DUMMY_HEATMAP = (() => {
 })();
 
 const ActivityHeatmap = memo(function ActivityHeatmap({ events }) {
- // Aggregate live WS events into a 7×24 day×hour grid.
+ // Historical per-hour counts (up to 7 days) from the real activity-series endpoint.
+ const [series, setSeries] = useState(null);
+ useEffect(() => {
+  let mounted = true;
+  cachedFetch('/api/dashboard/activity-series?hours=168', 60000)
+   .then(s => { if (mounted && Array.isArray(s?.buckets)) setSeries(s.buckets); })
+   .catch(() => {});
+  return () => { mounted = false; };
+ }, []);
+
+ // Overlay historical counts + live WS events into a 7×24 day×hour grid.
  const cells = useMemo(() => {
   const grid = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
   const now = Date.now();
-  events.forEach(ev => {
-   if (!ev || !ev.ts) return;
-   const agoHours = (now - ev.ts) / 3600000;
+  const add = (ts, n = 1) => {
+   const agoHours = (now - ts) / 3600000;
    if (agoHours < 0 || agoHours > 7 * 24) return;
    const dayIdx = Math.min(6, Math.floor(agoHours / 24));
    // row 0 = oldest (6d ago); row 6 = now — invert so latest sits at bottom.
    const row = 6 - dayIdx;
-   const hourIdx = new Date(ev.ts).getHours();
-   if (row >= 0 && row < 7 && hourIdx >= 0 && hourIdx < 24) grid[row][hourIdx]++;
-  });
+   const hourIdx = new Date(ts).getHours();
+   if (row >= 0 && row < 7 && hourIdx >= 0 && hourIdx < 24) grid[row][hourIdx] += n;
+  };
+  // Historical data — bucket.hour is 'YYYY-MM-DD HH:00' (UTC), so parse as UTC.
+  if (Array.isArray(series)) {
+   for (const b of series) {
+    if (!b || !b.hour) continue;
+    const ts = Date.parse(`${b.hour.replace(' ', 'T')}:00Z`);
+    if (Number.isNaN(ts)) continue;
+    add(ts, (b.tasks || 0) + (b.agentActions || 0) + (b.messages || 0));
+   }
+  }
+  // Live events observed during this session.
+  events.forEach(ev => { if (ev && ev.ts) add(ev.ts); });
   return grid;
- }, [events]);
+ }, [series, events]);
 
- // Use live data once we have real events; otherwise show dummy so the
- // visualization is meaningful even before traffic arrives.
- const hasReal = events.length > 0;
+ // Real data once we have history or live events; otherwise show a dummy
+ // grid so the visualization reads before any traffic exists.
+ const hasReal = (Array.isArray(series) && series.length > 0) || events.length > 0;
  const values = hasReal ? cells : DUMMY_HEATMAP;
 
  return (
@@ -639,7 +663,7 @@ export default function Dashboard() {
  }, []);
 
  useEffect(() => {
-  if (!lastMsg || lastMsg.type === 'task:log') return;
+  if (!lastMsg || lastMsg.type === 'task:log' || NOISE_TYPES.has(lastMsg.type)) return;
   setEvents(prev => {
    const entry = { type: lastMsg.type, text: formatEvent(lastMsg), ts: Date.now() };
    const next = [...prev, entry];

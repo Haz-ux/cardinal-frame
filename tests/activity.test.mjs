@@ -65,3 +65,26 @@ describe('Activity Feed', () => {
     expect(res.body.length).toBeGreaterThan(0);
   });
 });
+
+describe('Activity Series (heatmap data)', () => {
+  it('should return hourly buckets matching task creation counts', async () => {
+    // Create a task — its created_at lands in the current UTC hour bucket.
+    await request(app)
+      .post('/api/tasks')
+      .set(adminAuth())
+      .send({ name: 'Heatmap Series Task', command: 'echo heatmap' })
+      .expect(201);
+
+    const res = await request(app).get('/api/dashboard/activity-series?hours=168').set(adminAuth());
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.buckets)).toBe(true);
+    expect(res.body.buckets.length).toBe(169); // hours + current
+
+    // Bucket keys must match the space-separated strftime format, otherwise
+    // the find() lookups inside the endpoint silently produce all-zero counts.
+    const key = new Date().toISOString().slice(0, 13).replace('T', ' ') + ':00';
+    const current = res.body.buckets.find(b => b.hour === key);
+    expect(current).toBeTruthy();
+    expect(current.tasks).toBeGreaterThan(0);
+  });
+});
