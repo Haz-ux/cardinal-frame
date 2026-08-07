@@ -372,7 +372,7 @@ Use "input_override" for literal fixed values (e.g., { "limit": 5 }).
 Each step must be a JSON object:
 ${isSkill ? `{
   "skill_name": "exact-skill-name",
-  "name": "human readable step name",
+  "name": "short descriptive step name (e.g. \"Check System Health\")",
   "input_mapping": { "param": "$prev.output" },
   "input_override": { "fixed_param": "value" },
   "continue_on_error": false
@@ -380,7 +380,7 @@ ${isSkill ? `{
   "tool_name": "exact tool name",
   "method": "GET or POST",
   "endpoint": "/api/...",
-  "name": "human readable step name",
+  "name": "short descriptive step name (e.g. \"Check System Health\")",
   "input_mapping": { "param": "$prev.field" },
   "input_override": {},
   "continue_on_error": false
@@ -397,8 +397,11 @@ ${isSkill ? `{
 
 Respond as JSON only:
 {
-  "name": "chain-name-kebab-case",
+  "name": "a name that says what the chain does (2-5 words, kebab-case, e.g. \"daily-status-report\")",
   "description": "What this chain does",
   "steps": [ ... ]
-}`;
+}
+
+## Naming
+The "name" MUST describe what the chain actually does. Never use placeholder or example names like "chain-name-kebab-case", "new-chain", or "my-chain" — the name must identify the real function.`;
 }

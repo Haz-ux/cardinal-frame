@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { SEED_SKILLS } from './seed-skills.mjs';
+import { SEED_SKILL_CHAINS, SEED_TOOL_CHAINS } from '../chain-seeds.mjs';
 
 /**
  * Heartbeat routes: rules CRUD, state inspection, skill match, seed library.
@@ -114,62 +115,35 @@ export default function heartbeatRoutes(ctx) {
       audit('seed', 'skills', null, req.user.id, { seeded: seeded.length, skipped: skipped.length });
       broadcast('skill:seeded', { seeded, skipped });
 
-      // Seed chain templates
-      const SEED_CHAIN_TEMPLATES = [
-        {
-          name: 'research-and-summarize',
-          description: 'Research a topic and summarize the findings into a concise report',
-          steps: [
-            { skill_name: 'web-research', name: 'Research', input_mapping: { query: '$input' } },
-            { skill_name: 'paper-summarize', name: 'Summarize', input_mapping: { text: '$prev.output' } },
-          ],
-        },
-        {
-          name: 'audit-and-report',
-          description: 'Run deployment audit checks and generate an actionable report',
-          steps: [
-            { skill_name: 'deploy-check', name: 'Audit Deploy', input_mapping: { service: '$input' } },
-            { skill_name: 'log-analyzer', name: 'Analyze Logs', input_mapping: { logs: '$prev.output' } },
-            { skill_name: 'paper-summarize', name: 'Generate Report', input_mapping: { text: '$prev.output' } },
-          ],
-        },
-        {
-          name: 'build-and-deploy',
-          description: 'Run build checks, execute build, and verify deployment health',
-          steps: [
-            { skill_name: 'code-linter', name: 'Lint Code', input_mapping: { path: '$input' } },
-            { skill_name: 'deploy-check', name: 'Deploy & Check', input_mapping: { service: '$prev.output' } },
-          ],
-        },
-        {
-          name: 'monitor-and-respond',
-          description: 'Check system health and auto-respond to issues with corrective actions',
-          steps: [
-            { skill_name: 'monitor-check', name: 'Monitor', input_mapping: {} },
-            { skill_name: 'incident-responder', name: 'Respond', input_mapping: { alerts: '$prev.output' } },
-          ],
-        },
-        {
-          name: 'research-to-landing-page',
-          description: 'Research a product topic and generate a landing page from findings',
-          steps: [
-            { skill_name: 'web-research', name: 'Research Topic', input_mapping: { query: '$input' } },
-            { skill_name: 'paper-summarize', name: 'Extract Key Points', input_mapping: { text: '$prev.output' } },
-            { skill_name: 'landing-page-generator', name: 'Generate Landing Page', input_mapping: { product: '$prev.output' } },
-          ],
-        },
-      ];
+      // Seed chain templates (shared source of truth) — skill chains + tool chains
+      const seedChains = (stmts_, list, insertStmt) => {
+        let seeded = 0, updated = 0;
+        for (const tmpl of list) {
+          const steps = JSON.stringify(tmpl.steps);
+          const existing = stmts_.getByName.get(tmpl.name);
+          if (!existing) {
+            insertStmt.run(randomUUID(), tmpl.name, tmpl.description, steps, 'template', req.user?.id || null);
+            seeded++;
+          } else if (existing.steps !== steps || existing.description !== tmpl.description || existing.status !== 'template') {
+            stmts_.update.run(tmpl.name, tmpl.description, steps, 'template', existing.id);
+            updated++;
+          }
+        }
+        return { seeded, updated };
+      };
 
-      let chainsSeeded = 0;
-      for (const tmpl of SEED_CHAIN_TEMPLATES) {
-        const existing = stmts.skillChains.getByName.get(tmpl.name);
-        if (existing) continue;
-        const id = randomUUID();
-        stmts.skillChains.insert.run(id, tmpl.name, tmpl.description, JSON.stringify(tmpl.steps), 'template', req.user?.id || null);
-        chainsSeeded++;
-      }
+      const skillChains = seedChains(stmts.skillChains, SEED_SKILL_CHAINS, stmts.skillChains.insert);
+      const toolChains = seedChains(stmts.toolChains, SEED_TOOL_CHAINS, stmts.toolChains.insert);
 
-      res.json({ seeded, skipped, chains_seeded: chainsSeeded, total_seeded: seeded.length, total_skipped: skipped.length });
+      res.json({
+        seeded, skipped,
+        chains_seeded: skillChains.seeded,
+        chains_updated: skillChains.updated,
+        tool_chains_seeded: toolChains.seeded,
+        tool_chains_updated: toolChains.updated,
+        total_seeded: seeded.length,
+        total_skipped: skipped.length,
+      });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

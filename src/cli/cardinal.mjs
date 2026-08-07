@@ -3,7 +3,7 @@
 import { randomUUID } from 'crypto';
 
 const BASE = process.env.CF_API || 'http://localhost:8080/api';
-const TOKEN = process.env.CF_TOKEN;
+let TOKEN = process.env.CF_TOKEN;
 
 async function req(method, path, body) {
  const headers = { 'Content-Type': 'application/json' };
@@ -92,6 +92,153 @@ async function port() {
   console.log(`Current port: ${data.port} (fixed — set PORT env var to change)`);
 }
 
+// ─── config ──────────────────────────────────────────────────
+// `cardinal config` — manage environment variables + dev settings.
+//   cardinal config list                         show all env vars + dev settings
+//   cardinal config get <key>                    get an env var (masked unless --raw)
+//   cardinal config set <key> <value> [--encrypt] set an env var
+//   cardinal config unset <key>                  delete an env var
+//   cardinal config dev                         show dev settings
+//   cardinal config dev <key> <value>           set a dev setting (logLevel, debugMode, sandboxTimeout, maxConcurrentAgents, wsHeartbeatMs, embeddingModel)
+async function ensureAuth() {
+  if (TOKEN) return;
+  try {
+    const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+    if (data.token) TOKEN = data.token;
+  } catch (e) {
+    console.error(`✗ Could not log in as admin: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
+    process.exit(1);
+  }
+}
+
+async function config(args) {
+  await ensureAuth();
+  const sub = args[0];
+  const rest = args.slice(1);
+  if (!sub || sub === 'list') return configList(rest);
+  if (sub === 'get') return configGet(rest);
+  if (sub === 'set') return configSet(rest);
+  if (sub === 'unset') return configUnset(rest);
+  if (sub === 'dev') return configDev(rest);
+  console.error(`Usage: cardinal config [list|get|set|unset|dev] [args...]\nRun 'cardinal help' for details.`);
+  process.exit(1);
+}
+
+async function configList(_args) {
+  try {
+    const env = await req('GET', '/settings/env');
+    const dev = await req('GET', '/settings/dev');
+    console.log('── Environment Variables ──');
+    if (!env.length) console.log('(none)');
+    else {
+      const sens = env.map(e => ({ key: e.key, value: e.encrypted ? '•••• (encrypted)' : e.value, category: e.category || '', encrypted: e.encrypted ? 'yes' : '' }));
+      table(sens, ['key', 'value', 'category', 'encrypted']);
+    }
+    console.log('\n── Dev Settings ──');
+    for (const [k, v] of Object.entries(dev)) {
+      if (k === 'port') continue;
+      console.log(`  ${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+    }
+    console.log(`  port: ${dev.port} (read-only — set PORT env var)`);
+  } catch (e) { console.error(`Error: ${e.message}`); process.exit(1); }
+}
+
+async function configGet(args) {
+  const [key, flag] = args;
+  if (!key) { console.error('Usage: cardinal config get <key>'); process.exit(1); }
+  const raw = flag === '--raw';
+  const all = await req('GET', '/settings/env');
+  const row = all.find(r => r.key === key);
+  if (!row) { console.error(`"${key}" not set`); process.exit(1); }
+  if (raw && row.encrypted) console.log(row.value);
+  else if (raw) console.log(row.value);
+  else console.log(row.encrypted ? '•••• (encrypted — use --raw to reveal)' : row.value);
+}
+
+async function configSet(args) {
+  const [key, value, flag] = args;
+  if (!key || value === undefined) { console.error('Usage: cardinal config set <key> <value> [--encrypt]'); process.exit(1); }
+  const encrypted = flag === '--encrypt' ? 1 : 0;
+  if (encrypted && value.length < 6) { console.error('Encrypted values should be at least 6 chars — refusing to hide a trivial value.'); process.exit(1); }
+  const data = await req('POST', '/settings/env', { key, value, encrypted, category: 'general' });
+  console.log(`Set "${data.key}"${encrypted ? ' (encrypted)' : ''}`);
+}
+
+async function configUnset(args) {
+  const [key] = args;
+  if (!key) { console.error('Usage: cardinal config unset <key>'); process.exit(1); }
+  const data = await req('DELETE', `/settings/env/${encodeURIComponent(key)}`);
+  console.log(`Unset "${key}"`);
+}
+
+async function configDev(args) {
+  if (!args.length) {
+    const dev = await req('GET', '/settings/dev');
+    console.log('Dev Settings:');
+    for (const [k, v] of Object.entries(dev)) {
+      console.log(`  ${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+    }
+    return;
+  }
+  const [key, ...rest] = args;
+  const value = rest.join(' ');
+  if (value === '') { console.error('Usage: cardinal config dev <key> <value>'); process.exit(1); }
+  if (key === 'port') { console.error('Port is fixed to 8080 — set the PORT env var or --server-only flag instead'); process.exit(1); }
+  const data = await req('PUT', '/settings/dev', { [key]: String(value) });
+  console.log(`Updated dev settings: ${(data.updated || []).join(', ') || '(no changes)'}`);
+}
+
+// ─── setup ───────────────────────────────────────────────────
+// `cardinal setup` — first-run / bootstrap wizard: check health, login, seed
+// the skill library (including the skill-scanner), and report what's ready.
+async function setup(args) {
+  // If no CF_TOKEN was provided, login as admin so we can call admin endpoints.
+  await ensureAuth();
+  console.log('Cardinal Frame — setup\n');
+  // 1. Health
+  try {
+    const h = await req('GET', '/health');
+    console.log(`✓ Server up — status: ${h.status || 'unknown'}, uptime: ${h.uptime ?? '-'}s`);
+  } catch (e) {
+    console.error(`✗ Server not reachable at ${BASE} — is 'cardinal run' going? (${e.message})`);
+    process.exit(1);
+  }
+  // 2. Seed skills + chains
+  console.log('Seeding skill library + chains…');
+  try {
+    const seed = await req('POST', '/skills/seed');
+    console.log(`  skills: ${seed.total_seeded || 0} seeded, ${seed.total_skipped || 0} already present`);
+    console.log(`  skill chains: ${seed.chains_seeded || 0} seeded, ${seed.chains_updated || 0} updated`);
+    console.log(`  tool chains: ${seed.tool_chains_seeded || 0} seeded, ${seed.tool_chains_updated || 0} updated`);
+    if ((seed.seeded || []).includes('skill-scanner')) console.log('  ✓ skill-scanner installed (pre-ingest gate active)');
+  } catch (e) {
+    console.error(`  ✗ seeding failed: ${e.message}`);
+  }
+  // 3. Status snapshot
+  try {
+    const st = await req('GET', '/health');
+    console.log(`\nStatus — agents ready, ws clients: ${st.ws?.connected_clients ?? '-'}`);
+  } catch {}
+  console.log('\nNext: `cardinal config list` to view settings, `cardinal commands` to list all commands.');
+}
+
+// ─── commands ────────────────────────────────────────────────
+// `cardinal commands` — print all available commands.
+async function commands() {
+  console.log(HELP);
+}
+
+// `cardinal doctor` — health/diagnostic check (placeholder).
+async function doctor(args) {
+  const fix = args[0] === 'fix';
+  if (fix) {
+    console.error('cardinal doctor:fix — not yet implemented');
+    process.exit(2);
+  }
+  console.error('cardinal doctor — not yet implemented');
+  process.exit(2);
+}
+
 // `cardinal chat <message>` — POST /api/chat
 async function chat(args) {
   const message = args.join(' ');
@@ -174,6 +321,8 @@ async function run(args) {
 
   // Start client unless disabled
   let clientProc = null;
+  let forwardProc = null;
+  let lanForwardProc = null;
   if (!args.includes('--no-client') && !args.includes('--server-only')) {
     console.log('Starting dashboard...');
     clientProc = spawn('npm', ['run', 'dev'], {
@@ -184,6 +333,32 @@ async function run(args) {
     clientProc.stderr?.on('data', (d) => process.stdout.write(`Client: ${d}`));
     clientProc.on('exit', (code) => console.log(`Dashboard exited (code=${code})`));
     console.log('Dashboard: http://localhost:5173');
+
+    // IPv4 loopback forwarder — vite binds only [::1] (a wildcard host would call
+    // os.networkInterfaces(), which the proot sandbox blocks), so this tiny raw-TCP
+    // proxy makes http://127.0.0.1:5173 and http://localhost:5173 work too.
+    forwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
+      cwd: CF_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    forwardProc.stdout?.on('data', (d) => process.stdout.write(`Forward: ${d}`));
+    forwardProc.stderr?.on('data', (d) => process.stdout.write(`Forward: ${d}`));
+    forwardProc.on('exit', (code) => console.log(`IPv4 forwarder exited (code=${code})`));
+
+    // Optional LAN forwarder — if CARDINAL_LAN_HOST is set, also listen on that
+    // WiFi IP so the phone browser can reach the app via the real interface
+    // (Android's loopback handling for post-load fetches has been unreliable).
+    if (process.env.CARDINAL_LAN_HOST) {
+      lanForwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
+        cwd: CF_DIR,
+        env: { ...process.env, FWD_LISTEN_HOST: process.env.CARDINAL_LAN_HOST },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      lanForwardProc.stdout?.on('data', (d) => process.stdout.write(`Forward(LAN): ${d}`));
+      lanForwardProc.stderr?.on('data', (d) => process.stdout.write(`Forward(LAN): ${d}`));
+      lanForwardProc.on('exit', (code) => console.log(`LAN forwarder exited (code=${code})`));
+      console.log(`Dashboard (LAN): http://${process.env.CARDINAL_LAN_HOST}:5173`);
+    }
   }
 
   console.log('Cardinal Frame is running. Press Ctrl+C to stop.');
@@ -191,6 +366,8 @@ async function run(args) {
   const shutdown = () => {
     console.log('\nStopping Cardinal Frame...');
     if (clientProc) { try { clientProc.kill('SIGTERM'); } catch {} }
+    if (forwardProc) { try { forwardProc.kill('SIGTERM'); } catch {} }
+    if (lanForwardProc) { try { lanForwardProc.kill('SIGTERM'); } catch {} }
     if (serverPid) { try { process.kill(serverPid, 'SIGTERM'); } catch {} }
     process.exit(0);
   };
@@ -206,7 +383,7 @@ async function stop() {
   const pids = [];
   try { pids.push(Number(fs.readFileSync(PID_FILE, 'utf8'))); } catch {}
   // Also sweep for any stray server/dashboard processes
-  for (const pat of ['src/server/server.mjs', 'client/node_modules/.bin/vite']) {
+  for (const pat of ['src/server/server.mjs', 'client/node_modules/.bin/vite', 'client/vite-ipv4-forward.mjs']) {
     try {
       const { execSync } = await import('node:child_process');
       const out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim();
@@ -240,6 +417,15 @@ Commands:
   chat <message>               Send a chat message (POST /api/chat)
   run [args]                   Start server + dashboard (--no-client, --server-only)
   stop                         Stop server + dashboard
+  setup                        First-run wizard: health check + seed skill library & chains
+  config [list|get|set|unset|dev]  Manage env vars + dev settings
+                                  config list
+                                  config get <key> [--raw]
+                                  config set <key> <value> [--encrypt]
+                                  config unset <key>
+                                  config dev [key value]
+  commands                     Print this command list
+  doctor [fix]                 Diagnostics (placeholder — not yet implemented)
 
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
@@ -276,6 +462,18 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         break;
       case 'chat':
         await chat(sub !== undefined ? process.argv.slice(3) : []);
+        break;
+      case 'setup':
+        await setup(rest);
+        break;
+      case 'config':
+        await config([sub, ...rest].filter(a => a !== undefined));
+        break;
+      case 'commands':
+        await commands();
+        break;
+      case 'doctor':
+        await doctor([sub, ...rest].filter(a => a !== undefined));
         break;
       case 'run':
         await run(process.argv.slice(3));

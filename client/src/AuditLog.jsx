@@ -115,7 +115,7 @@ export default function AuditLog() {
               {isExpanded && (
                 <div className="px-4 py-3 text-xs" style={{ background: 'rgba(0,0,0,0.3)' }}>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
-                    <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{entry.id?.slice(0,12)}…</span></div>
+                    <div><span className="text-gray-500 block">ID</span><span className="font-mono" style={{ color: NEON.cyan }}>{String(entry.id ?? '').slice(0,12)}…</span></div>
                     <div><span className="text-gray-500 block">User</span><span style={{ color: '#888' }}>{entry.user_id || 'system'}</span></div>
                     <div><span className="text-gray-500 block">Target</span><span style={{ color: '#888' }}>{entry.target_type}/{entry.target_id?.slice(0,8)}</span></div>
                     <div><span className="text-gray-500 block">Time</span><span style={{ color: '#888' }}>{entry.timestamp || entry.created_at}</span></div>

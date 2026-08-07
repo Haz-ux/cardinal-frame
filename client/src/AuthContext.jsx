@@ -72,19 +72,35 @@ export function useAuth() {
   return ctx;
 }
 
-export function api(path, opts = {}) {
+export async function api(path, opts = {}) {
   const token = localStorage.getItem('cf_token');
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  return fetch(path, { ...opts, headers, cache: 'no-store', signal: controller.signal }).then(r => {
-    if (!r.ok) return r.json().then(e => Promise.reject(new Error(e.error || `Request failed: ${r.status}`)));
-    return r.json();
-  }).finally(() => clearTimeout(timer)).catch(err => {
-    if (err.name === 'AbortError') throw new Error('Request timed out — check the server connection and try again');
-    throw err;
-  });
+
+  // The phone's connection to the dev sandbox can stall on a wedged pooled
+  // socket; a longer timeout plus one retry gives a fresh connection a chance.
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const res = await fetch(path, { ...opts, headers, cache: 'no-store', signal: controller.signal });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.error || `Request failed: ${res.status}`);
+      }
+      return res.json();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        lastErr = new Error('Request timed out — check the server connection and try again');
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr;
 }
 
 function saveUser(username) {

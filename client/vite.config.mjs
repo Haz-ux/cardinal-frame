@@ -25,7 +25,9 @@ export default defineConfig({
   ],
   server: {
     port: 5173,
-    host: '::1', // this phone's browser resolves localhost → ::1 (IPv6); vite must listen there or localhost:5173 refuses to connect
+    host: '::1', // this phone's browser resolves localhost → ::1 (IPv6); vite must listen there or localhost:5173 refuses to connect.
+    // NOTE: do NOT use a wildcard host ('::', '0.0.0.0', 'localhost') — vite's resolveServerUrls calls os.networkInterfaces(),
+    // which the proot sandbox blocks (uv_interface_addresses error 13). IPv4 loopback is served by client/vite-ipv4-forward.mjs.
     strictPort: true, // fail hard if 5173 is busy instead of silently bumping to 5174+
     proxy: {
       '/api': {

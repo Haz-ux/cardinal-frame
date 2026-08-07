@@ -237,7 +237,7 @@ export default function SkillsTools({ initialTab }) {
                   style={inputStyle} />
                 <select value={newSkill.category} onChange={e => setNewSkill(p => ({ ...p, category: e.target.value }))}
                   style={{ ...inputStyle, background: BG.surface }}>
-                  {['general', 'agents', 'tasks', 'llm', 'system', 'mcp', 'schedules', 'custom', 'devops', 'development', 'coding', 'shopify', 'web-design', 'research', 'productivity', 'data', 'ai'].map(c => <option key={c} value={c}>{c}</option>)}
+                  {['general', 'agents', 'tasks', 'llm', 'system', 'mcp', 'schedules', 'custom', 'devops', 'development', 'coding', 'security', 'network', 'shopify', 'web-design', 'research', 'productivity', 'data', 'ai'].map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
                 <input placeholder="Handler (api, function, script)" value={newSkill.handler} onChange={e => setNewSkill(p => ({ ...p, handler: e.target.value }))}
                   style={inputStyle} />
@@ -262,14 +262,18 @@ export default function SkillsTools({ initialTab }) {
                 {skills.filter(s => (s.category || 'general') === cat).map(skill => (
                   <div key={skill.id} style={{
                     background: BG.card, border: `1px solid ${NEON.purple}10`, borderRadius: 10,
-                    padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
                   }}>
-                    <div style={{ width: 28, height: 28, borderRadius: 6, background: `${NEON.purple}10`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div style={{ width: 28, height: 28, borderRadius: 6, background: `${NEON.purple}10`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                       <Sparkles size={12} style={{ color: NEON.purple }} />
                     </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{skill.name}</span>
+                    <div style={{ flex: '1 1 200px', minWidth: 0, overflow: 'hidden' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span style={{ color: '#fff', fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>{skill.name}</span>
+                        <span style={{
+                          fontSize: 9, fontFamily: 'monospace', letterSpacing: 0.5, padding: '1px 6px',
+                          borderRadius: 8, border: `1px solid ${NEON.purple}30`, color: NEON.purple, flexShrink: 0,
+                        }}>{handlerType(skill.handler).toUpperCase()}</span>
                         {(() => {
                           const fr = getFailureRate(skill.id);
                           if (!fr || fr.total < 1) return null;
@@ -278,7 +282,7 @@ export default function SkillsTools({ initialTab }) {
                           return (
                             <span style={{
                               fontSize: 10, fontFamily: 'monospace', padding: '1px 6px',
-                              borderRadius: 8, border: `1px solid ${color}40`, color,
+                              borderRadius: 8, border: `1px solid ${color}40`, color, flexShrink: 0,
                               cursor: fr.needsReview ? 'pointer' : 'default',
                             }} onClick={() => fr.needsReview && generateProposal(skill.id)}>
                               {pct}% fail ({fr.failures}/{fr.total})
@@ -287,13 +291,18 @@ export default function SkillsTools({ initialTab }) {
                           );
                         })()}
                       </div>
-                      <div style={{ color: '#666', fontSize: 11 }}>{skill.description}</div>
+                      <div style={{ color: '#666', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{skill.description}</div>
+                      {skill.handler && (
+                        <details style={{ marginTop: 6 }}>
+                          <summary style={{ color: '#555', fontSize: 10, fontFamily: 'monospace', cursor: 'pointer' }}>view handler</summary>
+                          <pre style={{ color: '#999', fontSize: 10, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: 8, marginTop: 4, maxHeight: 220, overflow: 'auto', background: 'rgba(0,0,0,0.35)', borderRadius: 6 }}>{skill.handler}</pre>
+                        </details>
+                      )}
                     </div>
-                    <span style={{ color: '#444', fontSize: 10, fontFamily: 'monospace' }}>{skill.handler}</span>
-                    <button onClick={() => toggleSkill(skill)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: skill.enabled ? NEON.green : '#555', padding: 2, display: 'flex' }}>
+                    <button onClick={() => toggleSkill(skill)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: skill.enabled ? NEON.green : '#555', padding: 2, display: 'flex', flexShrink: 0 }}>
                       {skill.enabled ? <ToggleRight size={18} /> : <ToggleLeft size={18} />}
                     </button>
-                    <button onClick={() => deleteSkill(skill.id, skill.name)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#444', padding: 2, display: 'flex' }}>
+                    <button onClick={() => deleteSkill(skill.id, skill.name)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#444', padding: 2, display: 'flex', flexShrink: 0 }}>
                       <Trash2 size={13} />
                     </button>
                   </div>
@@ -354,6 +363,15 @@ const pillBtn = {
 const methodBadge = {
   padding: '2px 8px', borderRadius: 10, fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
 };
+
+function handlerType(handler) {
+  const h = String(handler || '');
+  if (h.startsWith('hybrid:')) return 'hybrid';
+  if (h.startsWith('template:')) return 'template';
+  if (h.startsWith('api:')) return 'api';
+  if (/=>\s*\{|\breturn\b/.test(h) || h.trim().startsWith('(') || h.trim().startsWith('async')) return 'script';
+  return 'custom';
+}
 
 function methodColor(m) {
   switch (m) {
