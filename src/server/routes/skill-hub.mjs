@@ -16,6 +16,8 @@ export default function skillHubRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, randomUUID } = ctx;
   const router = express.Router();
 
+  const SOURCE_TYPES = ['git', 'github', 'url', 'tarball', 'http'];
+
   // ─── Hub Sources CRUD ──────────────────────────────────────────
 
   // List all hub sources
@@ -53,6 +55,9 @@ export default function skillHubRoutes(ctx) {
     try {
       const { name, url, type = 'github' } = req.body;
       if (!name || !url) return res.status(400).json({ error: 'name and url required' });
+      if (!SOURCE_TYPES.includes(type)) {
+        return res.status(400).json({ error: `Invalid source type. Allowed: ${SOURCE_TYPES.join(', ')}` });
+      }
 
       // SSRF protection
       if (isInternalUrl(url)) return res.status(403).json({ error: 'Internal/private URLs not allowed' });

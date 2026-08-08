@@ -4,7 +4,7 @@ import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypt
 /**
  * Settings routes: env vars (CRUD + test), dev settings (CRUD + restart).
  * Dependencies: db, wss, server, logger, fireHook, authMiddleware, requireRole, apiLimiter, broadcast, PORT
- * Exports: encryptSecret, decryptSecret, decryptValue, xorCipher, xorDecipher, getDevSetting, getDevSettings
+ * Exports: encryptSecret, decryptSecret, decryptValue, xorDecipher, getDevSetting, getDevSettings
  */
 
 // ─── AES-256-GCM encryption for stored secrets ─────────────────────────
@@ -16,10 +16,12 @@ const KEY_HEX = ENCRYPT_SECRET
   : randomBytes(32).toString('hex');
 
 export function encryptSecret(plaintext) {
+  const value = String(plaintext ?? '');
+  if (!value) return '';
   const key = Buffer.from(KEY_HEX, 'hex');
   const iv = randomBytes(12); // 96-bit IV for GCM
   const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const enc = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [iv, tag, enc].map(b => b.toString('base64')).join(':');
 }
@@ -27,37 +29,43 @@ export function encryptSecret(plaintext) {
 export function decryptSecret(packed) {
   try {
     const [ivB64, tagB64, encB64] = packed.split(':');
-    if (!ivB64 || !tagB64 || !encB64) return packed;
+    if (!ivB64 || !tagB64 || !encB64) return null;
     const key = Buffer.from(KEY_HEX, 'hex');
     const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'));
     decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
     const dec = Buffer.concat([decipher.update(Buffer.from(encB64, 'base64')), decipher.final()]);
     return dec.toString('utf8');
-  } catch { return packed; }
+  } catch { return null; }
 }
 
-// ─── Legacy XOR (backward compat with existing DB rows) ───────────────
-export function xorCipher(text) {
-  const buf = Buffer.from(text, 'utf8');
-  const key = Buffer.from(ENCRYPT_SECRET || 'cf-default-secret-v1', 'utf8');
-  for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
-  return buf.toString('base64');
+// ─── Format detection ─────────────────────────────────────────────────
+// AES-GCM payloads are packed as `iv:tag:ciphertext` (base64, colon-delimited).
+// base64 never contains ':', so a 3-part string unambiguously identifies AES.
+export function isAesPacked(val) {
+  return typeof val === 'string' && val.split(':').length === 3;
 }
+
+// ─── Legacy XOR (read-only, backward compat with pre-AES DB rows) ─────
+// Only used to decrypt rows written before the AES-256-GCM migration.
+// The fallback key is retained solely for that purpose — nothing new is
+// ever encrypted with XOR, and the key never signs or encrypts writes.
+const LEGACY_XOR_KEY = 'cf-default-secret-v1';
 
 export function xorDecipher(b64) {
   try {
+    if (typeof b64 !== 'string' || !b64 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return null;
     const buf = Buffer.from(b64, 'base64');
-    const key = Buffer.from(ENCRYPT_SECRET || 'cf-default-secret-v1', 'utf8');
+    const key = Buffer.from(ENCRYPT_SECRET || LEGACY_XOR_KEY, 'utf8');
     for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
     return buf.toString('utf8');
-  } catch { return b64; }
+  } catch { return null; }
 }
 
 // ─── Smart decrypt — AES-GCM first, XOR fallback ──────────────────────
 export function decryptValue(val, isEncrypted) {
   if (!isEncrypted) return val;
-  if (val.includes(':')) return decryptSecret(val);
-  return xorDecipher(val);
+  if (isAesPacked(val)) return decryptSecret(val) ?? val;
+  return xorDecipher(val) ?? val;
 }
 
 // ─── Decrypt a provider row's api_key in place (if it is encrypted) ──

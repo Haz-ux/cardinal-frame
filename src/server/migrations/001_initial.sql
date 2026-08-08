@@ -448,7 +448,7 @@ CREATE TABLE IF NOT EXISTS skill_hub_sources (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   url TEXT NOT NULL,
-  type TEXT DEFAULT 'git' CHECK(type IN ('git','tarball','http')),
+  type TEXT DEFAULT 'git' CHECK(type IN ('git','github','url','tarball','http')),
   verified INTEGER DEFAULT 0,
   trust_score REAL DEFAULT 0,
   scan_status TEXT DEFAULT 'pending' CHECK(scan_status IN ('pending','scanning','passed','blocked','failed')),

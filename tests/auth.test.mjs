@@ -154,4 +154,76 @@ describe('Auth API', () => {
       expect(res.status).toBe(200);
     });
   });
+
+  describe('Refresh tokens', () => {
+    it('login returns an access + refresh token pair', async () => {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ username: 'admin', password: 'admin123' });
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('token');
+      expect(res.body).toHaveProperty('refreshToken');
+    });
+
+    it('refresh rotates the token pair and invalidates the old refresh token', async () => {
+      const loginRes = await request(app)
+        .post('/api/auth/login')
+        .send({ username: 'admin', password: 'admin123' });
+      const oldRefresh = loginRes.body.refreshToken;
+
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .send({ refreshToken: oldRefresh });
+      expect(refreshRes.status).toBe(200);
+      expect(refreshRes.body).toHaveProperty('token');
+      expect(refreshRes.body.refreshToken).toBeTruthy();
+      expect(refreshRes.body.refreshToken).not.toBe(oldRefresh);
+
+      // Old token must now be revoked → 401 on reuse
+      const replay = await request(app)
+        .post('/api/auth/refresh')
+        .send({ refreshToken: oldRefresh });
+      expect(replay.status).toBe(401);
+    });
+
+    it('rejects a garbage refresh token', async () => {
+      const res = await request(app)
+        .post('/api/auth/refresh')
+        .send({ refreshToken: 'not-a-real-token' });
+      expect(res.status).toBe(401);
+    });
+
+    it('rejects a missing refresh token', async () => {
+      const res = await request(app)
+        .post('/api/auth/refresh')
+        .send({});
+      expect(res.status).toBe(400);
+    });
+
+    it('logout revokes the refresh token', async () => {
+      const loginRes = await request(app)
+        .post('/api/auth/login')
+        .send({ username: 'admin', password: 'admin123' });
+      const refreshToken = loginRes.body.refreshToken;
+
+      const logoutRes = await request(app)
+        .post('/api/auth/logout')
+        .send({ refreshToken });
+      expect(logoutRes.status).toBe(200);
+      expect(logoutRes.body.success).toBe(true);
+
+      const refreshRes = await request(app)
+        .post('/api/auth/refresh')
+        .send({ refreshToken });
+      expect(refreshRes.status).toBe(401);
+    });
+
+    it('logout with unknown token still succeeds', async () => {
+      const res = await request(app)
+        .post('/api/auth/logout')
+        .send({ refreshToken: 'definitely-not-a-token' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+  });
 });

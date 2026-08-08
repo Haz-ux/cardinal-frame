@@ -81,7 +81,8 @@ if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'cardinal-frame-dev-
   console.error('FATAL: JWT_SECRET must be set in production. Set the JWT_SECRET env var.');
   process.exit(1);
 }
-const JWT_EXPIRES = process.env.JWT_EXPIRES || '24h';
+const JWT_EXPIRES = process.env.JWT_EXPIRES || '15m';
+const JWT_REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES || '7d';
 
 // ─── Logger ────────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -185,6 +186,17 @@ db.exec(`
   metadata TEXT DEFAULT '{}',
   created_at TEXT DEFAULT (datetime('now'))
   );
+  CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    revoked_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
   CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -648,7 +660,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     url TEXT NOT NULL,
-    type TEXT DEFAULT 'git' CHECK(type IN ('git','tarball','http')),
+    type TEXT DEFAULT 'git' CHECK(type IN ('git','github','url','tarball','http')),
     verified INTEGER DEFAULT 0,
     trust_score REAL DEFAULT 0,
     scan_status TEXT DEFAULT 'pending' CHECK(scan_status IN ('pending','scanning','passed','blocked','failed')),
@@ -844,6 +856,13 @@ const stmts = {
   getAll: db.prepare('SELECT id, username, role, created_at FROM users'),
   updateRole: db.prepare('UPDATE users SET role = ? WHERE id = ?'),
   updatePassword: db.prepare('UPDATE users SET password_hash = ? WHERE id = ?'),
+  },
+  refreshTokens: {
+    insert: db.prepare('INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)'),
+    getByHash: db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?'),
+    revoke: db.prepare("UPDATE refresh_tokens SET revoked_at = datetime('now') WHERE id = ? AND revoked_at IS NULL"),
+    revokeAllByUser: db.prepare("UPDATE refresh_tokens SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL"),
+    deleteExpired: db.prepare("DELETE FROM refresh_tokens WHERE expires_at < datetime('now') OR revoked_at IS NOT NULL"),
   },
   files: {
      insert: db.prepare('INSERT INTO files (id, filename, original_name, size, mime_type, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -1421,7 +1440,7 @@ async function fireHook(hookName, data) {
 // ─── Shared Context Object ──────────────────────────────────────────────
 const ctx = {
   app, db, stmts, wss, logger,
-  JWT_SECRET, JWT_EXPIRES,
+  JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES,
   authMiddleware, optionalAuth, requireRole, authLimiter, apiLimiter, readLimiter, writeLimiter, sandboxLimiter,
   audit, broadcast, broadcastLog,
   randomUUID,

@@ -56,24 +56,24 @@ client/src/
 ## API Surface
 | Route Group | Auth | Rate Limit | Description |
 |---|---|---|---|
-| `/api/auth/*` | Public/required | 20/min | Login, register, token refresh |
+| `/api/auth/*` | Public/required | 20/min | Login, register, refresh, logout |
 | `/api/health` | Public | None | Health check |
-| `/api/graph/*` | optionalAuth | 100/min | Neural map graph data |
-| `/api/sandbox/execute` | admin | 100/min | Sandboxed code execution |
-| `/api/chains/*` | required | 100/min | Skill/tool chain CRUD + execution |
-| `/api/evolution/*` | admin | 100/min | Skill evolution, chain promotion |
-| `/api/heartbeat/*` | required/admin | 100/min | Heartbeat rules, daemon state |
-| `/api/skills/hub/*` | required/admin | 100/min | Skill hub sources, scan, install |
-| `/api/dags/*` | required | 100/min | DAG CRUD + execution |
-| `/api/chat/*` | required | 100/min | Chat completions, conversations |
+| `/api/graph/*` | optionalAuth | 50/min | Neural map graph data |
+| `/api/sandbox/execute` | admin | 10/min | Sandboxed code execution |
+| `/api/chains/*` | required | 50/min | Skill/tool chain CRUD + execution |
+| `/api/evolution/*` | admin | 50/min | Skill evolution, chain promotion |
+| `/api/heartbeat/*` | required/admin | 50/min | Heartbeat rules, daemon state |
+| `/api/skills/hub/*` | required/admin | 50/min | Skill hub sources, scan, install |
+| `/api/dags/*` | required | 50/min | DAG CRUD + execution |
+| `/api/chat/*` | required | 50/min | Chat completions, conversations |
 
 ## Security Model
-- **Auth:** JWT (24h expiry), bcrypt password hashing
+- **Auth:** short-lived JWT access token (`JWT_EXPIRES`, default 15m) + hashed, rotatable refresh token (`JWT_REFRESH_EXPIRES`, default 7d). Refresh via `POST /api/auth/refresh`; server-side revoke via `POST /api/auth/logout`. bcrypt password hashing.
 - **RBAC:** `admin` and `user` roles, `requireRole('admin')` middleware
-- **Rate Limiting:** Auth 20/min, API 100/min (express-rate-limit)
+- **Rate Limiting:** Auth 20/min, write API 50/min, read API 200/min, sandbox 10/min (express-rate-limit)
 - **Input Validation:** Zod schemas on all POST/PUT routes (`validateBody`)
 - **Security Headers:** X-Frame-Options, X-Content-Type-Options, Referrer-Policy
-- **Sandbox:** isolated process execution with 5s timeout, 100KB maxBuffer
+- **Sandbox:** skill VM sandbox uses configurable `sandboxTimeout` (default 30s) with a 1 MB `execSync` buffer; `POST /api/sandbox/execute` uses a 5s timeout / 100 KB buffer
 - **Skill Hub Scanner:** 15 dangerous patterns (eval, prototype pollution, etc.)
 - **SSRF Protection:** blocks AWS metadata, localhost, RFC1918 on hub sources
 - **Heartbeat:** vm sandbox for condition eval (no `new Function()`)

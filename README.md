@@ -92,8 +92,10 @@ Highlights:
   encrypted (`ENCRYPT_SECRET` → SHA-256 key, `iv:tag:enc`), decrypted only at runtime
   chokepoints. Legacy XOR rows decrypt transparently. A previous plaintext-at-rest
   issue and an `ENCRYPT_SECRET` load-order bug are fixed and covered by the audit.
-- **Auth** — JWT (24h, `JWT_SECRET`), bcrypt (cost 10). Roles: `admin`, `user`, `viewer`.
-  `requireRole(...)` middleware on admin routes. Auth endpoints rate-limited 20/min.
+- **Auth** — short-lived JWT access token (`JWT_EXPIRES`, default 15m) + hashed,
+  rotatable refresh token (`JWT_REFRESH_EXPIRES`, default 7d), bcrypt (cost 10).
+  Roles: `admin`, `user`, `viewer`. `requireRole(...)` middleware on admin routes.
+  Auth endpoints rate-limited 20/min.
 - **No hardcoded keys** — CI runs gitleaks with full history scan; a pre-commit hook
   scans staged files (see [ADR-006](./docs/adr/0006-hardcoded-api-key-in-git-history.md)).
 
@@ -103,11 +105,13 @@ All under `/api/auth`, all public routes rate-limited (20/min):
 
 | Method | Endpoint | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/api/auth/register` | public | Register a user (role `user`), returns JWT |
-| `POST` | `/api/auth/login` | public | Login, returns JWT + user |
+| `POST` | `/api/auth/register` | public | Register a user (role `user`), returns access + refresh token |
+| `POST` | `/api/auth/login` | public | Login, returns access + refresh token |
 | `GET` | `/api/auth/me` | JWT | Current user profile |
+| `POST` | `/api/auth/refresh` | public | Rotate a refresh token → new access + refresh pair |
+| `POST` | `/api/auth/logout` | public | Revoke a refresh token (server-side logout) |
 | `POST` | `/api/auth/reset-request` | public | Request password reset (token printed to server console) |
-| `POST` | `/api/auth/reset-confirm` | public | Confirm reset, returns fresh JWT |
+| `POST` | `/api/auth/reset-confirm` | public | Confirm reset, returns fresh access + refresh token |
 | `GET` | `/api/users` | admin | List all users |
 | `PATCH` | `/api/users/:id/role` | admin | Change a user's role (`admin`/`user`/`viewer`) |
 | `GET` | `/api/profile` | JWT | Current profile (same as `/me`) |
@@ -117,7 +121,12 @@ All under `/api/auth`, all public routes rate-limited (20/min):
 curl -s -X POST http://localhost:8080/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"Haz","password":"cardinal"}'
-# => { "token": "<jwt>", "user": { "id": "haz-001", "username": "Haz", "role": "admin" } }
+# => { "token": "<jwt>", "refreshToken": "<opaque>", "user": { "id": "haz-001", "username": "Haz", "role": "admin" } }
+
+curl -s -X POST http://localhost:8080/api/auth/refresh \
+  -H 'Content-Type: application/json' \
+  -d '{"refreshToken":"<opaque>"}'
+# => { "token": "<new jwt>", "refreshToken": "<new opaque>", "user": { ... } }
 
 curl -s http://localhost:8080/api/users \
   -H "Authorization: Bearer <jwt>"          # admin only → 403 for role "user"
@@ -197,6 +206,8 @@ npm install
 # Configure secrets (required for production)
 cp .env.example .env
 #  - JWT_SECRET:   openssl rand -base64 48
+#  - JWT_EXPIRES:   optional access-token lifetime (default 15m)
+#  - JWT_REFRESH_EXPIRES: optional refresh-token lifetime (default 7d)
 #  - ENCRYPT_SECRET: openssl rand -base64 48
 # The server refuses to boot with the default JWT_SECRET in production.
 

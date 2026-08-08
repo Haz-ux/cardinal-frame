@@ -66,6 +66,43 @@ describe('Skill Hub API', () => {
       expect([400, 500]).toContain(res.status);
     });
 
+    it('should accept the API default type (github) — CHECK constraint regression', async () => {
+      const res = await request(app)
+        .post('/api/skills/hub/sources')
+        .set(adminAuth())
+        .send({
+          name: 'Default Type Source',
+          url: 'https://github.com/example/default-type-repo',
+        });
+      expect([200, 201]).toContain(res.status);
+      expect(res.body.type).toBe('github');
+    });
+
+    it('should accept a url-type source', async () => {
+      const res = await request(app)
+        .post('/api/skills/hub/sources')
+        .set(adminAuth())
+        .send({
+          name: 'URL Source',
+          url: 'https://example.com/skills-index.json',
+          type: 'url',
+        });
+      expect([200, 201]).toContain(res.status);
+    });
+
+    it('should reject an invalid source type', async () => {
+      const res = await request(app)
+        .post('/api/skills/hub/sources')
+        .set(adminAuth())
+        .send({
+          name: 'Bad Type',
+          url: 'https://example.com/x',
+          type: 'ftp',
+        });
+      expect([400, 403]).toContain(res.status);
+      if (res.status === 400) expect(res.body.error).toContain('Invalid source type');
+    });
+
     it('should reject SSRF attempt (AWS metadata)', async () => {
       const res = await request(app)
         .post('/api/skills/hub/sources')

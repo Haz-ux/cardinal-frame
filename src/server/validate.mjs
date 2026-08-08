@@ -92,6 +92,12 @@ export const schemas = {
     token: z.string().min(1),
     password: z.string().min(6).max(200),
   }),
+  refresh: z.object({
+    refreshToken: z.string().min(1),
+  }),
+  logout: z.object({
+    refreshToken: z.string().min(1),
+  }),
 
   // Tasks
   createTask: z.object({
