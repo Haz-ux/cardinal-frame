@@ -7,7 +7,7 @@
 
 ## Context
 
-The comparative analysis against OpenClaw and Hermes Agent identified that Cardinal Frame's skills were "write-once" — no per-execution outcome logging existed. While the `skills` table had aggregate counters (`success_count`, `failure_count`, `invoke_count`, `confidence`), there was no per-invocation log with timestamps, durations, or trace correlation.
+The comparative analysis against other designs identified that Cardinal Frame's skills were "write-once" — no per-execution outcome logging existed. While the `skills` table had aggregate counters (`success_count`, `failure_count`, `invoke_count`, `confidence`), there was no per-invocation log with timestamps, durations, or trace correlation.
 
 The analysis recommended: "log every skill invocation's outcome to the same trace store, and surface a 'this skill has failed N/M times' signal on the dashboard."
 
