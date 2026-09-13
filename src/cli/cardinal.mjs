@@ -1,18 +1,39 @@
 #!/usr/bin/env node
-// Cardinal Frame CLI — manage tasks, agents, DAGs, schedules from terminal
-import { randomUUID } from 'crypto';
+// Cardinal Frame CLI — manage tasks, agents, config, and comms from the terminal
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+// Repo root resolved from this file's location (src/cli/cardinal.mjs),
+// overridable via CF_DIR. Never hardcode a machine-specific path.
+const REPO_ROOT = process.env.CF_DIR || resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const BASE = process.env.CF_API || 'http://localhost:8080/api';
+const API_ROOT = BASE.replace(/\/api\/?$/, '');
 let TOKEN = process.env.CF_TOKEN;
+
+class CliError extends Error {}
 
 async function req(method, path, body) {
  const headers = { 'Content-Type': 'application/json' };
  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
  const opts = { method, headers };
  if (body) opts.body = JSON.stringify(body);
- const res = await fetch(`${BASE}${path}`, opts);
- const data = await res.json();
- if (!res.ok) { console.error(`Error: ${data.error || res.status}`); process.exit(1); }
+ let res;
+ try {
+   res = await fetch(`${BASE}${path}`, opts);
+ } catch (e) {
+   throw new CliError(`Cannot reach ${BASE} — is the server running? (${e.message})`);
+ }
+ const text = await res.text();
+ let data = null;
+ if (text) {
+   try { data = JSON.parse(text); }
+   catch { data = text; } // non-JSON (proxy/HTML error page) — don't crash parsing it
+ }
+ if (!res.ok) {
+   const detail = data && typeof data === 'object' ? (data.error || JSON.stringify(data)) : String(data || '');
+   throw new CliError(`HTTP ${res.status}${detail ? `: ${String(detail).slice(0, 300)}` : ''}`);
+ }
  return data;
 }
 
@@ -29,8 +50,6 @@ function table(items, fields) {
   console.log(fields.map((f, i) => String(item[f] ?? '').slice(0, 40).padEnd(widths[i])).join('  '));
  }
 }
-
-function truncate(s, len = 40) { return s && s.length > len ? s.slice(0, len) + '…' : s; }
 
 // ─── Command handlers ───────────────────────────────────────
 // Each handler receives the remaining argv slice (subcommand/arg already consumed).
@@ -88,6 +107,7 @@ async function token() {
 
 // `cardinal port` — GET /api/settings/dev, print current port (read-only; fixed to 8080 unless PORT env set)
 async function port() {
+  await ensureAuth();
   const data = await req('GET', '/settings/dev');
   console.log(`Current port: ${data.port} (fixed — set PORT env var to change)`);
 }
@@ -263,20 +283,51 @@ async function doctor(args) {
   process.exit(2);
 }
 
-// `cardinal chat <message>` — POST /api/chat
+// `cardinal chat <message>` — POST /api/aimi/chat (SSE stream), print reply deltas
 async function chat(args) {
+  await ensureAuth();
   const message = args.join(' ');
   if (!message) { console.error('Usage: cardinal chat <message>'); process.exit(1); }
-  const data = await req('POST', '/chat', { messages: [{ role: 'user', content: message }] });
-  if (data && typeof data === 'object' && typeof data.response === 'string') {
-    console.log(data.response);
-  } else {
-    pretty(data);
+  const headers = { 'Content-Type': 'application/json' };
+  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
+  let res;
+  try {
+    res = await fetch(`${BASE}/aimi/chat`, { method: 'POST', headers, body: JSON.stringify({ message }) });
+  } catch (e) {
+    throw new CliError(`Cannot reach ${BASE} — is the server running? (${e.message})`);
   }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new CliError(`HTTP ${res.status}${errText ? `: ${errText.slice(0, 300)}` : ''}`);
+  }
+  // Consume the text/event-stream, printing content deltas as they arrive.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '', printed = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        const delta = obj.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta) { process.stdout.write(delta); printed = true; }
+        if (obj.done) { process.stdout.write('\n'); return; }
+      }
+    }
+  }
+  if (printed) process.stdout.write('\n');
 }
 
-const CF_DIR = process.env.CF_DIR || '/home/cardinal-frame';
-const HEALTH_URL = 'http://localhost:8080/api/health';
+const HEALTH_URL = `${API_ROOT}/api/health`;
 const PID_FILE = '/tmp/cardinal.pid';
 const LOG_FILE = process.env.CF_LOG_FILE || '/tmp/cardinal-server.log';
 
@@ -300,14 +351,14 @@ async function run(args) {
   console.log('Starting Cardinal Frame...');
 
   if (await isUp()) {
-    console.log('Server is already running on http://localhost:8080');
+    console.log(`Server is already running on ${API_ROOT}`);
     console.log('Dashboard: http://localhost:5173');
     return;
   }
 
   // Start the server (stable entrypoint — no file watcher)
   const serverProc = spawn('node', ['--max-old-space-size=512', 'src/server/server.mjs'], {
-    cwd: CF_DIR,
+    cwd: REPO_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const serverPid = serverProc.pid;
@@ -341,7 +392,7 @@ async function run(args) {
     process.exit(1);
   }
 
-  console.log('Server is up: http://localhost:8080 (PID ' + serverPid + ')');
+  console.log(`Server is up: ${API_ROOT} (PID ` + serverPid + ')');
 
   // Start client unless disabled
   let clientProc = null;
@@ -350,7 +401,7 @@ async function run(args) {
   if (!args.includes('--no-client') && !args.includes('--server-only')) {
     console.log('Starting dashboard...');
     clientProc = spawn('npm', ['run', 'dev'], {
-      cwd: CF_DIR + '/client',
+      cwd: REPO_ROOT + '/client',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     clientProc.stdout?.on('data', (d) => process.stdout.write(`Client: ${d}`));
@@ -362,7 +413,7 @@ async function run(args) {
     // os.networkInterfaces(), which the proot sandbox blocks), so this tiny raw-TCP
     // proxy makes http://127.0.0.1:5173 and http://localhost:5173 work too.
     forwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
-      cwd: CF_DIR,
+      cwd: REPO_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     forwardProc.stdout?.on('data', (d) => process.stdout.write(`Forward: ${d}`));
@@ -374,7 +425,7 @@ async function run(args) {
     // (Android's loopback handling for post-load fetches has been unreliable).
     if (process.env.CARDINAL_LAN_HOST) {
       lanForwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
-        cwd: CF_DIR,
+        cwd: REPO_ROOT,
         env: { ...process.env, FWD_LISTEN_HOST: process.env.CARDINAL_LAN_HOST },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -401,23 +452,49 @@ async function run(args) {
   await new Promise(() => {});
 }
 
-// `cardinal stop` — stop server + dashboard started by `cardinal run`
+// `cardinal stop` — stop server + dashboard started by `cardinal run`.
+// Only touches processes belonging to THIS repo checkout: the PID file is
+// verified via /proc cmdline, and the pgrep sweep only kills candidates whose
+// working directory or command line is under REPO_ROOT. Never kills another
+// project's server.
 async function stop() {
   const fs = await import('node:fs');
-  const pids = [];
-  try { pids.push(Number(fs.readFileSync(PID_FILE, 'utf8'))); } catch {}
-  // Also sweep for any stray server/dashboard processes
+  const { execSync } = await import('node:child_process');
+  const pids = new Set();
+  const cmdlineOf = (pid) => {
+    try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); } catch { return ''; }
+  };
+  const isOurs = (pid) => {
+    const cl = cmdlineOf(pid);
+    if (!cl) return false;
+    let cwd = '';
+    try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
+    return cwd === REPO_ROOT || cwd === REPO_ROOT + '/client' || cl.includes(REPO_ROOT);
+  };
+
+  // PID file — but verify it's actually our server before trusting it.
+  try {
+    const pidFilePid = Number(fs.readFileSync(PID_FILE, 'utf8'));
+    if (pidFilePid && cmdlineOf(pidFilePid).includes('src/server/server.mjs') && isOurs(pidFilePid)) {
+      pids.add(pidFilePid);
+    }
+  } catch {}
+
+  // Sweep for strays from this repo only.
   for (const pat of ['src/server/server.mjs', 'client/node_modules/.bin/vite', 'client/vite-ipv4-forward.mjs']) {
-    try {
-      const { execSync } = await import('node:child_process');
-      const out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim();
-      for (const pid of out.split('\n')) { if (pid) pids.push(Number(pid)); }
-    } catch {}
+    let out = '';
+    try { out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim(); } catch {}
+    for (const line of out.split('\n')) {
+      const n = Number(line);
+      if (n && n !== process.pid && isOurs(n)) pids.add(n);
+    }
   }
-  if (pids.length === 0) { console.log('Nothing is running.'); return; }
-  for (const pid of new Set(pids)) {
+
+  if (pids.size === 0) { console.log('Nothing is running.'); return; }
+  for (const pid of pids) {
     try { process.kill(pid, 'SIGTERM'); console.log('Stopped PID ' + pid); } catch {}
   }
+  try { fs.unlinkSync(PID_FILE); } catch {}
   console.log('Cardinal Frame stopped.');
 }
 
@@ -438,7 +515,7 @@ Commands:
   tasks:create <title> [aid]   Create a task (POST /api/tasks)
   token                        Login as admin, print JWT (POST /api/auth/login)
   port                         Show current dev port (fixed to 8080; set PORT env var to change)
-  chat <message>               Send a chat message (POST /api/chat)
+  chat <message>               Chat with Aimi (POST /api/aimi/chat, streams the reply)
   telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...
                            Register Telegram webhook, optionally locked to sender id(s)
   run [args]                   Start server + dashboard (--no-client, --server-only)
@@ -456,6 +533,7 @@ Commands:
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
+  CF_DIR    Repo root override (default: resolved from the CLI's own location)
   CF_LOG_FILE  Path to log file (default: /tmp/cardinal-server.log)
 
 Run 'cardinal' (no args) or 'cardinal help' for this message.
@@ -516,7 +594,8 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         process.exit(1);
     }
   } catch (err) {
-    console.error('Fatal:', err.message);
+    if (err instanceof CliError) console.error(`Error: ${err.message}`);
+    else console.error('Fatal:', err.message);
     process.exit(1);
   }
 })();
