@@ -12,7 +12,7 @@ import { usePolling } from './usePolling';
 import {
   Inbox, FlaskConical, CheckCircle2, XCircle, Sparkles,
   Pencil, ArrowLeft, RefreshCw, Loader,
-  Network, GitMerge,
+  Network, GitMerge, Cpu, ShieldCheck, Play, RotateCcw, FileCode2, Hammer,
 } from 'lucide-react';
 
 const TABS = [
@@ -21,6 +21,7 @@ const TABS = [
   { key: 'rejected', label: 'REJECTED' },
   { key: 'promoted', label: 'PROMOTED' },
   { key: 'clusters', label: 'CLUSTERS' },
+  { key: 'compiled', label: 'COMPILED' },
 ];
 
 // Phase 3 — semantic clustering pipeline steps (approved preview content).
@@ -48,6 +49,43 @@ const RISK_STYLE = {
   low:    { label: 'LOW RISK',    color: NEON.green },
   medium: { label: 'MEDIUM RISK', color: NEON.orange },
   high:   { label: 'HIGH RISK',   color: NEON.red },
+};
+
+// ════════════════════════════════════════════════════════════════════
+// PHASE 4 — SKILL COMPILER (Compiled tab)
+// ════════════════════════════════════════════════════════════════════
+// Phase 4 — compiler pipeline steps (approved preview content, static).
+const COMPILER_PIPELINE = [
+  { n: '1 · Spec', d: 'Approved candidate → structured procedural spec (schema-validated, no free prose)' },
+  { n: '2 · Compile', d: 'Compiler picks the form: script, hybrid, prompt template, or memory-only' },
+  { n: '3 · Test gate', d: 'Generated tests run isolated. Fail = back to the drawing board' },
+  { n: '4 · Scan', d: 'Skill-scanner verdict. Blocked = dead end, logged' },
+  { n: '5 · Version', d: 'Immutable v1, disabled. You activate — or roll back' },
+];
+
+// Phase 4 — safety rails (approved preview content, static).
+const COMPILER_SAFETY_RAILS = [
+  { title: 'Disabled by default.', body: 'Every generated version ships disabled. Nothing runs until you explicitly activate it.' },
+  { title: 'High-risk → Docker only.', body: 'If the compiler emits executable code with elevated capabilities, it only ever executes inside a container — never on the host.' },
+  { title: 'Still no live routing.', body: "After Phase 4, Cardinal Frame can produce a tested, reviewable skill — but live requests still don't flow through learned skills. That's Phase 5, and it's your call." },
+];
+
+const VERSION_KIND_STYLE = {
+  prompt_template: { label: 'PROMPT TEMPLATE', color: NEON.cyan },
+  script:          { label: 'SCRIPT',          color: NEON.green },
+  hybrid:          { label: 'HYBRID',          color: NEON.purple },
+  memory:          { label: 'MEMORY',          color: '#8b94a7' },
+};
+
+// Approved-but-inactive renders as DISABLED (amber) per the approved preview.
+const VERSION_STATE_STYLE = {
+  compiled:    { label: 'COMPILED',    color: NEON.cyan },
+  tested:      { label: 'TESTED',      color: NEON.cyan },
+  scanned:     { label: 'SCANNED',     color: NEON.cyan },
+  approved:    { label: 'DISABLED',    color: NEON.yellow },
+  active:      { label: 'ACTIVE',      color: NEON.green },
+  rolled_back: { label: 'ROLLED BACK', color: '#8b94a7' },
+  rejected:    { label: 'REJECTED',    color: NEON.red },
 };
 
 function stateChipLabel(state) {
@@ -120,6 +158,19 @@ export default function LearningInbox() {
   const [openCluster, setOpenCluster] = useState(null);
   const [deciding, setDeciding] = useState(null); // merge proposal id in flight
   const [mergeNotice, setMergeNotice] = useState(null);
+
+  // ── Phase 4: skill compiler ──
+  const [versions, setVersions] = useState([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState(null);
+  const [openVersion, setOpenVersion] = useState(null);
+  const [versionDetails, setVersionDetails] = useState({}); // id -> VersionDetail
+  const [detailFetching, setDetailFetching] = useState(null); // version id fetching detail
+  const [versionActioning, setVersionActioning] = useState(null); // `${id}:${action}` in flight
+  const [versionNotice, setVersionNotice] = useState(null);
+  const [showFullArtifact, setShowFullArtifact] = useState({}); // version id -> bool
+  const [compiling, setCompiling] = useState(false); // candidate→version compile in flight
+  const [compileNotice, setCompileNotice] = useState(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -213,8 +264,111 @@ export default function LearningInbox() {
     }
   };
 
+  // ── Phase 4: skill compiler data ──
+  const refreshVersions = useCallback(async () => {
+    setVersionsLoading(true);
+    try {
+      const data = await cachedFetch('/api/learning/skill-versions');
+      setVersions(Array.isArray(data?.versions) ? data.versions : []);
+      setVersionsError(null);
+    } catch (err) {
+      console.error('LearningInbox versions refresh error:', err);
+      setVersionsError(err.message || 'Failed to load versions');
+    } finally {
+      setVersionsLoading(false);
+    }
+  }, []);
+
+  // Fetch versions when the COMPILED tab is selected.
+  useEffect(() => {
+    if (tab === 'compiled') refreshVersions();
+  }, [tab, refreshVersions]);
+
+  usePolling(refreshVersions, 30000, tab === 'compiled' && openVersion === null && versionActioning === null);
+
+  const toggleVersion = async (id) => {
+    const opening = openVersion !== id;
+    setOpenVersion(opening ? id : null);
+    if (opening && id && !versionDetails[id]) {
+      setDetailFetching(id);
+      try {
+        const data = await cachedFetch(`/api/learning/skill-versions/${id}`);
+        if (data?.version) setVersionDetails(prev => ({ ...prev, [id]: data.version }));
+        else setVersionsError('Version detail not found');
+      } catch (err) {
+        console.error('LearningInbox version detail error:', err);
+        setVersionsError(err.message || 'Failed to load version detail');
+      } finally {
+        setDetailFetching(null);
+      }
+    }
+  };
+
+  const invalidateVersions = () => {
+    invalidateCache('/api/learning/skill-versions');
+    for (const v of versions) invalidateCache(`/api/learning/skill-versions/${v.id}`);
+  };
+
+  const handleVersionAction = async (id, action) => {
+    // action: 'approve' | 'activate' | 'rollback'
+    if (!id || versionActioning) return;
+    setVersionActioning(`${id}:${action}`);
+    setVersionNotice(null);
+    setVersionsError(null);
+    try {
+      const data = await authedFetch(`/api/learning/skill-versions/${id}/${action}`, { method: 'POST' });
+      if (data?.version) {
+        setVersionDetails(prev => (prev[id] ? { ...prev[id], ...data.version } : prev));
+        // Backend returns { version, rolled_back: [ids] } on activation.
+        const superseded = Array.isArray(data.superseded) ? data.superseded
+          : Array.isArray(data.rolled_back) ? data.rolled_back : [];
+        if (action === 'activate' && superseded.length > 0) {
+          const names = superseded.map(s => String(s).slice(0, 8)).join(', ');
+          setVersionNotice(`Activated → now ACTIVE. Superseded: ${names}. Activation and rollback are atomic and audit-logged.`);
+        } else if (action === 'activate') {
+          setVersionNotice('Activated → now ACTIVE. Activation and rollback are atomic and audit-logged.');
+        } else if (action === 'approve') {
+          setVersionNotice('Approved — ships DISABLED until you activate it.');
+        } else if (action === 'rollback') {
+          setVersionNotice('Rolled back. The version stays immutable; it can never be edited, only superseded.');
+        } else {
+          setVersionNotice(`Action "${action}" complete.`);
+        }
+      }
+      invalidateVersions();
+      await refreshVersions();
+    } catch (err) {
+      console.error('LearningInbox version action error:', err);
+      setVersionsError(err.message || `${action} failed`);
+    } finally {
+      setVersionActioning(null);
+    }
+  };
+
+  // Phase 4 — compile a promoted candidate into a versioned skill.
+  const handleCompile = async () => {
+    if (!detail?.candidate?.id || compiling) return;
+    setCompiling(true);
+    setCompileNotice(null);
+    try {
+      const data = await authedFetch(`/api/learning/candidates/${detail.candidate.id}/compile`, { method: 'POST' });
+      const v = data?.version || {};
+      const n = v.version_number != null ? `v${v.version_number}` : 'a new version';
+      setCompileNotice(`Compiled → ${n} · state ${(VERSION_STATE_STYLE[v.state] || {}).label || v.state || '—'}. It ships DISABLED — activate it from the COMPILED tab.`);
+      invalidateVersions();
+      await refreshVersions();
+    } catch (err) {
+      console.error('LearningInbox compile error:', err);
+      setCompileNotice(`⚠ Compile failed: ${err.message || 'unknown error'}`);
+    } finally {
+      setCompiling(false);
+    }
+  };
+
   const invalidateLists = () => {
-    for (const s of TABS) invalidateCache(`/api/learning/candidates?state=${s.key}`);
+    for (const s of ['review', 'testing', 'rejected', 'promoted']) {
+      invalidateCache(`/api/learning/candidates?state=${s}`);
+    }
     invalidateCache('/api/learning/review/jobs');
   };
 
@@ -543,6 +697,333 @@ export default function LearningInbox() {
     );
   };
 
+  // ── Phase 4: version helpers ──
+  const shortHash = (h) => {
+    const s = String(h || '');
+    return s.length > 10 ? `${s.slice(0, 8)}…` : (s || '—');
+  };
+
+  const testCountLabel = (ts) => {
+    if (!ts) return '—';
+    const p = num(ts.passed);
+    return `${p}/${p + num(ts.failed)}`;
+  };
+
+  const scanChipStyle = (sc) => {
+    if (sc?.blocked) return { label: 'BLOCKED', color: NEON.red };
+    if (sc?.verdict === 'safe') return { label: 'SAFE', color: NEON.green };
+    return { label: 'PENDING', color: '#8b94a7' };
+  };
+
+  // Spec field block — the approved preview's .field pattern.
+  const SpecField = ({ label, children }) => (
+    <div className="chamfer-sm p-2.5" style={{ background: BG.surface, border: `1px solid ${NEON.cyan}10` }}>
+      <div className="text-[10px] tracking-widest uppercase font-hud mb-1.5" style={{ color: NEON.cyan }}>
+        {label}
+      </div>
+      <div className="text-[12px]" style={{ color: '#a9c1e8' }}>{children}</div>
+    </div>
+  );
+
+  // ── Phase 4: version card (tap-to-expand) ──
+  const VersionCard = ({ v }) => {
+    const kind = VERSION_KIND_STYLE[v.kind] || { label: String(v.kind || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+    const st = VERSION_STATE_STYLE[v.state] || { label: String(v.state || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+    const sc = scanChipStyle(v.scanner);
+    const open = openVersion === v.id;
+    const d = versionDetails[v.id] || {};
+    const spec = d.spec && typeof d.spec === 'object' ? d.spec : null;
+    const testReport = d.test_report || null;
+    const scannerVerdict = d.scanner_verdict || null;
+    const history = Array.isArray(d.history) ? d.history : [];
+    const artifact = typeof d.artifact === 'string' ? d.artifact : '';
+    const fullArtifact = Boolean(showFullArtifact[v.id]);
+    const ART_TRUNC = 600;
+    const artifactShown = (!fullArtifact && artifact.length > ART_TRUNC)
+      ? `${artifact.slice(0, ART_TRUNC)}…`
+      : artifact;
+    const busy = versionActioning && String(versionActioning).startsWith(`${v.id}:`)
+      ? String(versionActioning).split(':')[1]
+      : null;
+    // Action gating mirrors the backend state machine:
+    // approve: scanned → approved · activate: approved → active · rollback: active|approved → rolled_back.
+    const canApprove = v.state === 'scanned';
+    const canActivate = v.state === 'approved';
+    const canRollback = ['active', 'approved'].includes(v.state);
+    const tests = Array.isArray(testReport?.tests) ? testReport.tests : [];
+    const evidenceCount = Array.isArray(spec?.evidence_event_ids) ? spec.evidence_event_ids.length : 0;
+
+    const actionBtn = (action, label, color, enabled, Icon) => (
+      <button
+        key={action}
+        onClick={() => enabled && handleVersionAction(v.id, action)}
+        disabled={!enabled || busy !== null}
+        className="flex-1 min-w-[100px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all flex items-center justify-center gap-1.5"
+        style={{
+          background: enabled ? `${color}12` : 'transparent',
+          border: `1px solid ${color}`,
+          color,
+          opacity: !enabled || busy !== null ? 0.4 : 1,
+          cursor: !enabled || busy !== null ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {busy === action ? <Loader size={13} className="animate-spin" /> : <Icon size={13} />}
+        {busy === action ? 'Working…' : label}
+      </button>
+    );
+
+    return (
+      <div
+        className="chamfer-sm"
+        style={{ background: BG.surface, border: `1px solid ${NEON.cyan}20` }}
+      >
+        <button
+          onClick={() => toggleVersion(v.id)}
+          className="p-3 flex flex-col gap-2 text-left w-full"
+          style={{ cursor: 'pointer', minHeight: '40px' }}
+        >
+          <span className="text-[15px] font-medium" style={{ color: '#dbe2f1' }}>
+            {v.candidate_title || 'Untitled version'}
+            {v.version_number != null && <span style={{ color: '#555' }}> · v{v.version_number}</span>}
+          </span>
+          <div className="flex gap-1.5 flex-wrap items-center">
+            <Chip color={kind.color}>KIND · {kind.label}</Chip>
+            <Chip color={st.color}>{st.label}</Chip>
+            <Chip color={sc.color}>SCAN · {sc.label}</Chip>
+            {Boolean(v.requires_docker) && <Chip color={NEON.yellow}>DOCKER ONLY</Chip>}
+          </div>
+          <div className="flex gap-3 text-[10px] font-hud flex-wrap" style={{ color: '#555' }}>
+            <span>sha <span style={{ color: '#8b94a7' }}>{shortHash(v.content_hash)}</span></span>
+            <span>tests <span style={{ color: v.test_summary ? NEON.green : '#8b94a7' }}>{testCountLabel(v.test_summary)}</span></span>
+            <span>created <span style={{ color: '#8b94a7' }}>{fmtDate(v.created_at)}</span></span>
+          </div>
+          <span className="text-[10px] font-hud" style={{ color: '#555' }}>
+            Tap to {open ? 'collapse ▲' : 'expand ▾'}
+          </span>
+        </button>
+
+        {open && (
+          <div
+            className="px-3 pb-3 flex flex-col gap-2.5"
+            style={{ borderTop: `1px solid ${NEON.cyan}15`, paddingTop: '12px' }}
+          >
+            {detailFetching === v.id && !spec && !artifact && tests.length === 0 && (
+              <div className="flex items-center gap-2 py-3 text-[12px] font-hud" style={{ color: '#555' }}>
+                <Loader size={14} className="animate-spin" /> Loading version detail…
+              </div>
+            )}
+
+            <p className="text-[11px] font-hud m-0" style={{ color: '#666' }}>
+              Versions are immutable — v{v.version_number ?? '—'} can never be edited, only superseded.
+              Activation and rollback are atomic and audit-logged.
+            </p>
+
+            {/* Compiler rationale */}
+            {v.rationale && (
+              <div
+                className="chamfer-sm p-3 text-[12px]"
+                style={{ background: `${NEON.cyan}04`, border: `1px dashed ${NEON.cyan}60`, color: '#8b94a7' }}
+              >
+                <b style={{ color: NEON.cyan }}>Compiler decision: {kind.label.toLowerCase()}.</b>{' '}
+                {v.rationale}
+              </div>
+            )}
+
+            {/* Procedural spec */}
+            {spec ? (
+              <div className="flex flex-col gap-2">
+                <div className="text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.purple }}>
+                  ◇ Procedural spec
+                </div>
+                {spec.problem_signature && (
+                  <SpecField label="problem_signature">{spec.problem_signature}</SpecField>
+                )}
+                {Array.isArray(spec.preconditions) && spec.preconditions.length > 0 && (
+                  <SpecField label="preconditions">
+                    <ul className="m-0 pl-4 flex flex-col gap-0.5">
+                      {spec.preconditions.map((p, i) => <li key={i}>{p}</li>)}
+                    </ul>
+                  </SpecField>
+                )}
+                {Array.isArray(spec.procedure) && spec.procedure.length > 0 && (
+                  <SpecField label="procedure">
+                    <ol className="m-0 pl-5 flex flex-col gap-1">
+                      {spec.procedure.map((s, i) => (
+                        <li key={i}>
+                          {typeof s === 'string' ? s : (
+                            <>
+                              {s.step != null && <b style={{ color: '#dbe2f1' }}>{s.step}. </b>}
+                              {s.action || ''}
+                              {s.why && <span style={{ color: '#666' }}> — <i>why: {s.why}</i></span>}
+                            </>
+                          )}
+                        </li>
+                      ))}
+                    </ol>
+                  </SpecField>
+                )}
+                {Array.isArray(spec.verification) && spec.verification.length > 0 && (
+                  <SpecField label="verification">
+                    <ul className="m-0 pl-4 flex flex-col gap-0.5">
+                      {spec.verification.map((t, i) => <li key={i}><span style={{ color: NEON.green }}>✓</span> {t}</li>)}
+                    </ul>
+                  </SpecField>
+                )}
+                {Array.isArray(spec.failure_modes) && spec.failure_modes.length > 0 && (
+                  <SpecField label="failure_modes">
+                    <ul className="m-0 pl-4 flex flex-col gap-0.5">
+                      {spec.failure_modes.map((f, i) => (
+                        <li key={i}>
+                          {typeof f === 'string' ? f : (
+                            <><span style={{ color: '#dbe2f1' }}>{f.symptom}</span> <span style={{ color: '#666' }}>→</span> {f.recovery}</>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </SpecField>
+                )}
+                {Array.isArray(spec.do_not_use_when) && spec.do_not_use_when.length > 0 && (
+                  <SpecField label="do_not_use_when">
+                    <ul className="m-0 pl-4 flex flex-col gap-0.5">
+                      {spec.do_not_use_when.map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                  </SpecField>
+                )}
+                <SpecField label="evidence">
+                  {evidenceCount} event{evidenceCount === 1 ? '' : 's'} linked
+                  {spec.confidence != null && (
+                    <div className="mt-2"><ConfidenceBar confidence={spec.confidence} /></div>
+                  )}
+                </SpecField>
+              </div>
+            ) : (
+              detailFetching !== v.id && (
+                <span className="text-[12px]" style={{ color: '#555' }}>Spec not available for this version.</span>
+              )
+            )}
+
+            {/* Artifact */}
+            {artifact && (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-1.5 text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.cyan }}>
+                  <FileCode2 size={12} /> Artifact
+                </div>
+                <pre
+                  className="chamfer-sm p-3 m-0 text-[11px] font-hud whitespace-pre-wrap break-words overflow-hidden"
+                  style={{ background: BG.card, border: `1px solid ${NEON.cyan}15`, color: '#a9c1e8', maxHeight: fullArtifact ? 'none' : 220 }}
+                >
+                  {artifactShown}
+                </pre>
+                {artifact.length > ART_TRUNC && (
+                  <button
+                    onClick={() => setShowFullArtifact(prev => ({ ...prev, [v.id]: !fullArtifact }))}
+                    className="self-start text-[11px] font-hud"
+                    style={{ color: NEON.cyan, cursor: 'pointer', minHeight: '40px' }}
+                  >
+                    {fullArtifact ? '▲ show less' : `▾ show more (${artifact.length} chars)`}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Test gate */}
+            {(tests.length > 0 || testReport || v.test_summary) && (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-1.5 text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.green }}>
+                  <Hammer size={12} /> Test gate · {testReport ? `${num(testReport.passed)}/${num(testReport.passed) + num(testReport.failed)}` : testCountLabel(v.test_summary)} pass
+                </div>
+                {tests.map((t, i) => {
+                  const pass = t.status === 'pass';
+                  return (
+                    <div key={i} className="flex flex-col gap-0.5">
+                      <div
+                        className="chamfer-sm px-3 py-2.5 flex items-center gap-2.5"
+                        style={{
+                          background: BG.surface,
+                          border: `1px solid ${pass ? `${NEON.green}40` : `${NEON.red}40`}`,
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: 10, height: 10, flexShrink: 0,
+                            background: pass ? NEON.green : NEON.red,
+                            boxShadow: `0 0 8px ${pass ? NEON.green : NEON.red}80`,
+                          }}
+                        />
+                        <span className="flex-1 text-[12px]" style={{ color: '#a9c1e8' }}>{t.name || `test ${i + 1}`}</span>
+                        <span className="text-[10px] font-hud font-bold" style={{ color: pass ? NEON.green : NEON.red }}>
+                          {String(t.status || '—').toUpperCase()}
+                        </span>
+                      </div>
+                      {t.detail && <div className="text-[11px] font-hud pl-7" style={{ color: '#555' }}>{t.detail}</div>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Scanner verdict */}
+            {(scannerVerdict || v.scanner) && (
+              <div
+                className="chamfer-sm p-3"
+                style={{ background: BG.surface, border: `1px solid ${sc.color}40` }}
+              >
+                <div className="flex items-center gap-1.5 text-[10px] tracking-widest uppercase font-hud font-bold mb-1.5" style={{ color: sc.color }}>
+                  <ShieldCheck size={12} /> Scanner verdict · {sc.label}
+                </div>
+                {(() => {
+                  const det = scannerVerdict?.details ?? scannerVerdict?.detail ?? scannerVerdict?.summary;
+                  if (!det) return null;
+                  const text = typeof det === 'string' ? det : JSON.stringify(det, null, 2);
+                  return <p className="text-[12px] m-0 font-hud whitespace-pre-wrap" style={{ color: '#8b94a7' }}>{text}</p>;
+                })()}
+                {scannerVerdict?.verdict && scannerVerdict.verdict !== 'safe' && (
+                  <div className="text-[11px] font-hud mt-1" style={{ color: '#555' }}>
+                    verdict: {String(scannerVerdict.verdict)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* History timeline */}
+            {history.length > 0 && (
+              <div className="flex flex-col gap-1.5">
+                <div className="text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: '#8b94a7' }}>
+                  ◇ Version history
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {history.map((h, i) => (
+                    <div key={i} className="flex items-center gap-2 text-[11px] font-hud">
+                      <span style={{ width: 8, height: 8, background: NEON.cyan, flexShrink: 0 }} />
+                      <span style={{ color: '#a9c1e8' }}>{h.action || '—'}</span>
+                      <span style={{ color: '#555' }}>· {h.actor || '—'}</span>
+                      <span className="ml-auto shrink-0" style={{ color: '#555' }}>{fmtDate(h.created_at)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Admin actions */}
+            <div className="flex flex-col gap-1.5">
+              <div className="text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.yellow }}>
+                ◇ Admin actions
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {actionBtn('approve', 'Approve', NEON.yellow, canApprove, ShieldCheck)}
+                {actionBtn('activate', 'Activate', NEON.green, canActivate, Play)}
+                {actionBtn('rollback', 'Rollback', NEON.red, canRollback, RotateCcw)}
+              </div>
+              <p className="text-[10px] m-0" style={{ color: '#555' }}>
+                Admin-gated server-side. Approve ships the version DISABLED; activate makes it live; rollback pulls it back.
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const latestJob = jobs[0];
   const budgetUsed = num(latestJob?.budget_used);
   const budgetLimit = num(latestJob?.budget_limit) || 20;
@@ -717,6 +1198,43 @@ export default function LearningInbox() {
             <span className="text-[12px]" style={{ color: '#555' }}>No linked evidence.</span>
           )}
 
+          {/* ── Phase 4: compile a promoted candidate into a versioned skill ── */}
+          {c.state === 'promoted' && (
+            <>
+              <div className="text-[10px] tracking-widest uppercase font-hud font-bold mt-2" style={{ color: NEON.cyan }}>
+                ◇ Skill compiler
+              </div>
+              <button
+                onClick={handleCompile}
+                disabled={compiling}
+                className="w-full py-3 chamfer-sm text-[12px] tracking-wider font-hud uppercase font-bold transition-all flex items-center justify-center gap-2"
+                style={{
+                  background: `${NEON.cyan}10`, border: `1px solid ${NEON.cyan}`, color: NEON.cyan,
+                  opacity: compiling ? 0.5 : 1, cursor: compiling ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {compiling ? <Loader size={14} className="animate-spin" /> : <Cpu size={14} />}
+                {compiling ? 'Compiling — spec → compile → test → scan…' : 'Compile to skill'}
+              </button>
+              {compileNotice && (
+                <div
+                  className="chamfer-sm px-3 py-2.5 text-[12px] font-hud"
+                  style={
+                    compileNotice.startsWith('⚠')
+                      ? { background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }
+                      : { background: `${NEON.green}06`, border: `1px solid ${NEON.green}40`, color: NEON.green }
+                  }
+                >
+                  {compileNotice}
+                </div>
+              )}
+              <p className="text-[11px] m-0" style={{ color: '#555' }}>
+                Runs the full pipeline — spec, compile, isolated test gate, scanner — then stores an immutable
+                version. The version ships disabled; you activate it from the COMPILED tab.
+              </p>
+            </>
+          )}
+
           {/* Rejected note or actions */}
           {c.state === 'rejected' ? (
             <div
@@ -783,7 +1301,7 @@ export default function LearningInbox() {
           <div className="flex gap-2 flex-wrap">
             {TABS.map(t => {
               const active = tab === t.key;
-              const tabCount = t.key === 'clusters' ? clusters.length : (lists[t.key] || []).length;
+              const tabCount = t.key === 'clusters' ? clusters.length : t.key === 'compiled' ? versions.length : (lists[t.key] || []).length;
               return (
                 <button
                   key={t.key}
@@ -973,6 +1491,159 @@ export default function LearningInbox() {
                   </span>
                 </div>
                 {SAFETY_RAILS.map((r) => (
+                  <div
+                    key={r.title}
+                    className="chamfer-sm p-3 text-[12px]"
+                    style={{ background: BG.surface, border: `1px solid ${NEON.yellow}25`, color: '#8b94a7' }}
+                  >
+                    <b style={{ color: NEON.yellow }}>{r.title}</b> {r.body}
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : tab === 'compiled' ? (
+            <>
+              {/* ══ PHASE 4: SKILL COMPILER ══ */}
+              <div className="flex items-start justify-between flex-wrap gap-3">
+                <div>
+                  <h2
+                    className="flex items-center gap-2 text-lg font-bold tracking-wider font-hud"
+                    style={{ color: NEON.cyan, filter: `drop-shadow(0 0 8px ${NEON.cyan}60)` }}
+                  >
+                    ◈ Skill compiler
+                  </h2>
+                  <p className="text-[11px] mt-1" style={{ color: '#555' }}>
+                    Phase 4 — approved candidates become tested, versioned skills
+                  </p>
+                  <div className="flex gap-2 mt-2.5 flex-wrap">
+                    <span
+                      className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                      style={{ background: `${NEON.yellow}10`, color: NEON.yellow, border: `1px solid ${NEON.yellow}40` }}
+                    >
+                      ◉ disabled until you approve
+                    </span>
+                    <span
+                      className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                      style={{ background: `${NEON.cyan}10`, color: NEON.cyan, border: `1px solid ${NEON.cyan}35` }}
+                    >
+                      no live routing yet
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={refreshVersions}
+                  disabled={versionsLoading}
+                  className="flex items-center gap-2 px-4 py-2 chamfer-sm text-[11px] font-bold tracking-wide font-hud uppercase transition-all"
+                  style={{
+                    background: `${NEON.cyan}12`,
+                    border: `1px solid ${NEON.cyan}40`,
+                    color: NEON.cyan,
+                    opacity: versionsLoading ? 0.5 : 1,
+                    cursor: versionsLoading ? 'not-allowed' : 'pointer',
+                    boxShadow: `0 0 12px ${NEON.cyan}20`,
+                    minHeight: '40px',
+                  }}
+                >
+                  {versionsLoading ? <Loader size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                  {versionsLoading ? 'Loading…' : 'Refresh'}
+                </button>
+              </div>
+
+              {versionsError && (
+                <div
+                  className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+                  style={{ background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }}
+                >
+                  ⚠ {versionsError}
+                </div>
+              )}
+
+              {versionNotice && (
+                <div
+                  className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+                  style={{ background: `${NEON.green}06`, border: `1px solid ${NEON.green}40`, color: NEON.green }}
+                >
+                  ✓ {versionNotice}
+                </div>
+              )}
+
+              {/* Pipeline strip (static, approved preview content) */}
+              <div
+                className="chamfer-md overflow-hidden"
+                style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+              >
+                <div
+                  className="px-4 py-3"
+                  style={{ borderBottom: `1px solid ${NEON.cyan}12` }}
+                >
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+                    ◇ Pipeline
+                  </span>
+                </div>
+                <div className="p-3 flex flex-wrap items-stretch gap-1.5">
+                  {COMPILER_PIPELINE.map((s, i) => (
+                    <div key={s.n} className="flex items-stretch gap-1.5 flex-1 min-w-[130px]">
+                      <div
+                        className="chamfer-sm p-2.5 flex-1"
+                        style={{ background: BG.surface, border: `1px solid ${NEON.cyan}15` }}
+                      >
+                        <div className="text-[12px] font-bold font-hud" style={{ color: NEON.cyan }}>{s.n}</div>
+                        <div className="text-[10px] mt-1" style={{ color: '#8b94a7' }}>{s.d}</div>
+                      </div>
+                      {i < COMPILER_PIPELINE.length - 1 && (
+                        <span className="self-center shrink-0" style={{ color: NEON.cyan }}>→</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Version cards */}
+              <div
+                className="chamfer-md overflow-hidden"
+                style={{ background: BG.card, border: `1px solid ${NEON.cyan}20` }}
+              >
+                <div
+                  className="px-4 py-3 flex items-center gap-2"
+                  style={{ borderBottom: `1px solid ${NEON.cyan}12` }}
+                >
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+                    ◇ Immutable versions
+                  </span>
+                  <span
+                    className="ml-auto text-[10px] font-hud px-2 py-0.5"
+                    style={{ background: `${NEON.cyan}12`, color: NEON.cyan }}
+                  >
+                    {versions.length} versions
+                  </span>
+                </div>
+                <div className="p-3 flex flex-col gap-2">
+                  {versionsLoading && versions.length === 0 && (
+                    <div className="flex items-center justify-center py-10 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                      <Loader size={16} className="animate-spin" /> Loading versions…
+                    </div>
+                  )}
+                  {!versionsLoading && versions.length === 0 && (
+                    <div className="text-center py-10 text-[11px] font-hud" style={{ color: '#444' }}>
+                      <Cpu size={20} className="mx-auto mb-2" style={{ color: '#333' }} />
+                      No compiled versions yet — open a promoted candidate and hit “Compile to skill”.
+                    </div>
+                  )}
+                  {versions.map((ver, vi) => <VersionCard key={ver.id || `version-${vi}`} v={ver} />)}
+                </div>
+              </div>
+
+              {/* Safety rails (static, approved preview content) */}
+              <div
+                className="chamfer-md p-4 flex flex-col gap-2"
+                style={{ background: BG.card, border: `1px solid ${NEON.yellow}25` }}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.yellow }}>
+                    ◇ Safety rails
+                  </span>
+                </div>
+                {COMPILER_SAFETY_RAILS.map((r) => (
                   <div
                     key={r.title}
                     className="chamfer-sm p-3 text-[12px]"
