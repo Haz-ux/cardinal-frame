@@ -101,6 +101,21 @@ router.post('/mcp/servers/:id/disconnect', authMiddleware, requireRole('admin'),
   res.json({ id: server.id, status: 'disconnected' });
 });
 
+// Set per-server auto-connect (admin only). Servers flagged auto_connect=1 are
+// connected at boot and kept alive by the MCP manager (Track C).
+router.patch('/mcp/servers/:id/autoconnect', authMiddleware, requireRole('admin'), (req, res) => {
+  const server = stmts.mcp.getById.get(req.params.id);
+  if (!server) return res.status(404).json({ error: 'MCP server not found' });
+  const { auto_connect } = req.body || {};
+  if (typeof auto_connect !== 'boolean') {
+    return res.status(400).json({ error: 'auto_connect must be a boolean' });
+  }
+  db.prepare('UPDATE mcp_servers SET auto_connect = ? WHERE id = ?').run(auto_connect ? 1 : 0, req.params.id);
+  logger.info(`MCP auto_connect ${auto_connect ? 'enabled' : 'disabled'}: ${server.name} (${req.params.id})`);
+  broadcast('mcp:autoconnect', { id: req.params.id, auto_connect });
+  res.json({ id: req.params.id, auto_connect });
+});
+
 // List tools from a specific MCP server — authenticated users only.
 router.get('/mcp/servers/:id/tools', authMiddleware, (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
