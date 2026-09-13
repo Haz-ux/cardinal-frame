@@ -4,8 +4,10 @@
 --
 -- Versions are IMMUTABLE once compiled: there is no edit path. A new
 -- compile produces version_number+1. Exactly one version per candidate
--- may be in state 'active' at a time (enforced in application code with
--- an atomic transaction, since a partial unique index can't express it).
+-- may be in state 'active' at a time: the activate route rolls other
+-- actives back inside its transaction, and migration 032 adds a partial
+-- unique index ON (candidate_id) WHERE state='active' so the database
+-- enforces it too (second process / direct DB write gap closed).
 --
 -- SHADOW MODE: even an 'active' version is DISABLED — nothing executes,
 -- nothing routes live traffic. Approval/activation only flip state

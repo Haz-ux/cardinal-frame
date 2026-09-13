@@ -2,7 +2,7 @@
 // Uses supertest against the real learning router with an in-memory DB.
 // CI runs these; they can't run on the dev box (Node 24 bus-errors on
 // vitest, pre-existing).
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import express from 'express';
 import request from 'supertest';
@@ -28,7 +28,7 @@ function freshDb() {
     '022_learning_events.sql',
     '026_learning_candidates.sql',
     '027_learning_clusters.sql',
-    '028_learning_skill_versions.sql',
+    '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql',
     '029_learning_retrieval.sql',
     '030_learning_curator.sql',
   ]) {
@@ -330,5 +330,29 @@ describe('GET /api/learning/curator/config', () => {
     const res = await request(app).get('/api/learning/curator/config').set(H(U1));
     expect(res.body.config.prune_eligible).toBe(true);
     expect(res.body.config.reviewed_dry_runs).toBe(2);
+  });
+});
+
+describe('LEARNING_CURATOR_ENABLED kill-switch (M8)', () => {
+  afterEach(() => { delete process.env.LEARNING_CURATOR_ENABLED; });
+
+  it('mutation routes return 403 curator_disabled when explicitly false', async () => {
+    process.env.LEARNING_CURATOR_ENABLED = 'false';
+    const run = await request(app).post('/api/learning/curator/run').set(H(U1)).send({ mode: 'dry_run' });
+    expect(run.status).toBe(403);
+    expect(run.body.error).toBe('curator_disabled');
+    const approve = await request(app).post('/api/learning/curator/recommendations/x/approve').set(H(U1));
+    expect(approve.status).toBe(403);
+    expect(approve.body.error).toBe('curator_disabled');
+    const flags = await request(app).get('/api/learning/retrieval/flags').set(H(U1));
+    expect(flags.body.flags.curator).toBe(false);
+  });
+
+  it('curator routes work when the flag is unset (default enabled)', async () => {
+    delete process.env.LEARNING_CURATOR_ENABLED;
+    const res = await request(app).post('/api/learning/curator/run').set(H(U1)).send({ mode: 'dry_run' });
+    expect(res.status).toBe(200);
+    const flags = await request(app).get('/api/learning/retrieval/flags').set(H(U1));
+    expect(flags.body.flags.curator).toBe(true);
   });
 });

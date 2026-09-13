@@ -18,7 +18,7 @@ let db;
 
 function freshDb() {
   const d = new Database(':memory:');
-  for (const f of ['014_learning_events.sql', '022_learning_events.sql', '026_learning_candidates.sql', '028_learning_skill_versions.sql']) {
+  for (const f of ['014_learning_events.sql', '022_learning_events.sql', '026_learning_candidates.sql', '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   d.exec('CREATE TABLE skills (id TEXT PRIMARY KEY, name TEXT, enabled INTEGER DEFAULT 1)');

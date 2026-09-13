@@ -26,6 +26,9 @@ afterEach(async () => {
 describe('Job Queue', () => {
   it('should enqueue a job and persist to SQLite', () => {
     queue = createJobQueue(db, { maxRetries: 2 });
+    // NOTE: 'task' is only an opaque type label here — there is intentionally
+    // no default 'task' handler (M2). The queue is not started, so no handler
+    // lookup happens; this tests storage only.
     const id = queue.enqueue('task', { command: 'echo hello' });
     expect(id).toBeTruthy();
 
@@ -47,7 +50,11 @@ describe('Job Queue', () => {
     expect(next.id).toBe(id2);
   });
 
-  it('should process a task job and mark it completed', async () => {
+  it('should fail task jobs: no default task handler exists (M2)', async () => {
+    // M2 (audit 2026-09-13 v2): the default 'task' handler was deleted. It
+    // executed raw command strings with an explicit /bin/sh and no
+    // sanitization. Only 'dag' jobs are enqueued in production, so the
+    // handler was removed rather than kept as a loaded footgun.
     queue = createJobQueue(db, { concurrency: 1, defaultTimeout: 5000 });
     queue.start();
     const id = queue.enqueue('task', { command: 'echo test123' });
@@ -56,17 +63,17 @@ describe('Job Queue', () => {
     await new Promise(r => setTimeout(r, 3000));
 
     const job = queue.getJob(id);
-    expect(job.status).toBe('completed');
-    const result = JSON.parse(job.result);
-    expect(result.exitCode).toBe(0);
-    expect(result.output).toContain('test123');
+    expect(job.status).not.toBe('completed');
+    expect(job.last_error).toContain('No handler for job type: task');
 
     await queue.stop();
   });
 
   it('should retry failed jobs with exponential backoff', async () => {
     queue = createJobQueue(db, { concurrency: 1, maxRetries: 2, defaultTimeout: 2000, baseDelay: 100 });
-    const id = queue.enqueue('task', { command: 'exit 1' });
+    // Custom registered handler (no built-in 'task' handler since M2).
+    queue.registerHandler('failer', async () => { throw new Error('boom'); });
+    const id = queue.enqueue('failer', {});
 
     queue.start();
     await new Promise(r => setTimeout(r, 3000));
@@ -81,7 +88,8 @@ describe('Job Queue', () => {
 
   it('should move permanently failed jobs to dead status', async () => {
     queue = createJobQueue(db, { concurrency: 1, maxRetries: 1, defaultTimeout: 2000, baseDelay: 100 });
-    const id = queue.enqueue('task', { command: 'exit 1' });
+    queue.registerHandler('failer', async () => { throw new Error('boom'); });
+    const id = queue.enqueue('failer', {});
 
     queue.start();
     await new Promise(r => setTimeout(r, 4000));
@@ -168,7 +176,8 @@ describe('Job Queue', () => {
 
   it('should handle job timeouts', async () => {
     queue = createJobQueue(db, { concurrency: 1, maxRetries: 1, defaultTimeout: 500, baseDelay: 100 });
-    const id = queue.enqueue('task', { command: 'sleep 5' }, { timeoutMs: 500 });
+    queue.registerHandler('sleeper', () => new Promise(r => setTimeout(r, 5000)));
+    const id = queue.enqueue('sleeper', {}, { timeoutMs: 500 });
 
     queue.start();
     await new Promise(r => setTimeout(r, 3000));

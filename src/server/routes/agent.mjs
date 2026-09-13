@@ -1285,7 +1285,7 @@ router.post('/agent/approve', authMiddleware, apiLimiter, async (req, res) => {
 
     // Recover the gated tool call. New pending actions store { tool, args };
     // legacy 'write' drafts stored raw file content.
-    const GATED_TOOLS = ['file_write', 'shell_exec', 'git_op'];
+    const GATED_TOOLS = ['file_write', 'shell_exec', 'git_op', 'gmail_send'];
     let toolName = null;
     let toolArgs = {};
     try {
@@ -1302,6 +1302,10 @@ router.post('/agent/approve', authMiddleware, apiLimiter, async (req, res) => {
       scope: session?.scope || 'sandbox',
       sessionId: session?.id,
       userId: req.user.id,
+      // M5: this call was approved by a human via this endpoint — lets
+      // gated tools (e.g. gmail_send) treat the approval as satisfying
+      // their confirmation gate instead of creating another pending action.
+      humanApproved: true,
     });
     const status = result.error ? 'failed' : 'approved';
     stmts.agentActions.updateResult.run(JSON.stringify(result).slice(0, 5000), status, action_id);

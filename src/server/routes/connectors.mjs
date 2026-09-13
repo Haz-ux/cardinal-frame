@@ -32,7 +32,7 @@ const GOOGLE_SCOPES = {
 };
 
 export default function connectorsRoutes(ctx) {
-  const { db, stmts, logger, audit, authMiddleware, requireRole, apiLimiter, randomUUID } = ctx;
+  const { db, stmts, logger, audit, authMiddleware, requireRole, apiLimiter, randomUUID, broadcast } = ctx;
   const router = express.Router();
 
   // ─── Registry host wiring (once, at factory time) ─────────────────
@@ -123,12 +123,21 @@ export default function connectorsRoutes(ctx) {
   }
 
   // Admin auth that also accepts ?token= for browser-initiated flows
-  // (dashboard opens the authorize URL in a new tab; query token is consumed
-  // server-side and never logged). Falls through to normal authMiddleware.
+  // (dashboard opens the authorize URL in a new tab). The token is consumed
+  // into the Authorization header and then STRIPPED from req.url BEFORE
+  // morgan logs it — morgan's 'tiny' format records req.url on response
+  // finish, so rewriting req.url here keeps the JWT out of access logs.
   function adminAuthBrowser(req, res, next) {
     if (!req.headers.authorization && req.query && req.query.token) {
       req.headers.authorization = `Bearer ${req.query.token}`;
-      delete req.query.token;
+      try {
+        const u = new URL(req.originalUrl || req.url, 'http://localhost');
+        u.searchParams.delete('token');
+        req.url = u.pathname + u.search;
+        req.originalUrl = req.url;
+      } catch {
+        delete req.query.token;
+      }
     }
     authMiddleware(req, res, (err) => {
       if (err) return next(err);
@@ -340,8 +349,7 @@ export default function connectorsRoutes(ctx) {
 
   // ─── Agent tools: every connector action becomes an agent tool ────
   // Tool name = action id (e.g. 'github_list_issues'). The agent's own
-  // identity becomes the audit actor. gmail_send's confirmation gate lives
-  // in the connector handler itself, so the tool cannot bypass it.
+  // identity becomes the audit actor.
   for (const conn of listConnectors()) {
     for (const [actionId, action] of Object.entries(conn.actions || {})) {
       registerAgentTool(
@@ -349,8 +357,56 @@ export default function connectorsRoutes(ctx) {
         `[${conn.name}] ${action.description}`,
         action.parameters || { type: 'object', properties: {} },
         async (args, agentCtx) => {
+          // M5: agent-initiated gmail_send requires out-of-band human
+          // approval. confirmed:true is self-attested by the agent (a
+          // prompt-injected agent passes it), so it is not sufficient —
+          // create a pending approval action and refuse to send until a
+          // human approves via POST /api/agent/approve. The tool returns a
+          // pending_approval response the agent can surface; nothing has
+          // been sent yet. agentCtx.humanApproved is set only by
+          // /agent/approve itself, so the approved re-entry sends.
+          if (actionId === 'gmail_send' && !agentCtx?.humanApproved) {
+            if (args?.confirmed !== true) {
+              // No draft confirmation claimed — fall through to the
+              // handler's refusal so the agent must surface the draft first.
+              return invokeConnectorAction(conn.id, actionId, args || {}, {
+                actor: agentCtx?.userId || agentCtx?.username || 'agent',
+              });
+            }
+            const pendingId = randomUUID();
+            const draft = {
+              to: args.to,
+              subject: args.subject,
+              body: String(args.body || '').slice(0, 4000),
+            };
+            stmts.agentActions.insert.run(
+              pendingId,
+              agentCtx?.sessionId || null,
+              0,
+              'exec',
+              `gmail_send to ${draft.to || '(no recipient)'}`,
+              JSON.stringify({ tool: 'gmail_send', args: { to: draft.to, subject: draft.subject, body: args.body } }),
+              'awaiting approval',
+              'pending'
+            );
+            logger.info(`[connectors] gmail_send held for human approval: ${pendingId} (to ${draft.to})`);
+            broadcast?.('agent:approval_required', {
+              session_id: agentCtx?.sessionId || null,
+              action_id: pendingId,
+              tool: 'gmail_send',
+              args: { to: draft.to, subject: draft.subject },
+              preview: draft,
+            });
+            return {
+              pending_approval: true,
+              action_id: pendingId,
+              draft: { to: draft.to, subject: draft.subject, body: draft.body },
+              message: 'gmail_send requires human approval before sending. A pending approval action was created — a human must approve it via POST /api/agent/approve with this action_id. The email has NOT been sent. Surface this to the user and wait; do not retry the send.',
+            };
+          }
           return invokeConnectorAction(conn.id, actionId, args || {}, {
             actor: agentCtx?.userId || agentCtx?.username || 'agent',
+            humanApproved: !!agentCtx?.humanApproved,
           });
         }
       );

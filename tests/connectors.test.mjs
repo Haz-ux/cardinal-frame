@@ -28,6 +28,20 @@ initSecretStore(tmpDir);
 
 const db = new Database(':memory:');
 db.exec(readFileSync(join(process.cwd(), 'src/server/migrations/023_connectors.sql'), 'utf8'));
+// agent_actions table for the M5 pending-approval path (agent tool wrapper
+// inserts pending gmail_send actions here).
+db.exec(`CREATE TABLE IF NOT EXISTS agent_actions (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  step_index INTEGER DEFAULT 0,
+  action_type TEXT NOT NULL CHECK(action_type IN ('read','write','exec','plan','iterate','response')),
+  target TEXT,
+  content TEXT,
+  result TEXT,
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','running','completed','failed','approved','rejected')),
+  approved_by TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+)`);
 
 const stmts = {
   connectors: {
@@ -43,10 +57,14 @@ const stmts = {
     getByOauthState: db.prepare('SELECT * FROM connectors WHERE oauth_state = ? AND oauth_state IS NOT NULL'),
     clearOauthState: db.prepare("UPDATE connectors SET oauth_state = NULL, updated_at = datetime('now') WHERE connector_id = ?"),
   },
+  agentActions: {
+    insert: db.prepare('INSERT INTO agent_actions (id, session_id, step_index, action_type, target, content, result, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+  },
 };
 
 const auditCalls = [];
 const logs = [];
+const broadcasts = [];
 const fakeCtx = {
   db,
   stmts,
@@ -57,6 +75,7 @@ const fakeCtx = {
   requireRole: (_role) => (_req, _res, next) => next(),
   apiLimiter: (_req, _res, next) => next(),
   randomUUID,
+  broadcast: (ev, data) => broadcasts.push({ ev, data }),
 };
 
 function makeApp() {
@@ -73,8 +92,10 @@ afterAll(() => {
 
 beforeEach(() => {
   db.exec('DELETE FROM connectors');
+  db.exec('DELETE FROM agent_actions');
   auditCalls.length = 0;
   logs.length = 0;
+  broadcasts.length = 0;
 });
 
 // ─── Registry basics ────────────────────────────────────────────────
@@ -291,5 +312,90 @@ describe('connector admin routes', () => {
     const res = await request(app).get('/api/connectors/google/callback?code=abc&state=bogus');
     expect(res.status).toBe(400);
     expect(res.text).toMatch(/Invalid or expired OAuth state/);
+  });
+});
+
+// ─── M5: gmail_send out-of-band human approval (agent tool path) ────
+describe('gmail_send human approval (M5)', () => {
+  async function gmailTool() {
+    makeApp(); // connectorsRoutes() registers the agent tools
+    const { agentTools } = await import('../src/server/routes/agent.mjs');
+    const tool = agentTools.find(t => t.name === 'gmail_send');
+    expect(tool).toBeDefined();
+    return tool;
+  }
+
+  it('agent call without confirmed → handler refusal, no pending action', async () => {
+    const tool = await gmailTool();
+    const out = await tool.execute(
+      { to: 'a@b.com', subject: 'hi', body: 'x' },
+      { sessionId: null, userId: 'user-1' });
+    expect(out.error).toMatch(/Confirmation required/);
+    expect(out.pending_approval).toBeUndefined();
+    const n = db.prepare('SELECT COUNT(*) c FROM agent_actions').get().c;
+    expect(n).toBe(0);
+  });
+
+  it('agent call with confirmed:true → pending approval, nothing sent', async () => {
+    const tool = await gmailTool();
+    const out = await tool.execute(
+      { to: 'a@b.com', subject: 'hi', body: 'x', confirmed: true },
+      { sessionId: null, userId: 'user-1' });
+    expect(out.pending_approval).toBe(true);
+    expect(out.action_id).toBeTruthy();
+    expect(out.sent).toBeUndefined();
+    expect(out.message).toMatch(/NOT been sent/);
+    const row = db.prepare('SELECT * FROM agent_actions WHERE id = ?').get(out.action_id);
+    expect(row).toBeDefined();
+    expect(row.status).toBe('pending');
+    expect(row.result).toBe('awaiting approval');
+    const stored = JSON.parse(row.content);
+    expect(stored.tool).toBe('gmail_send');
+    expect(stored.args.to).toBe('a@b.com');
+    expect(stored.args.confirmed).toBeUndefined(); // human approval replaces self-attestation
+    const bcast = broadcasts.find(b => b.ev === 'agent:approval_required' && b.data.action_id === out.action_id);
+    expect(bcast).toBeDefined();
+    expect(bcast.data.tool).toBe('gmail_send');
+  });
+
+  it('humanApproved re-entry skips the pending gate (no infinite loop)', async () => {
+    const tool = await gmailTool();
+    setConnectorDeps({
+      getState: () => ({ enabled: true, config: {}, secrets: {} }),
+      persistSecrets: () => {},
+      audit: () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    });
+    // What POST /api/agent/approve does after a human approves: re-execute
+    // with humanApproved=true. Must attempt the send (fails here only on
+    // missing OAuth tokens), never create another pending action.
+    const out = await tool.execute(
+      { to: 'a@b.com', subject: 'hi', body: 'x' },
+      { sessionId: null, userId: 'admin-1', humanApproved: true });
+    expect(out.pending_approval).toBeUndefined();
+    expect(out.error).toMatch(/not configured|tokens/i);
+    const n = db.prepare('SELECT COUNT(*) c FROM agent_actions').get().c;
+    expect(n).toBe(0);
+  });
+});
+
+// ─── M11: ?token= stripped before access logging ────────────────────
+describe('google authorize token hygiene (M11)', () => {
+  it('strips the token from req.url so loggers never see it', async () => {
+    const seen = [];
+    const app = express();
+    // Simulates morgan: reads req.url on response finish (after handlers ran).
+    app.use((req, res, next) => { res.on('finish', () => seen.push(req.url)); next(); });
+    app.use(express.json());
+    app.use('/api', connectorsRoutes(fakeCtx));
+    await request(app).post('/api/connectors/gmail/configure')
+      .send({ config: { oauth_client_id: 'cid', oauth_redirect_uri: 'https://x/cb' }, secrets: {} });
+    const res = await request(app).get('/api/connectors/google/authorize?connector=gmail&token=SUPERSECRETJWT');
+    expect(res.status).toBe(302);
+    const logged = seen.find(u => u.includes('authorize'));
+    expect(logged).toBeDefined();
+    expect(logged).not.toContain('SUPERSECRETJWT');
+    expect(logged).not.toContain('token=');
+    expect(logged).toContain('connector=gmail'); // other params preserved
   });
 });

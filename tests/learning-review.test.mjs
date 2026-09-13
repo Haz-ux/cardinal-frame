@@ -22,7 +22,8 @@ let tv = 0;
 
 function freshDb() {
   const d = new Database(':memory:');
-  for (const f of ['014_learning_events.sql', '022_learning_events.sql', '026_learning_candidates.sql']) {
+  for (const f of ['014_learning_events.sql', '022_learning_events.sql', '026_learning_candidates.sql',
+                   '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   return d;
@@ -333,5 +334,47 @@ describe('never throws', () => {
     const job = await runReviewJob({ db });
     expect(job.status).toBe('failed');
     expect(job.error).toMatch(/userId/);
+  });
+});
+
+describe('reject rolls back versions in the same transaction (M6)', () => {
+  function seedVersionRow(vid, userId, candId, state, n) {
+    db.prepare(`INSERT INTO learning_skill_versions
+      (id, user_id, candidate_id, version_number, kind, spec, artifact, content_hash, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'prompt_template', '{}', 'a', 'h', ?, datetime('now'), datetime('now'))`)
+      .run(vid, userId, candId, n, state);
+  }
+  const vstate = (id) => db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get(id).state;
+
+  it("rolls back active/approved versions with a version event, leaves others alone", () => {
+    const u = 'u-rejv';
+    const cid = 'c-rejv';
+    db.prepare(`INSERT INTO learning_candidates
+      (id, user_id, kind, title, draft, risk_tier, state, created_at, updated_at)
+      VALUES (?, ?, 'procedure', 't', '[]', 'low', 'promoted', datetime('now'), datetime('now'))`)
+      .run(cid, u);
+    seedVersionRow('v-a', u, cid, 'active', 1);
+    seedVersionRow('v-p', u, cid, 'approved', 2);
+    seedVersionRow('v-s', u, cid, 'scanned', 3);
+    const c = rejectCandidate(db, cid, u, 'bad idea');
+    expect(c.state).toBe('rejected');
+    expect(vstate('v-a')).toBe('rolled_back');
+    expect(vstate('v-p')).toBe('rolled_back');
+    expect(vstate('v-s')).toBe('scanned');
+    const ev = db.prepare("SELECT action, detail FROM learning_version_events WHERE version_id = 'v-a'").get();
+    expect(ev.action).toBe('rolled_back');
+    expect(JSON.parse(ev.detail).reason).toBe('candidate rejected');
+  });
+
+  it('is atomic: a version-write failure leaves the candidate un-rejected', () => {
+    const u = 'u-rejatom';
+    const cid = 'c-rejatom';
+    db.prepare(`INSERT INTO learning_candidates
+      (id, user_id, kind, title, draft, risk_tier, state, created_at, updated_at)
+      VALUES (?, ?, 'procedure', 't', '[]', 'low', 'candidate', datetime('now'), datetime('now'))`)
+      .run(cid, u);
+    db.exec('DROP TABLE learning_skill_versions'); // force the version rollback to throw
+    expect(() => rejectCandidate(db, cid, u, 'x')).toThrow();
+    expect(getCandidate(db, cid, u).state).toBe('candidate');
   });
 });

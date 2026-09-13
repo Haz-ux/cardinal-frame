@@ -32,11 +32,15 @@
  *   - execSync allowlist: read-only inspection tools only. Interpreters
  *     (node/python/npm) are deliberately excluded — spawning one would hand
  *     skill code an unsandboxed process with full `require`/`process`.
+ *   - execSync rejects shell metacharacters (`$`, backticks, `;|&><`, …) on
+ *     the whole command string before execution: the first-token allowlist
+ *     alone does not stop `echo $(touch /tmp/pwned)` from expanding.
  *   - Blocks rm -rf /, disk writes, kill -9, reverse shells, etc.
  */
 
 import vm from 'node:vm';
 import { execSync as _execSync } from 'node:child_process';
+import { hasShellMetachars } from '../command-safety.mjs';
 
 // ─── execSync allowlist ────────────────────────────────────────────────────
 // Read-only inspection tools only. Deliberately EXCLUDED:
@@ -79,7 +83,16 @@ function createRestrictedExecSync({ allowNetwork = false } = {}) {
   return (cmd, opts = {}) => {
     if (typeof cmd !== 'string') throw new Error('execSync: command must be a string');
 
-    // Check blocklist first
+    // M4: reject shell metacharacters BEFORE anything else. The first-token
+    // allowlist is not sufficient on its own: `echo $(touch /tmp/pwned)` and
+    // backticks expand in the shell even when the binary is allowlisted, so
+    // the whole command is rejected (same posture as sanitizeCommand).
+    if (hasShellMetachars(cmd)) {
+      throw new Error('execSync: shell metacharacters are not allowed');
+    }
+
+    // Then check the pattern blocklist (defense-in-depth for patterns the
+    // metachar filter doesn't cover, e.g. plain `rm -rf /`)
     for (const blocked of EXEC_BLOCKLIST) {
       if (blocked.test(cmd)) {
         throw new Error(`execSync: blocked command pattern matched`);

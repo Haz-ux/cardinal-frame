@@ -26,6 +26,7 @@ import {
   listCandidates,
   approveCandidate,
   rejectCandidate,
+  rollbackCandidateVersions,
   updateCandidateFields,
   getCandidateEvidence,
 } from '../learning/candidates.mjs';
@@ -404,6 +405,11 @@ export default function learningRoutes(ctx) {
         db.prepare('DELETE FROM candidate_evidence WHERE candidate_id = ?').run(loser.id);
         db.prepare(`UPDATE learning_candidates SET state = 'archived', updated_at = ?
           WHERE id = ? AND user_id = ?`).run(now, loser.id, req.user.id);
+        // M6: a merged-away (archived) candidate's active/approved
+        // versions roll back in the SAME transaction — they must not
+        // stay routable under the survivor.
+        rollbackCandidateVersions(db, loser.id, req.user.id, req.user.id,
+          `candidate merged away into ${survivor.id}`);
       }
       db.prepare(`UPDATE learning_candidates
         SET support_verified = support_verified + ?, support_recovered = support_recovered + ?,
@@ -823,10 +829,26 @@ export default function learningRoutes(ctx) {
     res.json({ feedback: result });
   });
 
-  // Phase kill-switches (curator is Phase 6 — flag only).
+  // Phase kill-switches. LEARNING_CURATOR_ENABLED is enforced by
+  // requireCuratorEnabled on the curator mutation routes below.
   router.get('/learning/retrieval/flags', authMiddleware, (req, res) => {
     res.json({ flags: getRetrievalFlags() });
   });
+
+  // M8: LEARNING_CURATOR_ENABLED is a real kill-switch. Only an explicit
+  // 'false' disables the curator mutation routes (403 + curator_disabled);
+  // unset (or anything but a false-y value) defaults to enabled so
+  // existing installs keep working. getRetrievalFlags() reads the env
+  // live on every call, so no restart is needed to flip it.
+  function requireCuratorEnabled(req, res, next) {
+    if (!getRetrievalFlags().curator) {
+      return res.status(403).json({
+        error: 'curator_disabled',
+        detail: 'LEARNING_CURATOR_ENABLED=false — curator is disabled',
+      });
+    }
+    next();
+  }
 
   // ─── Curator + lifecycle (Phase 6) ─────────────────────────────────
   // The curator PROPOSES, Haz disposes. dry_run proposes only; prune
@@ -913,7 +935,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Run the curator. Prune mode requires >= 2 reviewed dry runs.
-  router.post('/learning/curator/run', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  router.post('/learning/curator/run', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, async (req, res) => {
     const targetUser = resolveTargetUser(req);
     const mode = req.body?.mode === 'prune' ? 'prune' : 'dry_run';
     if (mode === 'prune' && !pruneEligible(db, targetUser)) {
@@ -950,7 +972,7 @@ export default function learningRoutes(ctx) {
 
   // Approve a proposed recommendation: applies the lifecycle flag
   // (stale/archive/quarantine) or stages the merge path. Never deletes.
-  router.post('/learning/curator/recommendations/:id/approve', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/curator/recommendations/:id/approve', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const rec = getRecommendation(db, req.params.id, targetUser);
     if (!rec) return res.status(404).json({ error: 'not found' });
@@ -967,7 +989,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Dismiss a proposed recommendation.
-  router.post('/learning/curator/recommendations/:id/dismiss', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/curator/recommendations/:id/dismiss', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const rec = getRecommendation(db, req.params.id, targetUser);
     if (!rec) return res.status(404).json({ error: 'not found' });
@@ -981,7 +1003,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Mark a curator run reviewed (counts toward prune eligibility).
-  router.post('/learning/curator/runs/:id/review', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/curator/runs/:id/review', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const run = db.prepare('SELECT * FROM learning_curator_runs WHERE id = ? AND user_id = ?')
       .get(req.params.id, targetUser);
@@ -994,7 +1016,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Pin (protect from curation) or unpin a version.
-  router.post('/learning/skill-versions/:id/pin', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/skill-versions/:id/pin', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const row = getOwnedVersion(req.params.id, targetUser);
     if (!row) return res.status(404).json({ error: 'not found' });
@@ -1010,7 +1032,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Restore a version: clears stale/archived/quarantined flags.
-  router.post('/learning/skill-versions/:id/restore', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/skill-versions/:id/restore', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const row = getOwnedVersion(req.params.id, targetUser);
     if (!row) return res.status(404).json({ error: 'not found' });

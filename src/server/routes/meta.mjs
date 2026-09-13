@@ -8,6 +8,55 @@ import { sanitizeCommand } from '../command-safety.mjs';
  * Meta routes: MCP, Groups, Schedules, Plugins, Audit Log
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID
  */
+
+// ─── MCP stdio config validation (M3) ─────────────────────────────
+// Registration is equivalent to code execution: the manager spawns
+// `command` as a child process on connect (and on boot for auto_connect
+// servers). Configs are therefore validated at write time, BEFORE
+// persistence, in the registration route below:
+//  - `command` must be a PATH basename in the allowlist below, or an
+//    absolute path inside a known bin dir whose basename is allowlisted.
+//    Absolute paths elsewhere (and anything like /bin/bash) are rejected.
+//  - `args` must be an array of strings.
+//  - `http` transport is rejected outright: the manager only speaks stdio,
+//    so accepting it would create dead config surface.
+const MCP_COMMAND_ALLOWLIST = new Set([
+  'node', 'nodejs', 'python3', 'python', 'npx', 'uvx', 'deno', 'bun',
+]);
+const MCP_BINDIRS = new Set(['/bin', '/usr/bin', '/usr/local/bin']);
+
+export function validateMcpServerConfig({ transport, command, args }) {
+  if (transport === 'http') {
+    return 'Transport "http" is not supported — the MCP manager only speaks stdio. Register this server with transport "stdio".';
+  }
+  if (transport && transport !== 'stdio') {
+    return 'Transport must be "stdio"';
+  }
+  if (typeof command !== 'string' || !command.trim()) {
+    return 'Command is required for stdio transport';
+  }
+  const cmd = command.trim();
+  if (cmd.includes('\\')) return 'Command must not contain backslashes';
+  if (cmd.includes('/')) {
+    // Absolute path: must live in a known bin dir AND be an allowlisted binary.
+    if (!cmd.startsWith('/')) return 'Command must be a PATH basename or an absolute path inside a known bin directory';
+    const slash = cmd.lastIndexOf('/');
+    const dir = cmd.slice(0, slash) || '/';
+    const base = cmd.slice(slash + 1);
+    if (!MCP_BINDIRS.has(dir)) {
+      return `Command path must be inside a known bin directory (${[...MCP_BINDIRS].join(', ')})`;
+    }
+    if (!MCP_COMMAND_ALLOWLIST.has(base)) {
+      return `Command "${base}" is not in the MCP command allowlist`;
+    }
+  } else if (!MCP_COMMAND_ALLOWLIST.has(cmd)) {
+    return `Command "${cmd}" is not in the MCP command allowlist`;
+  }
+  if (!Array.isArray(args)) return 'args must be an array of strings';
+  if (args.some(a => typeof a !== 'string')) return 'args must be an array of strings';
+  return null;
+}
+
 export default function metaRoutes(ctx) {
   const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID, mcp } = ctx;
   const router = express.Router();
@@ -18,15 +67,10 @@ export default function metaRoutes(ctx) {
 router.post('/mcp/servers', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const { name, transport, command, args, url } = req.body;
   if (!name) return res.status(400).json({ error: 'Name is required' });
-  if (!transport || !['stdio', 'http'].includes(transport)) {
-    return res.status(400).json({ error: 'Transport must be "stdio" or "http"' });
-  }
-  if (transport === 'stdio' && !command) {
-    return res.status(400).json({ error: 'Command is required for stdio transport' });
-  }
-  if (transport === 'http' && !url) {
-    return res.status(400).json({ error: 'URL is required for http transport' });
-  }
+  if (!transport) return res.status(400).json({ error: 'Transport is required ("stdio")' });
+  // M3: validate command/args/transport at write time, before persistence.
+  const configError = validateMcpServerConfig({ transport, command, args: args || [] });
+  if (configError) return res.status(400).json({ error: configError });
 
   const id = randomUUID();
   const argsJson = JSON.stringify(args || []);
@@ -127,8 +171,10 @@ router.get('/mcp/servers/:id/tools', authMiddleware, (req, res) => {
   res.json({ serverId: req.params.id, connected: mcp.isConnected(req.params.id), tools });
 });
 
-// Invoke a tool on an MCP server
-router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, apiLimiter, async (req, res) => {
+// Invoke a tool on an MCP server — ADMIN ONLY. Registration is admin-gated
+// but the servers may run with admin credentials, so non-admin users must
+// not invoke tools on them (M12).
+router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
   if (!mcp.isConnected(req.params.id)) {
@@ -140,9 +186,11 @@ router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, apiLimite
     const result = await mcp.invokeTool(req.params.id, req.params.toolName, toolArgs || {});
     const now = new Date().toISOString();
     stmts.mcp.updateStatus.run('connected', server.connected_at, now, server.id);
+    audit('mcp.tool.invoke', 'mcp_server', req.params.id, req.user?.id, { tool: req.params.toolName, outcome: 'ok' });
     logger.info(`MCP tool invoked: ${req.params.toolName} on ${server.name}`);
     res.json({ serverId: req.params.id, tool: req.params.toolName, result });
   } catch (err) {
+    audit('mcp.tool.invoke', 'mcp_server', req.params.id, req.user?.id, { tool: req.params.toolName, outcome: 'error' });
     logger.error(`MCP tool invocation failed: ${req.params.toolName} on ${server.name}: ${err.message}`);
     res.status(500).json({ error: `Tool invocation failed: ${err.message}` });
   }

@@ -13,10 +13,13 @@
  *     (`$.nodes.<id>`, `$.up[]`, `$.data`) and `{{nodes.<id>.output}}` mustache
  *     substitution in string fields before execution.
  *  3. `sanitizeCommand` (allowlist) is enforced on EVERY shell path — the old
- *     queue handler ran `node.command` with no check at all.
+ *     queue handler ran `node.command` with no check at all. Task nodes run
+ *     via shell-free `spawnArgv` (no `/bin/sh`), and the sanitizer's args
+ *     are passed through (never dropped).
  *
  * Security invariants:
- *  - `task` nodes run only through the allowlist `sanitizeCommand`; anything
+ *  - `task` nodes run only through the allowlist `sanitizeCommand`, executed
+ *    shell-free via `spawnArgv` (shell:false, args passed as argv); anything
  *    else is recorded as failed, never executed.
  *  - `transform` / `condition` / `branch` expressions run in node:vm with a
  *    sterilized, null-prototype `$` context only — no require, no process,
@@ -30,11 +33,9 @@
  *  - statuses: 'success' | 'failed' | 'skipped'
  */
 
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import vm from 'node:vm';
+import { spawnArgv } from './command-safety.mjs';
 
-const execAsync = promisify(exec);
 const EXPR_TIMEOUT_MS = 5000;
 const MAX_DELAY_S = 300;
 
@@ -196,10 +197,10 @@ export async function runNode(node, nodeCtx) {
         : { safe: false, error: 'no sanitizer configured' };
       if (!check.safe) return done({ status: 'failed', error: check.error });
       try {
-        const { stdout } = await execAsync(check.command, {
+        // shell:false argv execution via the shared helper (M1 fix): args are
+        // passed through, never dropped, and no shell ever interprets the string.
+        const stdout = await spawnArgv(check.command, check.args, {
           timeout: nodeCtx.timeoutMs || 30000,
-          shell: '/bin/sh',
-          env: { PATH: process.env.PATH },
           cwd: '/tmp',
         });
         return done({ status: 'success', exitCode: 0, output: stdout.trim().slice(0, 2000) });

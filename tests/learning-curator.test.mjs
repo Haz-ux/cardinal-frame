@@ -41,7 +41,7 @@ function freshDb() {
     '022_learning_events.sql',
     '026_learning_candidates.sql',
     '027_learning_clusters.sql',
-    '028_learning_skill_versions.sql',
+    '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql',
     '029_learning_retrieval.sql',
     '030_learning_curator.sql',
   ]) {

@@ -18,12 +18,23 @@ export const ALLOWED_COMMANDS = [
   'uniq', 'curl', 'wget', 'python3', 'node', 'bash',
 ];
 
+// Shell metacharacters rejected across EVERY execution path. All execution
+// is shell-free, so `;`, `|`, `$()`, backticks, etc. can only be injection
+// attempts. Unicode line separators are included: some shells/PATH tools
+// treat them as terminators.
+export const SHELL_METACHAR_RE = /[;&|><$`\\!{}()\[\]*?~#\n\r\u2028\u2029]/;
+
+/** True if the string contains any shell metacharacter (rejection helper). */
+export function hasShellMetachars(cmd) {
+  return SHELL_METACHAR_RE.test(String(cmd || ''));
+}
+
 export function sanitizeCommand(cmd) {
   const trimmed = String(cmd || '').trim();
   if (!trimmed) return { safe: false, error: 'Empty command' };
   // Shell metacharacters are never allowed: execution is shell-free, so
   // `;`, `|`, `$()`, backticks, etc. can only be injection attempts.
-  if (/[;&|><$`\\!{}()\[\]*?~#\n\r]/.test(trimmed)) {
+  if (hasShellMetachars(trimmed)) {
     return { safe: false, error: 'Shell metacharacters are not allowed; use a single simple command' };
   }
   const parts = trimmed.split(/\s+/);

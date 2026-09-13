@@ -27,7 +27,8 @@ let db;
 function freshDb() {
   const d = new Database(':memory:');
   for (const f of ['014_learning_events.sql', '022_learning_events.sql',
-                   '026_learning_candidates.sql', '027_learning_clusters.sql']) {
+                   '026_learning_candidates.sql', '027_learning_clusters.sql',
+                   '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   return d;
@@ -287,5 +288,42 @@ describe('POST /api/learning/cluster/backfill-legacy', () => {
     // Idempotent: second call imports nothing
     const again = await request(app).post('/api/learning/cluster/backfill-legacy').set(hdr);
     expect(again.body.result.imported).toBe(0);
+  });
+});
+
+describe('merge approve rolls back loser versions (M6)', () => {
+  function seedVersionRow(vid, userId, candId, state, n) {
+    db.prepare(`INSERT INTO learning_skill_versions
+      (id, user_id, candidate_id, version_number, kind, spec, artifact, content_hash, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'prompt_template', '{}', 'a', 'h', ?, datetime('now'), datetime('now'))`)
+      .run(vid, userId, candId, n, state);
+  }
+  const vstate = (id) => db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get(id).state;
+
+  it('loser active/approved versions roll back in the merge transaction with events', async () => {
+    const { app } = makeCtx();
+    const c1 = seedCandidate(U, { id: 'c1', title: 'Deploy health check',
+      draft: ['ping the staging health endpoint'], score: 0.9 });
+    const c2 = seedCandidate(U, { id: 'c2', title: 'Staging health monitor',
+      draft: ['check the staging health endpoint'], score: 0.8 });
+    const e1 = seedEvent(U);
+    const e2 = seedEvent(U);
+    seedEvidence(c1, e1);
+    seedEvidence(c2, e2);
+    seedVersionRow('v-loser', U, c2, 'active', 1);
+    seedVersionRow('v-survivor', U, c1, 'active', 1);
+
+    const run = await request(app).post('/api/learning/cluster/run').set(hdr).send({ threshold: 0.4 });
+    expect(run.body.stats.proposals_created).toBe(1);
+    const props = await request(app).get('/api/learning/merge-proposals').set(hdr);
+    const pid = props.body.proposals[0].id;
+
+    const res = await request(app).post(`/api/learning/merge-proposals/${pid}/approve`).set(hdr);
+    expect(res.status).toBe(200);
+    expect(vstate('v-loser')).toBe('rolled_back');
+    expect(vstate('v-survivor')).toBe('active');
+    const ev = db.prepare("SELECT action, detail FROM learning_version_events WHERE version_id = 'v-loser'").get();
+    expect(ev.action).toBe('rolled_back');
+    expect(JSON.parse(ev.detail).reason).toContain('merged away');
   });
 });

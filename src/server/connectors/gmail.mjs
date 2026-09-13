@@ -155,7 +155,7 @@ registerConnector({
     },
 
     gmail_send: {
-      description: 'Send an email via Gmail. REQUIRES confirmed=true — the caller must show the draft to the user and get explicit confirmation first. Never send silently.',
+      description: 'Send an email via Gmail. From the agent tool path: call with confirmed=true after showing the draft to the user; the send is held for HUMAN approval (you will get a pending_approval response with an action_id — surface it and wait, do NOT retry). Direct API callers: confirmed=true is required and sufficient.',
       parameters: {
         type: 'object',
         properties: {
@@ -168,8 +168,13 @@ registerConnector({
       },
       handler: async (state) => {
         const { args } = state;
-        // Two-step confirmation gate: refuse unless explicitly confirmed.
-        if (args.confirmed !== true) {
+        // M5: the confirmation gate. confirmed:true is self-attested by the
+        // caller, so for agent-initiated sends it is NOT sufficient on its
+        // own — the agent tool wrapper (routes/connectors.mjs) holds those
+        // for human approval via POST /api/agent/approve, which re-enters
+        // here with state.humanApproved=true. Direct (non-agent) callers
+        // keep the confirmed:true gate so existing integrations don't break.
+        if (args.confirmed !== true && !state.humanApproved) {
           return {
             error: 'Confirmation required: gmail_send refused. Show the draft (to, subject, body) to the user and re-invoke with confirmed=true only after they explicitly approve.',
           };

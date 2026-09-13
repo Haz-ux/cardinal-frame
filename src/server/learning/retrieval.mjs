@@ -37,11 +37,6 @@ import { isDockerAvailable } from '../routes/docker-backend.mjs';
 
 // ─── Config (env-overridable) ─────────────────────────────────────────
 
-function envNum(name, def) {
-  const v = Number.parseFloat(process.env[name]);
-  return Number.isFinite(v) ? v : def;
-}
-
 function envBool(name, def) {
   const raw = process.env[name];
   if (raw === undefined) return def;
@@ -49,28 +44,52 @@ function envBool(name, def) {
   return !['0', 'false', 'no', 'off', ''].includes(v);
 }
 
+/**
+ * M7 — read an env override clamped to [0, 1]. Out-of-range (or
+ * non-numeric) values warn and fall back to the default — same pattern
+ * as cluster.mjs:readThreshold. zeroAllowed=false also rejects 0 (used
+ * for the route floor, where 0 would silently disable the safety check).
+ */
+function envClamped(name, def, { zeroAllowed = true } = {}) {
+  const raw = Number.parseFloat(process.env[name]);
+  const outOfRange = !Number.isFinite(raw) || raw < 0 || raw > 1 || (!zeroAllowed && raw === 0);
+  if (outOfRange) {
+    if (Number.isFinite(raw)) {
+      console.warn(`[learning-retrieval] ${name}=${raw} out of range — clamped to default ${def}`);
+    }
+    return def;
+  }
+  return raw;
+}
+
 /** Blend weights for routeScore(). Env: LEARNING_WEIGHT_<NAME>. */
 export const ROUTE_WEIGHTS = {
-  semantic: envNum('LEARNING_WEIGHT_SEMANTIC', 0.50),
-  trigger: envNum('LEARNING_WEIGHT_TRIGGER', 0.20),
-  successRate: envNum('LEARNING_WEIGHT_SUCCESS_RATE', 0.15),
-  recency: envNum('LEARNING_WEIGHT_RECENCY', 0.10),
-  affinity: envNum('LEARNING_WEIGHT_AFFINITY', 0.05),
+  semantic: envClamped('LEARNING_WEIGHT_SEMANTIC', 0.50),
+  trigger: envClamped('LEARNING_WEIGHT_TRIGGER', 0.20),
+  successRate: envClamped('LEARNING_WEIGHT_SUCCESS_RATE', 0.15),
+  recency: envClamped('LEARNING_WEIGHT_RECENCY', 0.10),
+  affinity: envClamped('LEARNING_WEIGHT_AFFINITY', 0.05),
 };
 
 /** Minimum score for a shadow route. Env: LEARNING_ROUTE_FLOOR (0.70). */
-export const ROUTE_FLOOR = envNum('LEARNING_ROUTE_FLOOR', 0.70);
+export const ROUTE_FLOOR = envClamped('LEARNING_ROUTE_FLOOR', 0.70, { zeroAllowed: false });
 
 /** Minimum winner-minus-runner-up gap. Env: LEARNING_ROUTE_MARGIN (0.05). */
-export const ROUTE_MARGIN = envNum('LEARNING_ROUTE_MARGIN', 0.05);
+export const ROUTE_MARGIN = envClamped('LEARNING_ROUTE_MARGIN', 0.05);
 
-/** Phase kill-switches. Curator is Phase 6 — flag only, not wired. */
+/**
+ * Phase kill-switches. All are read live from the environment on every
+ * call, so tests and operators can flip them without a restart.
+ */
 export function getRetrievalFlags() {
   return {
     capture: envBool('LEARNING_CAPTURE_ENABLED', true),
     review: envBool('LEARNING_REVIEW_ENABLED', true),
     retrieval: envBool('LEARNING_RETRIEVAL_ENABLED', true),
-    curator: envBool('LEARNING_CURATOR_ENABLED', false),
+    // M8: defaults to enabled — that matches the effective behavior before
+    // this flag was wired into the curator routes. Only an explicit
+    // 'false' disables them (see requireCuratorEnabled in routes/learning.mjs).
+    curator: envBool('LEARNING_CURATOR_ENABLED', true),
   };
 }
 
@@ -151,10 +170,11 @@ export function routeScore({ similarity, triggerMatch, successRate: sr, recency,
 
 /**
  * Exclude versions that must not be routable. Input rows are
- * learning_skill_versions rows joined with the candidate's risk_tier
- * (and candidate title). Phase 6 curator flags (stale/archived/
- * quarantined) also exclude a version from routing. Never throws: a
- * version that fails filtering itself is excluded with reason
+ * learning_skill_versions rows joined with the candidate's risk_tier,
+ * title, and state (see shadowRoute's loader). Phase 6 curator flags
+ * (stale/archived/quarantined) and dead candidate states
+ * (rejected/archived) also exclude a version from routing. Never throws:
+ * a version that fails filtering itself is excluded with reason
  * 'filter_error'.
  *
  * @returns {{ kept: object[], excluded: Array<{versionId, reason}> }}
@@ -175,6 +195,10 @@ export function hardFilter({ db, userId, versions, logger = null }) {
         // Only Haz-activated versions are routable. State also covers
         // rolled_back / superseded / approved / compiled / tested.
         reason = `inactive_state:${v.state ?? 'null'}`;
+      } else if (v.candidate_state && ['rejected', 'archived'].includes(String(v.candidate_state))) {
+        // M6: versions of rejected/merged-away candidates must never route,
+        // even if a lifecycle transition missed rolling them back.
+        reason = `candidate_${v.candidate_state}`;
       } else if (v.stale === 1 || v.stale === true) {
         // Phase 6 curator: marked stale — out of routing until restored.
         reason = 'curator_stale';
@@ -318,11 +342,20 @@ export async function shadowRoute({ db, userId, requestText, context = {} }) {
       return fail('empty or invalid input');
     }
 
+    // M10: the cheap exclusion filters are pushed into SQL — curator
+    // flags (stale/archived/quarantined) and dead candidate states —
+    // so a JS-side bug or early return in hardFilter can never silently
+    // route a quarantined or orphaned version. hardFilter below stays
+    // as the second defense layer.
     const rows = db.prepare(`
-      SELECT v.*, c.risk_tier, c.title AS candidate_title
+      SELECT v.*, c.risk_tier, c.title AS candidate_title, c.state AS candidate_state
       FROM learning_skill_versions v
       JOIN learning_candidates c ON c.id = v.candidate_id
       WHERE v.user_id = ? AND v.state = 'active'
+        AND COALESCE(v.stale, 0) = 0
+        AND COALESCE(v.archived, 0) = 0
+        AND COALESCE(v.quarantined, 0) = 0
+        AND c.state NOT IN ('rejected', 'archived')
     `).all(userId);
 
     const { kept, excluded } = hardFilter({ db, userId, versions: rows });

@@ -221,17 +221,58 @@ export function approveCandidate(db, id, userId) {
 }
 
 /**
- * Reject: state -> 'rejected' with reason and a 30-day cooldown. Returns
- * the updated candidate or null.
+ * M6 — roll back a candidate's routable versions. Called when a candidate
+ * leaves the live set (rejected, or merged away as a merge loser): every
+ * 'active'/'approved' version flips to 'rolled_back' so it can never be
+ * routed again, with a learning_version_events row recording why.
+ *
+ * This performs no commit of its own — the caller MUST invoke it inside
+ * its transaction so the candidate transition and the version rollbacks
+ * commit atomically. Returns the rolled-back version ids.
+ *
+ * NOTE: the version-event INSERT mirrors compiler.mjs:recordVersionEvent
+ * and is inlined here to avoid a candidates<->compiler import cycle
+ * (compiler.mjs imports getCandidate from this module).
+ */
+export function rollbackCandidateVersions(db, candidateId, userId, actor, reason) {
+  const now = new Date().toISOString();
+  const rows = db.prepare(`SELECT id FROM learning_skill_versions
+    WHERE candidate_id = ? AND user_id = ? AND state IN ('active', 'approved')`)
+    .all(candidateId, userId);
+  const rolledBack = [];
+  const upd = db.prepare(`UPDATE learning_skill_versions
+    SET state = 'rolled_back', updated_at = ? WHERE id = ?`);
+  const evt = db.prepare(`INSERT INTO learning_version_events
+    (id, version_id, action, actor, detail, created_at)
+    VALUES (?, ?, 'rolled_back', ?, ?, ?)`);
+  for (const r of rows) {
+    upd.run(now, r.id);
+    evt.run(randomUUID(), r.id, actor || null,
+      JSON.stringify({ reason, candidate_id: candidateId }), now);
+    rolledBack.push(r.id);
+  }
+  return rolledBack;
+}
+
+/**
+ * Reject: state -> 'rejected' with reason and a 30-day cooldown. Any
+ * 'active'/'approved' versions roll back in the SAME transaction (M6) —
+ * a rejected candidate's versions must not stay routable. Returns the
+ * updated candidate or null.
  */
 export function rejectCandidate(db, id, userId, reason = '') {
   if (!userId) throw new Error('userId is required (ownership)');
   const existing = getCandidate(db, id, userId);
   if (!existing) return null;
   const cooldownUntil = new Date(Date.now() + REJECT_COOLDOWN_MS).toISOString();
-  db.prepare(`UPDATE learning_candidates SET state = 'rejected', reject_reason = ?,
-              cooldown_until = ?, updated_at = ? WHERE id = ? AND user_id = ?`)
-    .run(String(reason || '').slice(0, 500), cooldownUntil, new Date().toISOString(), id, userId);
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE learning_candidates SET state = 'rejected', reject_reason = ?,
+                cooldown_until = ?, updated_at = ? WHERE id = ? AND user_id = ?`)
+      .run(String(reason || '').slice(0, 500), cooldownUntil, now, id, userId);
+    rollbackCandidateVersions(db, id, userId, userId, 'candidate rejected');
+  });
+  tx();
   return getCandidate(db, id, userId);
 }
 

@@ -158,6 +158,10 @@ export async function invokeConnectorAction(connectorId, actionId, args, opts = 
     secrets: state.secrets || {},
     args: args || {},
     actor,
+    // M5: set only when a human approved this call out-of-band (e.g. via
+    // POST /api/agent/approve). Lets write-actions like gmail_send accept a
+    // human approval as satisfying their confirmation gate.
+    humanApproved: !!opts.humanApproved,
     // OAuth connectors can persist refreshed tokens through this callback.
     persistSecrets: (secretsObject) => deps.persistSecrets(connectorId, secretsObject),
   };

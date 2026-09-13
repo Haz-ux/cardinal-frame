@@ -15,17 +15,21 @@
  * Usage:
  *   import { createJobQueue } from './job-queue.mjs';
  *   const queue = createJobQueue(db, { concurrency: 5 });
- *   await queue.enqueue({ type: 'dag', dagId: '...', layers: [...] });
+ *   await queue.enqueue('dag', { dagId: '...', nodes: [...], edges: [...] });
  *   queue.start(); // begins processing + resumes incomplete jobs
  *   await queue.stop(); // waits for current jobs, persists state
+ *
+ * NOTE (M2): there is intentionally NO default `task` handler. A previous
+ * revision executed raw command strings with an explicit shell; it was
+ * deleted rather than sanitized because only 'dag' jobs are ever enqueued
+ * (see routes/tasks.mjs). Enqueueing 'task' without registering a handler
+ * fails the job with "No handler for job type: task". If you need a raw
+ * command job, register an explicit handler that routes through
+ * sanitizeCommand + spawnArgv (shell:false) from command-safety.mjs.
  */
 
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { runDag } from './dag-run.mjs';
-
-const execAsync = promisify(exec);
 
 export function createJobQueue(db, opts = {}) {
   const {
@@ -44,7 +48,10 @@ export function createJobQueue(db, opts = {}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,              -- 'dag' | 'chain' | 'task' | 'agent'
+      type TEXT NOT NULL,              -- 'dag' (default handler) | custom types
+                                     -- via registerHandler(). NOTE: there is
+                                     -- NO default 'task' handler (see M2 note
+                                     -- above the handlers registry).
       payload TEXT NOT NULL,           -- JSON: { dagId, layers, sessionId, ... }
       status TEXT NOT NULL DEFAULT 'pending',  -- pending | running | completed | failed | dead
       priority INTEGER DEFAULT 0,      -- higher = first
@@ -209,17 +216,12 @@ export function createJobQueue(db, opts = {}) {
     }
   });
 
-  // Default task handler
-  registerHandler('task', async (job) => {
-    const { command } = JSON.parse(job.payload);
-    const { stdout } = await execAsync(command, {
-      timeout: job.timeout_ms,
-      shell: '/bin/sh',
-      env: { PATH: process.env.PATH },
-      cwd: '/tmp',
-    });
-    return { exitCode: 0, output: stdout.trim().slice(0, 2000) };
-  });
+  // M2: the default `task` handler was deliberately REMOVED (audit 2026-09-13).
+  // It executed raw command strings with an explicit /bin/sh and no
+  // sanitization — a loaded footgun, and unreachable: only 'dag' jobs are
+  // ever enqueued (routes/tasks.mjs is the sole enqueue call site). Do NOT
+  // re-add a raw-string handler; register an explicit handler that routes
+  // through sanitizeCommand + spawnArgv (shell:false) instead.
 
   // ─── Queue logic ──────────────────────────────────────────────────
 
