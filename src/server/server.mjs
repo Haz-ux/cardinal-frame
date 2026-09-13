@@ -2192,6 +2192,7 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
    fireHook('onServerStart', { port: PORT, version: APP_VERSION });
 
    // Start heartbeat daemon
+   const pulseUserId = stmts.users.getByUsername.get('admin')?.id || 'system';
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,
      async (chainId, input) => {
        const chain = stmts.skillChains.getById.get(chainId);
@@ -2213,9 +2214,16 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
        if (!skill) return { ok: false, error: 'Skill not found' };
        return await executeSkill(skill, input, `heartbeat:${Date.now()}`);
      },
-     logger
+     logger,
+     {
+       pulseUserId,
+       personaPrompt: () => buildAimiSystemPrompt(stmts, pulseUserId, db),
+       invokeAgent: async (messages) => (await callAgentLLM(messages)).content,
+     }
    );
    heartbeat.start(parseInt(process.env.HEARTBEAT_INTERVAL || '60') * 1000);
+   const pulseEnabled = (process.env.AGENT_PULSE_ENABLED || 'true').toLowerCase() !== 'false';
+   if (pulseEnabled) heartbeat.startPulse(parseInt(process.env.AGENT_PULSE_INTERVAL || '900') * 1000);
    globalThis._heartbeat = heartbeat;
 
    // Start the Aimi learning loop daemon — promotes recurring patterns into

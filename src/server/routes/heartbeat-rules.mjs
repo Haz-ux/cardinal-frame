@@ -72,6 +72,14 @@ export default function heartbeatRoutes(ctx) {
     }
   });
 
+  router.get('/heartbeat/status', authMiddleware, (_req, res) => {
+    if (globalThis._heartbeat) {
+      res.json(globalThis._heartbeat.status());
+    } else {
+      res.json({ running: false, pulse: { enabled: false, ready: false } });
+    }
+  });
+
   // ─── Skill Match ─────────────────────────────────────────────────
   router.get('/skills/match/:input', authMiddleware, (req, res) => {
     try {

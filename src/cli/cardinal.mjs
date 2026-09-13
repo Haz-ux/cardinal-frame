@@ -491,6 +491,21 @@ async function scheduleDelete(args) {
   console.log(`Deleted rule ${id}`);
 }
 
+// `cardinal heartbeat` — daemon + agent pulse status
+async function heartbeat() {
+  await ensureAuth();
+  const s = await req('GET', '/heartbeat/status');
+  if (!s.running) { console.log('Heartbeat daemon is not running.'); return; }
+  console.log(`Heartbeat: running (tick every ${s.tickIntervalS}s)`);
+  const p = s.pulse || {};
+  if (!p.ready) console.log('Agent pulse: not configured');
+  else if (!p.enabled) console.log('Agent pulse: disabled (set AGENT_PULSE_ENABLED=true to enable)');
+  else {
+    console.log(`Agent pulse: enabled (every ${p.intervalS}s, ${p.runs} run(s))`);
+    console.log(`Last pulse: ${p.lastAt || 'never'}${p.lastAttention ? ` — ATTENTION: ${p.lastSummary}` : ' — quiet'}`);
+  }
+}
+
 // ─── Sessions (chat conversations) ──────────────────────────
 // `cardinal sessions` — list; `sessions:show|delete`
 async function sessions() {
@@ -820,6 +835,7 @@ Commands:
                                Create a heartbeat rule
   schedules:toggle <id>        Enable/disable a rule
   schedules:delete <id>        Delete a rule
+  heartbeat                    Heartbeat daemon + agent pulse status
   sessions                     List chat conversations (GET /api/chat/conversations)
   sessions:show <id>           Read a conversation's messages
   sessions:delete <id>         Delete a conversation
@@ -925,6 +941,9 @@ if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
       case 'schedules:create': await scheduleCreate(process.argv.slice(3)); break;
       case 'schedules:toggle': await scheduleToggle(process.argv.slice(3)); break;
       case 'schedules:delete': await scheduleDelete(process.argv.slice(3)); break;
+      case 'heartbeat':
+        await heartbeat();
+        break;
       case 'sessions':
         if (sub === 'show') await sessionShow(rest);
         else if (sub === 'delete') await sessionDelete(rest);
