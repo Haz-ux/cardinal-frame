@@ -17,6 +17,7 @@ export default function identityRoutes(ctx) {
   const router = express.Router();
 
   // Scaffold status — proves the mount is live without any behavior yet.
+  // TODO(v2): attach authMiddleware when real endpoints land here.
   router.get('/identity/status', (req, res) => {
     res.json({
       scaffold: true,

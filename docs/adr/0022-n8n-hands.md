@@ -1,7 +1,13 @@
 # ADR 0022: n8n as the Hands Layer — Brain vs. Hands
 
 Date: 2026-09-12
-Status: Accepted
+Status: **SUPERSEDED** (2026-09-13)
+
+> Superseded: Cardinal Frame will not depend on n8n. The project builds its
+> own DAG/workflow engine instead of delegating execution to n8n — no n8n
+> runtime dependency, no direct n8n integration. `src/server/integrations/n8n.mjs`
+> is retained only as an inert scaffold until a decision is made to remove it.
+> Do not build on this ADR's direction.
 
 ## Context
 

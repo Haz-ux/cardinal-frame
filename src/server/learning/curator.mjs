@@ -10,7 +10,7 @@
  * appearing on the map.
  *
  * v2 scaffold — contract surface only, no logic yet.
- * Dependencies (planned): learning/events.mjs, skill-safety.mjs
+ * Dependencies (planned): learning/events.mjs, ../skill-safety.mjs
  */
 
 

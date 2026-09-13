@@ -19,7 +19,7 @@ function notImplemented(fn) {
   throw new Error(`[v2-scaffold] ${fn}: ${SCAFFOLD}`);
 }
 
-export const SECRET_PATTERNS = ['api-key', 'bearer-token', 'private-key', 'password-field'];
+export const SECRET_SUBSTRINGS = ['api-key', 'bearer-token', 'private-key', 'password-field'];
 export async function screen(rawInput) {
   notImplemented('screen');
 }

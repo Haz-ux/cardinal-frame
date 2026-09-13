@@ -3,7 +3,7 @@
 -- avatar candidate staging table. Activation (user pick) flips a staged
 -- candidate to active — the machine never re-faces itself unprompted.
 
-CREATE TABLE IF NOT EXISTS identity (
+CREATE TABLE IF NOT EXISTS companion_identity (
   id TEXT PRIMARY KEY CHECK(id = 'singleton'),
   name TEXT NOT NULL DEFAULT 'Cardinal',
   character TEXT NOT NULL DEFAULT '',

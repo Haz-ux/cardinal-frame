@@ -22,6 +22,8 @@ function notImplemented(fn) {
 }
 
 export const PERSONAS = ['companion', 'ikaris', 'aries', 'minerva'];
+// NOTE(v2): companion/modes.mjs keeps a separate MODES list (aimi/cipher/ghost).
+// Unify on a single cast roster when implementing — do not let these drift.
 export async function castVoice(persona) {
   notImplemented('castVoice');
 }

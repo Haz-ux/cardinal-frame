@@ -20,6 +20,8 @@ function notImplemented(fn) {
 }
 
 export const MODES = ['aimi', 'cipher', 'ghost'];
+// NOTE(v2): identity/voice-cast.mjs keeps a separate PERSONAS list.
+// Unify on a single cast roster when implementing — do not let these drift.
 export async function listModes() {
   notImplemented('listModes');
 }
