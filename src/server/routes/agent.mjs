@@ -70,6 +70,16 @@ function registerAgentTool(name, description, parameters, executeFn) {
   agentTools.push({ name, description, parameters, execute: executeFn });
 }
 
+// Remove a tool from the registry by name. Returns true when a tool was
+// removed, false when no tool with that name was registered. Used by the
+// MCP manager (Track C) to un-surface stale MCP tools on disconnect.
+export function unregisterAgentTool(name) {
+  const idx = agentTools.findIndex(t => t.name === name);
+  if (idx === -1) return false;
+  agentTools.splice(idx, 1);
+  return true;
+}
+
 // OpenAI function-calling format for tool definitions
 function getToolDefinitions() {
   return agentTools.map(t => ({
@@ -1428,4 +1438,4 @@ router.get('/agent/tools', authMiddleware, (_req, res) => {
   return router;
 }
 
-export { callAgentLLM, callAgentLLMWithRetry, agentTools, runAgentLoop };
+export { callAgentLLM, callAgentLLMWithRetry, agentTools, runAgentLoop, registerAgentTool };
