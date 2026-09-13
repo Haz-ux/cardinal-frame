@@ -1,11 +1,28 @@
 import express from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'crypto';
 import { WebSocket } from 'ws';
 
 /**
  * Comms Engine: Telegram + Discord integration.
  * Dependencies (via ctx): db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast
  */
+
+// ── Webhook authentication ────────────────────────────────────────────
+// Both receivers are unauthenticated endpoints by necessity (Telegram/Discord
+// call them, not us). They MUST verify a shared secret instead:
+//   - Telegram: secret_token passed to setWebhook → Telegram echoes it back in
+//     the X-Telegram-Bot-Api-Secret-Token header.
+//   - Discord: this receiver doesn't speak the real interactions protocol
+//     (which would use Ed25519 signatures), so the provisioned
+//     config.webhook_secret must arrive in the X-Webhook-Secret header.
+// Timing-safe comparison — never `===` secrets.
+function webhookSecretsMatch(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 export default function commsRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
@@ -783,9 +800,15 @@ router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'
     if (!baseUrl) return res.status(400).json({ error: 'webhook_url or base_url required' });
     const fullUrl = `${baseUrl.replace(/\/$/, '')}/api/comms/telegram/webhook?channel_id=${channel_id}`;
 
+    // (Re)generate the webhook secret on every registration and hand it to
+    // Telegram via secret_token — Telegram echoes it back in the
+    // X-Telegram-Bot-Api-Secret-Token header, which the receiver verifies.
+    // Without this, anyone on the internet could forge updates.
+    config.webhook_secret = randomBytes(32).toString('hex');
+
     // Delete existing webhook, then set new one
     await telegramApiCall(config.bot_token, 'deleteWebhook', {});
-    const result = await telegramApiCall(config.bot_token, 'setWebhook', { url: fullUrl, allowed_updates: ['message', 'channel_post'] });
+    const result = await telegramApiCall(config.bot_token, 'setWebhook', { url: fullUrl, allowed_updates: ['message', 'channel_post'], secret_token: config.webhook_secret });
 
     // Stop polling if active, switch to webhook mode
     stopChannelPoller(channel_id);
@@ -811,6 +834,7 @@ router.post('/comms/telegram/remove-webhook', authMiddleware, requireRole('admin
     await telegramApiCall(config.bot_token, 'deleteWebhook', {});
     config.webhook_mode = false;
     delete config.webhook_url;
+    delete config.webhook_secret;
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
 
     // Restart polling
@@ -854,6 +878,32 @@ router.post('/comms/discord/setup-commands', authMiddleware, requireRole('admin'
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Provision/rotate the Discord webhook secret (admin only). The receiver
+// rejects any call without the secret in the X-Webhook-Secret header, so
+// configure the sender with the returned values.
+router.post('/comms/discord/setup-webhook', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  try {
+    const { channel_id, base_url } = req.body;
+    if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+    const channel = stmts.commsChannels.getById.get(channel_id);
+    if (!channel || channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
+
+    const config = JSON.parse(channel.config || '{}');
+    config.webhook_secret = randomBytes(32).toString('hex');
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
+
+    const baseUrl = (base_url || '').replace(/\/$/, '');
+    logger.info(`Discord webhook secret provisioned for channel ${channel.name}`);
+    res.json({
+      ok: true,
+      webhook_url: `${baseUrl}/api/comms/discord/webhook?channel_id=${channel_id}`,
+      webhook_secret: config.webhook_secret,
+      header: 'X-Webhook-Secret',
+      note: 'Store the secret where the webhook sender runs. The receiver rejects calls without it.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Telegram webhook receiver (alternative to polling)
 router.post('/comms/telegram/webhook', async (req, res) => {
   try {
@@ -861,6 +911,15 @@ router.post('/comms/telegram/webhook', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channel_id query param required' });
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
+    // Authenticate the caller: only Telegram knows the secret_token we set via
+    // setWebhook. Fail closed — channels registered before the secret existed
+    // must re-run setup-webhook.
+    const authConfig = JSON.parse(channel.config || '{}');
+    if (!webhookSecretsMatch(req.headers['x-telegram-bot-api-secret-token'], authConfig.webhook_secret)) {
+      logger.warn(`Rejected unauthenticated Telegram webhook for channel ${channel.id}`);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     
     const update = req.body;
     const msg = update.message || update.channel_post;
@@ -912,6 +971,17 @@ router.post('/comms/discord/webhook', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channel_id query param required' });
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
+    // Authenticate the caller: the provisioned webhook_secret must arrive in
+    // the X-Webhook-Secret header. NOTE: this endpoint does not speak the
+    // real Discord interactions protocol — if it ever does, verify Ed25519
+    // signatures (X-Signature-Ed25519) against the application public key
+    // instead of / in addition to this shared secret.
+    const authConfig = JSON.parse(channel.config || '{}');
+    if (!webhookSecretsMatch(req.headers['x-webhook-secret'], authConfig.webhook_secret)) {
+      logger.warn(`Rejected unauthenticated Discord webhook for channel ${channel.id}`);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     
     const interaction = req.body;
     if (interaction.type === 1) {
