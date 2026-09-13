@@ -23,6 +23,7 @@
 import { randomUUID } from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { runDag } from './dag-run.mjs';
 
 const execAsync = promisify(exec);
 
@@ -34,6 +35,9 @@ export function createJobQueue(db, opts = {}) {
     baseDelay = 1000,     // 1s, 2s, 4s, 8s...
     maxDelay = 30000,     // cap at 30s
   } = opts;
+  // Allowlist gate for shell steps; provided via opts or setSanitizeCommand().
+  // `let` (not destructured const) so the setter below can replace it.
+  let sanitizeCommand = opts.sanitizeCommand || null;
 
   // ─── Schema ───────────────────────────────────────────────────────
 
@@ -140,12 +144,12 @@ export function createJobQueue(db, opts = {}) {
     handlers.set(type, fn);
   }
 
-  // Default DAG handler
+  // Default DAG handler — runs through the shared executor (src/server/dag-run.mjs)
+  // so node types, data flow, and the sanitizeCommand allowlist apply here too.
   registerHandler('dag', async (job, ctx) => {
     const { payload, id: jobId } = job;
-    const { dagId, layers, nodes } = JSON.parse(payload);
+    const { dagId, nodes, edges } = JSON.parse(payload);
     const { db, broadcast } = ctx;
-    const steps = [];
 
     // Prepared statement to update DAG status in the dags table
     // (wrapped in try — the dags table may not exist in isolated queue tests)
@@ -154,40 +158,46 @@ export function createJobQueue(db, opts = {}) {
       updateDagStatus = db.prepare('UPDATE dags SET status = ?, last_run_result = ? WHERE id = ?');
     } catch {}
 
+    // Per-step records, keyed so onNodeStart/onNodeDone can pair them.
+    const stepIds = new Map();
+    let stepCounter = 0;
+
     try {
-      for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-        const layer = layers[layerIdx];
-        const layerResults = await Promise.all(layer.map(async (nodeId, nodeIdx) => {
-          const node = nodes.find(n => n.id === nodeId);
-          if (!node || !node.command) return { nodeId, status: 'skipped' };
+      const { layers, layerResults, finalOutput } = await runDag({
+        nodes,
+        edges: edges || [], // tolerate jobs enqueued before edges were stored
+        sanitizeCommand,
+        broadcast,
+        dagId,
+        timeoutMs: job.timeout_ms,
+        events: {
+          onNodeStart(nodeId) {
+            const stepId = randomUUID();
+            stepIds.set(nodeId, stepId);
+            const node = (nodes || []).find((n) => n.id === nodeId);
+            stmts.insertStep.run(stepId, jobId, stepCounter++, 'node',
+              JSON.stringify({ nodeId, type: node ? node.type || 'task' : 'task', command: node ? node.command : undefined }));
+            stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
+          },
+          onNodeDone(nodeId, result) {
+            const stepId = stepIds.get(nodeId);
+            if (!stepId) return;
+            const ok = result.status === 'success';
+            stmts.updateStep.run(
+              ok ? 'completed' : result.status === 'skipped' ? 'completed' : 'failed',
+              new Date().toISOString(), new Date().toISOString(),
+              JSON.stringify(result), result.error || result.reason || null, stepId
+            );
+          },
+          onLayerDone(layerIdx) {
+            broadcast?.('dag:layer', { id: dagId, layer: layerIdx, completed: true });
+          },
+        },
+      });
 
-          const stepId = randomUUID();
-          stmts.insertStep.run(stepId, jobId, layerIdx * 100 + nodeIdx, 'node', JSON.stringify({ nodeId, command: node.command }));
-          stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
-
-          try {
-            const start = Date.now();
-            const { stdout } = await execAsync(node.command, {
-              timeout: job.timeout_ms,
-              shell: '/bin/sh',
-              env: { PATH: process.env.PATH },
-              cwd: '/tmp',
-            });
-            const durationMs = Date.now() - start;
-            const result = { nodeId, nodeName: node.name, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs };
-            stmts.updateStep.run('completed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), null, stepId);
-            return result;
-          } catch (err) {
-            const result = { nodeId, nodeName: node.name, status: 'failed', exitCode: err.code ?? 1, error: (err.stderr || err.message).slice(0, 500), durationMs: 0 };
-            stmts.updateStep.run('failed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), err.message, stepId);
-            return result;
-          }
-        }));
-        steps.push({ layer: layerIdx, results: layerResults });
-      }
-
+      const steps = layerResults;
       // Update dags table + broadcast dag:status so the UI's WS subscription can react
-      const result = { steps, totalLayers: layers.length, completedAt: new Date().toISOString() };
+      const result = { steps, totalLayers: layers.length, completedAt: new Date().toISOString(), finalOutput };
       try { updateDagStatus.run('completed', JSON.stringify(result), dagId); } catch {} // dags table may not exist in isolated queue tests
       broadcast?.('dag:status', { id: dagId, status: 'completed', steps });
 
@@ -221,6 +231,7 @@ export function createJobQueue(db, opts = {}) {
 
   function setBroadcast(fn) { broadcast = fn; }
   function setLogger(l) { logger = l; }
+  function setSanitizeCommand(fn) { sanitizeCommand = fn; }
 
   function computeBackoff(attempts) {
     const delay = Math.min(baseDelay * Math.pow(2, attempts - 1), maxDelay);
@@ -349,6 +360,7 @@ export function createJobQueue(db, opts = {}) {
     registerHandler,
     setBroadcast,
     setLogger,
+    setSanitizeCommand,
     getStatus,
     getJob,
     getDeadJobs,

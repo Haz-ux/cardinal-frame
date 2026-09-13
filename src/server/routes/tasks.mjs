@@ -1,9 +1,9 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
 import path from 'path';
 import multer from 'multer';
 import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
+import { topoSortLayers, runDag } from '../dag-run.mjs';
 
 /**
  * Task + DAG + File routes
@@ -373,40 +373,8 @@ router.delete('/dags/:id', authMiddleware, (req, res) => {
 });
 
 // ─── DAG Execution with Parallel Fan-Out ───────────────────────────
-function topoSortLayers(nodes, edges) {
-  // Returns array of layers — each layer is an array of node IDs that can run in parallel
-  const inDeg = new Map();
-  const adj = new Map();
-  for (const n of nodes) {
-    inDeg.set(n.id, 0);
-    adj.set(n.id, []);
-  }
-  for (const e of edges) {
-    if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
-    if (!adj.has(e.source) || !adj.has(e.target)) continue;
-    adj.get(e.source).push(e.target);
-    inDeg.set(e.target, (inDeg.get(e.target) || 0) + 1);
-  }
-  const layers = [];
-  let current = [];
-  for (const [id, deg] of inDeg) if (deg === 0) current.push(id);
-
-  while (current.length) {
-    layers.push([...current]);
-    const next = [];
-    for (const cur of current) {
-      for (const nxt of adj.get(cur) || []) {
-        inDeg.set(nxt, inDeg.get(nxt) - 1);
-        if (inDeg.get(nxt) === 0) next.push(nxt);
-      }
-    }
-    current = next;
-  }
-
-  const totalSorted = layers.reduce((s, l) => s + l.length, 0);
-  if (totalSorted !== nodes.length) throw new Error('Cycle detected in DAG');
-  return layers;
-}
+// Node execution lives in the shared module (src/server/dag-run.mjs), used by
+// both the queue's `dag` handler and the in-process fallback below.
 
 router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
   const dag = stmts.dags.getById.get(req.params.id);
@@ -428,59 +396,35 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
         dagName: dag.name,
         layers: layers.map(layer => layer),
         nodes,
+        edges,
       }, { priority: 5, traceId: `dag:${req.params.id}` });
 
       // Listen for completion via broadcast (the queue broadcasts job:completed)
       // The queue handler will update the DAG status and broadcast results
       res.json({ dagId: dag.id, jobId, status: 'running', layers: layers.length, totalNodes: nodes.length });
     } else {
-      // Fallback: in-process execution (for tests / no-queue mode)
-      const steps = [];
-      let currentLayer = 0;
-
-      const runLayer = () => {
-        if (currentLayer >= layers.length) {
-          const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layers.length, completedAt: new Date().toISOString() });
-          stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
-          broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
-          logger.info(`DAG completed: ${dag.name} (${dag.id})`);
-          return;
-        }
-
-        const layer = layers[currentLayer];
-        const layerPromises = layer.map(nodeId => new Promise((resolve) => {
-          const node = nodes.find((n) => n.id === nodeId);
-          if (!node || !node.command) {
-            steps.push({ nodeId, nodeName: node?.name || nodeId, status: 'skipped', durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-            resolve();
-            return;
-          }
-          const check = sanitizeCommand(node.command);
-          if (!check.safe) {
-            steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', error: check.error, durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-            resolve();
-            return;
-          }
-          const start = Date.now();
-          exec(check.command, { timeout: 30000, shell: '/bin/sh', env: { PATH: process.env.PATH }, cwd: '/tmp' }, (error, stdout, stderr) => {
-            const durationMs = Date.now() - start;
-            if (error) {
-              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', exitCode: error.killed ? -1 : (error.code ?? 1), output: (stderr || error.message).slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
-            } else {
-              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
-            }
-            resolve();
-          });
-        }));
-
-        Promise.all(layerPromises).then(() => {
-          broadcast('dag:layer', { id: req.params.id, layer: currentLayer, completed: true });
-          currentLayer++;
-          runLayer();
-        });
-      };
-
-      runLayer();
+      // Fallback: in-process execution (for tests / no-queue mode) via the
+      // shared executor — same node types, data flow, and sanitizer as the queue.
+      runDag({
+        nodes,
+        edges,
+        sanitizeCommand,
+        broadcast,
+        dagId: req.params.id,
+        timeoutMs: 30000,
+        events: {
+          onLayerDone: (layerIdx) => broadcast('dag:layer', { id: req.params.id, layer: layerIdx, completed: true }),
+        },
+      }).then(({ layerResults, finalOutput }) => {
+        const steps = layerResults.flatMap((lr) => lr.results);
+        const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layerResults.length, completedAt: new Date().toISOString(), finalOutput });
+        stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
+        broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
+        logger.info(`DAG completed: ${dag.name} (${dag.id})`);
+      }).catch((runErr) => {
+        stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'failed', JSON.stringify({ error: runErr.message }), req.params.id);
+        broadcast('dag:status', { id: req.params.id, status: 'failed', error: runErr.message });
+      });
       res.json({ dagId: dag.id, status: 'running', layers: layers.length, totalNodes: nodes.length });
     }
   } catch (err) {

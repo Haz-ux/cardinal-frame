@@ -1526,6 +1526,9 @@ const jobQueue = createJobQueue(db, {
 });
 jobQueue.setBroadcast(broadcast);
 jobQueue.setLogger(logger);
+// The queue's `dag` handler shells out for `task` nodes — it must use the
+// same allowlist as the in-process fallback (previously it ran unsanitized).
+jobQueue.setSanitizeCommand(sanitizeCommand);
 
 // Start job queue eagerly (works in both test and production modes).
 // In test mode, server.listen() is skipped but the queue still processes
