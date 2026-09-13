@@ -8,6 +8,7 @@ import { sanitizeFtsQuery } from './memory.mjs';
 import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 import { record as recordLearningEvent } from '../learning/events.mjs';
+import { shadowRoute } from '../learning/retrieval.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -501,6 +502,17 @@ function terminalVersionFor(text, step) {
 async function runAgentLoop(sessionId, options = {}) {
   const session = _deps.stmts.agentSessions.getById.get(sessionId);
   if (!session) throw new Error('Session not found');
+
+  // ─── Phase 5: shadow retrieval routing (never affects the loop) ────
+  // Fire-and-forget: shadowRoute() never throws internally and this call
+  // is not awaited, returns nothing the loop consumes, and cannot change
+  // agent behavior. It only records what skill version WOULD have been
+  // routed for the review UI.
+  try {
+    shadowRoute({ db: _deps.db, userId: session.user_id, requestText: session.task, context: { sessionId } })
+      .then(r => { try { _deps.logger.debug(`shadow route ${r.decisionId ?? 'n/a'}: ${r.decision}`); } catch { /* never throws */ } })
+      .catch(() => { /* fire-and-forget: swallow */ });
+  } catch { /* the call itself must not disturb the loop */ }
 
   const ctx = { scope: session.scope, sessionId, userId: session.user_id };
   const maxSteps = options.maxSteps || MAX_AGENT_STEPS;

@@ -41,6 +41,10 @@ import {
   recordVersionEvent,
   VERSION_STATES,
 } from '../learning/compiler.mjs';
+import {
+  getRetrievalFlags,
+  recordFeedback,
+} from '../learning/retrieval.mjs';
 
 // API state filter → DB state. `review` is the visible untrusted queue
 // (DB state 'candidate').
@@ -660,6 +664,120 @@ export default function learningRoutes(ctx) {
     logger.info(`Learning skill version rolled back: ${row.id} (was ${row.state})`);
     const updated = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(row.id);
     res.json({ version: toVersionListItem(updated, row.candidate_title) });
+  });
+
+  // ─── Routing decisions + stats (Phase 5, shadow mode) ───────────────
+  // Read-only views of what WOULD have been routed. The decision rows are
+  // written by the fire-and-forget hook in runAgentLoop; nothing here
+  // affects live agent behavior.
+
+  // Recent routing decisions, newest first, with winner title/kind.
+  router.get('/learning/routing/decisions', authMiddleware, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit ?? '50', 10) || 50));
+    const rows = db.prepare(`SELECT d.*,
+        v.kind AS winner_kind,
+        c.title AS winner_title
+      FROM learning_routing_decisions d
+      LEFT JOIN learning_skill_versions v ON v.id = d.winner_version_id
+      LEFT JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE d.user_id = ?
+      ORDER BY d.created_at DESC
+      LIMIT ?`).all(targetUser, limit);
+    res.json({
+      decisions: rows.map(d => ({
+        id: d.id,
+        request_excerpt: d.request_excerpt,
+        winner_version_id: d.winner_version_id,
+        winner_title: d.winner_title ?? null,
+        winner_kind: d.winner_kind ?? null,
+        winner_score: d.winner_score,
+        runner_up_score: d.runner_up_score,
+        margin: d.margin,
+        decision: d.decision,
+        fallback_reason: d.fallback_reason,
+        mode: d.mode,
+        created_at: d.created_at,
+      })),
+    });
+  });
+
+  // Per-version route counters + aggregate routing stats.
+  router.get('/learning/routing/stats', authMiddleware, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const versions = db.prepare(`SELECT s.*,
+        v.version_number, v.kind, c.title AS title
+      FROM learning_skill_stats s
+      JOIN learning_skill_versions v ON v.id = s.version_id
+      JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE v.user_id = ?
+      ORDER BY s.routed_count DESC`).all(targetUser);
+    const totalDecisions = db.prepare(
+      'SELECT COUNT(*) AS n FROM learning_routing_decisions WHERE user_id = ?').get(targetUser).n;
+    const fallbacks = db.prepare(
+      "SELECT COUNT(*) AS n FROM learning_routing_decisions WHERE user_id = ? AND decision IN ('fallback_normal','filtered_all')").get(targetUser).n;
+    const avgMargin = db.prepare(
+      'SELECT AVG(margin) AS m FROM learning_routing_decisions WHERE user_id = ? AND decision = ? AND margin IS NOT NULL').get(targetUser, 'shadow_routed').m;
+    res.json({
+      versions: versions.map(v => {
+        const s = v.success_count ?? 0;
+        const f = v.failure_count ?? 0;
+        return {
+          version_id: v.version_id,
+          title: v.title,
+          kind: v.kind,
+          version_number: v.version_number,
+          routed_count: v.routed_count ?? 0,
+          success_count: s,
+          failure_count: f,
+          success_rate: (s + 1) / (s + f + 2),
+          last_routed_at: v.last_routed_at,
+        };
+      }),
+      summary: {
+        total_decisions: totalDecisions,
+        fallback_rate: totalDecisions > 0 ? fallbacks / totalDecisions : 0,
+        avg_margin: avgMargin ?? null,
+      },
+    });
+  });
+
+  // Record route/execution feedback on a decision (audit-logged).
+  // Route ledger → learning_skill_stats counters; execution ledger →
+  // learning_route_feedback rows only. The two ledgers never mix.
+  router.post('/learning/routing/decisions/:id/feedback', authMiddleware, apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const { ledger, positive, detail } = req.body ?? {};
+    if (ledger !== 'route' && ledger !== 'execution') {
+      return res.status(400).json({ error: "ledger must be 'route' or 'execution'" });
+    }
+    if (typeof positive !== 'boolean') {
+      return res.status(400).json({ error: 'positive must be a boolean' });
+    }
+    let result;
+    try {
+      result = recordFeedback({
+        db,
+        userId: targetUser,
+        decisionId: req.params.id,
+        ledger,
+        positive,
+        detail: typeof detail === 'string' ? detail.slice(0, 2000) : null,
+      });
+    } catch (err) {
+      if (err?.message === 'not found') return res.status(404).json({ error: 'not found' });
+      return res.status(400).json({ error: err?.message ?? 'feedback failed' });
+    }
+    audit('learning.routing.feedback', 'learning_routing_decision', req.params.id, req.user.id, {
+      target_user: targetUser, ledger, positive,
+    });
+    logger.info(`Learning routing feedback: ${ledger} ${positive ? 'positive' : 'negative'} on decision ${req.params.id}`);
+    res.json({ feedback: result });
+  });
+
+  // Phase kill-switches (curator is Phase 6 — flag only).
+  router.get('/learning/retrieval/flags', authMiddleware, (req, res) => {
+    res.json({ flags: getRetrievalFlags() });
   });
 
   return router;
