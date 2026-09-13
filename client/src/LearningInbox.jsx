@@ -13,7 +13,7 @@ import {
   Inbox, FlaskConical, CheckCircle2, XCircle, Sparkles,
   Pencil, ArrowLeft, RefreshCw, Loader,
   Network, GitMerge, Cpu, ShieldCheck, Play, RotateCcw, FileCode2, Hammer,
-  Route, Gauge, Power,
+  Route, Gauge, Power, Pin, ArchiveRestore,
 } from 'lucide-react';
 
 const TABS = [
@@ -24,6 +24,7 @@ const TABS = [
   { key: 'clusters', label: 'CLUSTERS' },
   { key: 'compiled', label: 'COMPILED' },
   { key: 'routing', label: 'ROUTING' },
+  { key: 'curator', label: 'CURATOR' },
 ];
 
 // Phase 3 — semantic clustering pipeline steps (approved preview content).
@@ -104,7 +105,7 @@ const KILL_FLAGS = [
   { key: 'capture',   label: 'capture',   desc: 'record learning events',   env: 'LEARNING_CAPTURE_ENABLED' },
   { key: 'review',    label: 'review',    desc: 'reviewer + candidates',    env: 'LEARNING_REVIEW_ENABLED' },
   { key: 'retrieval', label: 'retrieval', desc: 'shadow routing + scoring', env: 'LEARNING_RETRIEVAL_ENABLED' },
-  { key: 'curator',   label: 'curator',   desc: 'phase 6 — not built yet',  env: 'LEARNING_CURATOR_ENABLED' },
+  { key: 'curator',   label: 'curator',   desc: 'lifecycle maintenance passes', env: 'LEARNING_CURATOR_ENABLED' },
 ];
 
 // Score components the ranking formula can emit (preview order). The API
@@ -128,6 +129,57 @@ const VERSION_STATE_STYLE = {
   rolled_back: { label: 'ROLLED BACK', color: '#8b94a7' },
   rejected:    { label: 'REJECTED',    color: NEON.red },
 };
+
+// ════════════════════════════════════════════════════════════════════
+// PHASE 6 — CURATOR & LIFECYCLE (Curator tab)
+// ════════════════════════════════════════════════════════════════════
+// Phase 6 — how a curator run works (approved preview content, static).
+const CURATOR_PIPELINE = [
+  { n: '1 · Scan', d: 'Deterministic pass over every version: usage, recency, failure rates, references.' },
+  { n: '2 · Draft', d: 'Aimi turns raw findings into plain-language recommendations. No structural changes.' },
+  { n: '3 · Haz decides', d: 'Approve, dismiss, or pin. Dry-run reports first — prune-only mode comes later, only after two reviewed dry runs.' },
+];
+
+// Phase 6 — the maintenance pass rules (approved preview content, static).
+const CURATOR_RULES = [
+  { cond: 'Unused for 30 days', trans: 'active → stale', safe: '✓ skips pinned, system, referenced, executing' },
+  { cond: 'Stale for 90 days, still unreferenced', trans: 'stale → archived', safe: '✓ recoverable — restore any time, nothing deleted' },
+  { cond: 'Failure rate ≥ 50% over ≥ 5 runs', trans: 'active → quarantined', safe: "✓ minimum sample size — one bad run can't quarantine a skill" },
+  { cond: 'Duplicate cluster detected', trans: 'merge proposal (human review of behavior diff)', safe: '✓ feeds Phase 3 merge flow — Haz approves' },
+];
+
+// Recommendation kinds → chips.
+const RECOMMEND_KIND_STYLE = {
+  stale:      { label: 'STALE',      color: NEON.yellow },
+  archive:    { label: 'ARCHIVE',    color: NEON.cyan },
+  quarantine: { label: 'QUARANTINE', color: NEON.red },
+  merge:      { label: 'MERGE',      color: NEON.purple },
+};
+
+// Curator run modes → chips. DRY-RUN is the default and always available;
+// PRUNE (dry-run + apply approved actions) unlocks after 2 reviewed dry runs.
+const CURATOR_MODE_STYLE = {
+  dry_run: { label: 'DRY-RUN', color: NEON.yellow },
+  prune:   { label: 'PRUNE',   color: NEON.purple },
+};
+
+// Config rows: response key → display label + backing env var. The settings
+// panel is read-only: the backend owns these values, Haz edits env + restarts.
+const CURATOR_CONFIG_ROWS = [
+  { key: 'stale_after_days',       label: 'stale_after_days',       env: 'LEARNING_CURATOR_STALE_DAYS' },
+  { key: 'archive_after_days',     label: 'archive_after_days',     env: 'LEARNING_CURATOR_ARCHIVE_DAYS' },
+  { key: 'quarantine_failure_rate', label: 'quarantine_failure_rate', env: 'LEARNING_CURATOR_QUARANTINE_RATE' },
+  { key: 'min_failure_sample',     label: 'min_failure_sample',     env: 'LEARNING_CURATOR_MIN_SAMPLE' },
+  { key: 'interval_hours',         label: 'interval_hours',         env: 'LEARNING_CURATOR_INTERVAL_HOURS' },
+];
+
+// Never auto-touched — the curator's protection shield (static content).
+const PROTECTION_LIST = [
+  'Pinned skills — your explicit "keep this"',
+  'Referenced by schedules or chains',
+  'Currently executing versions',
+  'System skills',
+];
 
 function stateChipLabel(state) {
   switch (state) {
@@ -223,6 +275,20 @@ export default function LearningInbox() {
   const [feedbacking, setFeedbacking] = useState(null); // `${decisionId}:${ledger}` in flight
   const [feedbackNotice, setFeedbackNotice] = useState(null);
   const [flagNote, setFlagNote] = useState(null); // flag key whose env note is shown
+
+  // ── Phase 6: curator & lifecycle ──
+  const [runs, setRuns] = useState([]); // curator runs, recent first
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [recs, setRecs] = useState([]); // proposed recommendations
+  const [recsLoading, setRecsLoading] = useState(false);
+  const [curatorConfig, setCuratorConfig] = useState(null); // config object
+  const [curatorError, setCuratorError] = useState(null);
+  const [curatorNotice, setCuratorNotice] = useState(null);
+  const [curatorRunning, setCuratorRunning] = useState(null); // 'dry_run' | 'prune' | null
+  const [reviewingRun, setReviewingRun] = useState(null); // run id in flight
+  const [recActioning, setRecActioning] = useState(null); // `${recId}:${action}` in flight
+  const [openRec, setOpenRec] = useState(null); // expanded recommendation id
+  const [appliedRecs, setAppliedRecs] = useState([]); // recently applied (for restore)
 
   const refresh = useCallback(async () => {
     try {
@@ -368,6 +434,219 @@ export default function LearningInbox() {
   }, [tab, refreshRouting]);
 
   usePolling(refreshRouting, 30000, tab === 'routing' && openDecision === null && feedbacking === null);
+
+  // ── Phase 6: curator data (runs + proposed recommendations + config) ──
+  // Each endpoint degrades independently — a missing backend piece leaves an
+  // empty panel instead of failing the whole tab.
+  const refreshCurator = useCallback(async () => {
+    setRunsLoading(true);
+    setRecsLoading(true);
+    try {
+      const [rData, recData, cData, aData] = await Promise.all([
+        cachedFetch('/api/learning/curator/runs').catch(() => null),
+        cachedFetch('/api/learning/curator/recommendations?state=proposed').catch(() => null),
+        cachedFetch('/api/learning/curator/config').catch(() => null),
+        cachedFetch('/api/learning/curator/recommendations?state=applied').catch(() => null),
+      ]);
+      setRuns(Array.isArray(rData?.runs) ? rData.runs : []);
+      setRecs(Array.isArray(recData?.recommendations) ? recData.recommendations : []);
+      setCuratorConfig(cData?.config || null);
+      setAppliedRecs(Array.isArray(aData?.recommendations) ? aData.recommendations.slice(0, 5) : []);
+      if (!rData && !recData) setCuratorError('Curator endpoints unavailable — backend not responding.');
+      else setCuratorError(null);
+    } catch (err) {
+      console.error('LearningInbox curator refresh error:', err);
+      setCuratorError(err.message || 'Failed to load curator data');
+    } finally {
+      setRunsLoading(false);
+      setRecsLoading(false);
+    }
+  }, []);
+
+  const invalidateCurator = () => {
+    invalidateCache('/api/learning/curator/runs');
+    invalidateCache('/api/learning/curator/recommendations?state=proposed');
+    invalidateCache('/api/learning/curator/recommendations?state=applied');
+  };
+
+  // Fetch curator data when the CURATOR tab is selected.
+  useEffect(() => {
+    if (tab === 'curator') refreshCurator();
+  }, [tab, refreshCurator]);
+
+  usePolling(refreshCurator, 30000, tab === 'curator' && curatorRunning === null && recActioning === null && reviewingRun === null);
+
+  // Phase 6 — trigger a curator run. The backend drafts recommendations for
+  // dry_run; prune applies approved actions and returns 400
+  // { error: 'prune_not_eligible', reviewed } until two dry runs are reviewed.
+  const handleRunCurator = async (mode) => {
+    if (curatorRunning) return;
+    setCuratorRunning(mode);
+    setCuratorNotice(null);
+    try {
+      const token = localStorage.getItem('cf_token');
+      const res = await fetch('/api/learning/curator/run', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ mode }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (body.error === 'prune_not_eligible') {
+          const reviewed = num(body.reviewed);
+          setCuratorNotice(`Prune not eligible yet — ${reviewed}/2 dry runs reviewed. Mark two dry runs reviewed to unlock prune mode.`);
+          return;
+        }
+        throw new Error(body.error || `Request failed: ${res.status}`);
+      }
+      const run = body.run || {};
+      setCuratorNotice(
+        mode === 'prune'
+          ? `Prune run complete — ${num(run.findings_count)} findings, ${num(run.applied_count)} applied.`
+          : `Dry run complete — ${num(run.findings_count)} findings drafted, 0 applied. Review the proposals below.`
+      );
+      // Refresh everything: runs (new entry), proposed recs (new/ drained),
+      // config (prune eligibility may have changed).
+      invalidateCurator();
+      invalidateCache('/api/learning/curator/runs');
+      invalidateCache('/api/learning/curator/config');
+      await refreshCurator();
+    } catch (err) {
+      console.error('LearningInbox curator run error:', err);
+      setCuratorError(err.message || 'Curator run failed');
+    } finally {
+      setCuratorRunning(null);
+    }
+  };
+
+  // Phase 6 — mark a dry run reviewed. Two reviewed dry runs unlock prune.
+  const handleReviewRun = async (runId) => {
+    if (!runId || reviewingRun) return;
+    setReviewingRun(runId);
+    setCuratorNotice(null);
+    try {
+      await authedFetch(`/api/learning/curator/runs/${runId}/review`, { method: 'POST' });
+      setCuratorNotice('Run marked reviewed. Two reviewed dry runs unlock prune mode.');
+      invalidateCurator();
+      invalidateCache('/api/learning/curator/config');
+      await refreshCurator();
+    } catch (err) {
+      console.error('LearningInbox run review error:', err);
+      setCuratorError(err.message || 'Failed to mark run reviewed');
+    } finally {
+      setReviewingRun(null);
+    }
+  };
+
+  // Phase 6 — approve / dismiss a recommendation.
+  const handleRecAction = async (rec, action) => {
+    // action: 'approve' | 'dismiss'
+    if (!rec?.id || recActioning) return;
+    setRecActioning(`${rec.id}:${action}`);
+    setCuratorNotice(null);
+    try {
+      const data = await authedFetch(`/api/learning/curator/recommendations/${rec.id}/${action}`, { method: 'POST' });
+      const updated = data?.recommendation || {};
+      setRecs(prev => prev.map(r => (r?.id === rec.id ? { ...r, ...updated, state: updated.state || (action === 'approve' ? 'approved' : 'dismissed') } : r)).filter(r => r?.state === 'proposed'));
+      if (action === 'approve') {
+        const applied = data?.applied === true;
+        setCuratorNotice(applied ? 'Approved and applied — the version transitioned.' : 'Approved — the action is queued to apply.');
+      } else {
+        setCuratorNotice('Dismissed — the version stays as it is.');
+      }
+      invalidateCurator();
+      invalidateCache('/api/learning/curator/runs');
+    } catch (err) {
+      console.error('LearningInbox recommendation action error:', err);
+      setCuratorError(err.message || 'Recommendation action failed');
+    } finally {
+      setRecActioning(null);
+    }
+  };
+
+  // Phase 6 — pin a version instead of acting on the recommendation.
+  // Pinned skills are never auto-touched by future curator runs.
+  const handlePinVersion = async (rec) => {
+    if (!rec?.version_id || recActioning) return;
+    setRecActioning(`${rec.id}:pin`);
+    setCuratorNotice(null);
+    try {
+      await authedFetch(`/api/learning/skill-versions/${rec.version_id}/pin`, {
+        method: 'POST',
+        body: JSON.stringify({ pinned: true }),
+      });
+      await authedFetch(`/api/learning/curator/recommendations/${rec.id}/dismiss`, { method: 'POST' });
+      setRecs(prev => prev.filter(r => r?.id !== rec.id));
+      setCuratorNotice(`Pinned "${rec.version_title || rec.version_id}" — the curator will never touch it.`);
+      invalidateCurator();
+      invalidateCache('/api/learning/skill-versions');
+    } catch (err) {
+      console.error('LearningInbox pin error:', err);
+      setCuratorError(err.message || 'Pin failed');
+    } finally {
+      setRecActioning(null);
+    }
+  };
+
+  // Phase 6 — restore an archived version (archive is reversible).
+  // Only archive-kind recommendations can be restored.
+  const handleRestoreVersion = async (rec) => {
+    if (!rec?.version_id || recActioning) return;
+    setRecActioning(`${rec.id}:restore`);
+    setCuratorNotice(null);
+    try {
+      const data = await authedFetch(`/api/learning/skill-versions/${rec.version_id}/restore`, { method: 'POST' });
+      setCuratorNotice(
+        `Restored "${rec.version_title || rec.version_id}" — archived ${num(data?.archived)}, stale ${num(data?.stale)}, quarantined ${num(data?.quarantined)}.`
+      );
+      setAppliedRecs(prev => prev.filter(r => r?.id !== rec.id));
+      invalidateCurator();
+      invalidateCache('/api/learning/skill-versions');
+    } catch (err) {
+      console.error('LearningInbox restore error:', err);
+      setCuratorError(err.message || 'Restore failed');
+    } finally {
+      setRecActioning(null);
+    }
+  };
+
+  // Phase 6 — one-line evidence summary for a recommendation card.
+  // evidence is either a plain string or an object; never crash on shape.
+  const evidenceLine = (ev) => {
+    if (!ev) return null;
+    if (typeof ev === 'string') return ev;
+    if (typeof ev === 'object') {
+      const parts = [];
+      if (ev.unused_days != null) parts.push(`unused ${ev.unused_days} days`);
+      if (ev.stale_days != null) parts.push(`stale ${ev.stale_days} days`);
+      if (ev.failures != null && ev.samples != null) parts.push(`${ev.failures}/${ev.samples} failures`);
+      else if (ev.failure_rate != null) parts.push(`${Math.round(Number(ev.failure_rate) * 100)}% failure rate`);
+      if (ev.unreferenced) parts.push('unreferenced');
+      if (ev.similar_to) parts.push(`similar to ${ev.similar_to}`);
+      if (parts.length) return parts.join(' · ');
+      try { return JSON.stringify(ev); } catch { return null; }
+    }
+    return String(ev);
+  };
+
+  // Phase 6 — policy summary for a run card from its policy snapshot.
+  const policyLine = (snapshot) => {
+    if (!snapshot) return null;
+    if (typeof snapshot === 'string') return snapshot;
+    if (typeof snapshot === 'object') {
+      const p = [];
+      if (snapshot.stale_after_days != null) p.push(`stale>${snapshot.stale_after_days}d`);
+      if (snapshot.archive_after_days != null) p.push(`archive>${snapshot.archive_after_days}d`);
+      if (snapshot.quarantine_failure_rate != null) p.push(`quarantine≥${Math.round(Number(snapshot.quarantine_failure_rate) * 100)}%`);
+      if (snapshot.min_failure_sample != null) p.push(`≥${snapshot.min_failure_sample} runs`);
+      if (p.length) return `policy: ${p.join(' · ')}`;
+      try { return `policy: ${JSON.stringify(snapshot).slice(0, 120)}`; } catch { return null; }
+    }
+    return null;
+  };
 
   // Phase 5 — feedback on a shadow decision. Route and execution ledgers are
   // separate: route feedback tunes the retriever, execution feedback tunes
@@ -1656,6 +1935,611 @@ export default function LearningInbox() {
     );
   };
 
+  // ══════════════════════════════════════════════════════════════
+  // PHASE 6 — CURATOR TAB COMPONENTS
+  // ══════════════════════════════════════════════════════════════
+
+  // Phase 6: one Aimi-style recommendation card with Approve / Dismiss /
+  // Pin-instead actions and tap-to-expand full evidence.
+  const RecommendationCard = ({ rec }) => {
+    if (!rec || typeof rec !== 'object') return null;
+    const open = openRec === rec.id;
+    const kindStyle = RECOMMEND_KIND_STYLE[rec.kind]
+      || { label: String(rec.kind || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+    const kindChip = RECOMMEND_KIND_STYLE[rec.kind] ? kindStyle : null;
+    const vKind = VERSION_KIND_STYLE[rec.version_kind] || null;
+    const vState = VERSION_STATE_STYLE[rec.version_state] || null;
+    const evLine = evidenceLine(rec.evidence);
+    const busy = recActioning && String(recActioning).startsWith(`${rec.id}:`)
+      ? String(recActioning).split(':')[1]
+      : null;
+
+    const actBtn = (action, label, color, title) => (
+      <button
+        key={action}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (action === 'pin') handlePinVersion(rec);
+          else handleRecAction(rec, action); // 'approve' | 'dismiss'
+        }}
+        disabled={busy !== null}
+        title={title}
+        className="flex-1 min-w-[96px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all"
+        style={{
+          background: `${color}10`,
+          border: `1px solid ${color}60`,
+          color,
+          opacity: busy !== null ? 0.4 : 1,
+          cursor: busy !== null ? 'not-allowed' : 'pointer',
+          minHeight: '40px',
+        }}
+      >
+        {busy === action ? (
+          <><Loader size={12} className="animate-spin inline" /> …</>
+        ) : label}
+      </button>
+    );
+
+    return (
+      <div
+        className="chamfer-sm"
+        style={{ background: BG.surface, border: `1px solid ${kindStyle.color}25` }}
+      >
+        <button
+          onClick={() => setOpenRec(open ? null : rec.id)}
+          className="p-3 flex flex-col gap-2 text-left w-full"
+          style={{ cursor: 'pointer', minHeight: '40px' }}
+        >
+          <span className="text-[10px] tracking-widest uppercase font-hud" style={{ color: NEON.purple }}>
+            ✦ Aimi drafts
+          </span>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[14px] font-medium" style={{ color: '#dbe2f1' }}>
+              {rec.version_title || `version ${String(rec.version_id || '').slice(0, 8)}`}
+            </span>
+            {kindChip && <Chip color={kindChip.color}>{kindChip.label}</Chip>}
+            {vKind && <Chip color={vKind.color}>KIND · {vKind.label}</Chip>}
+            {vState && <Chip color={vState.color}>{vState.label}</Chip>}
+            <span className="text-[10px] font-hud ml-auto" style={{ color: '#555' }}>
+              {fmtDate(rec.created_at)}
+            </span>
+          </div>
+          {rec.reason && (
+            <p className="text-[12px] m-0" style={{ color: '#8b94a7' }}>{rec.reason}</p>
+          )}
+          {evLine && (
+            <div className="text-[11px] font-hud" style={{ color: NEON.cyan }}>
+              {evLine}
+            </div>
+          )}
+          <span className="text-[10px] font-hud" style={{ color: '#555' }}>
+            Tap to {open ? 'collapse ▲' : 'expand ▾'}
+          </span>
+        </button>
+
+        <div className="px-3 pb-3 flex gap-2 flex-wrap" style={{ borderTop: `1px solid ${kindStyle.color}12`, paddingTop: '12px' }}>
+          {actBtn('approve', `Approve ${kindStyle.label.toLowerCase()}`, NEON.green, 'Accept Aimi\u2019s proposal and let the curator apply it')}
+          {actBtn('pin', 'Pin instead', NEON.cyan, 'Keep the version permanently — the curator will never propose touching it again')}
+          {actBtn('dismiss', 'Dismiss', '#8b94a7', 'Reject the proposal; the version stays exactly as it is')}
+        </div>
+
+        {open && rec.evidence != null && typeof rec.evidence === 'object' && (
+          <div className="px-3 pb-3">
+            <div className="text-[10px] tracking-widest uppercase font-hud font-bold mb-1.5" style={{ color: '#555' }}>
+              ◇ Full evidence
+            </div>
+            <pre
+              className="chamfer-sm p-3 text-[11px] font-mono overflow-auto m-0"
+              style={{ background: BG.card, border: `1px solid ${NEON.cyan}12`, color: '#8b94a7', maxHeight: '220px' }}
+            >
+              {JSON.stringify(rec.evidence, null, 2)}
+            </pre>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Phase 6: the whole Curator tab — lifecycle maintenance, Haz's call on
+  // every change. Dry-run reports first; prune unlocks after 2 reviewed runs.
+  const CuratorTab = () => {
+    const latestRun = runs[0] || null;
+    const history = runs.slice(1);
+    const latestMode = CURATOR_MODE_STYLE[latestRun?.mode] || null;
+    const isDryRun = latestRun?.mode === 'dry_run';
+    const reviewed = latestRun?.reviewed === true || latestRun?.reviewed === 1;
+    const pruneEligible = curatorConfig?.prune_eligible === true;
+    const reviewedCount = num(curatorConfig?.reviewed_dry_runs);
+    const cfgLoading = !curatorConfig && runsLoading;
+
+    return (
+      <>
+        {/* ══ PHASE 6: CURATOR & LIFECYCLE ══ */}
+        <div className="flex items-start justify-between flex-wrap gap-3">
+          <div>
+            <h2
+              className="flex items-center gap-2 text-lg font-bold tracking-wider font-hud"
+              style={{ color: NEON.purple, filter: `drop-shadow(0 0 8px ${NEON.purple}60)` }}
+            >
+              ◈ Curator & lifecycle
+            </h2>
+            <p className="text-[11px] mt-1" style={{ color: '#555' }}>
+              Phase 6 — the catalog ages gracefully, or not at all without your say
+            </p>
+            <div className="flex gap-2 mt-2.5 flex-wrap">
+              <span
+                className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                style={{ background: `${NEON.yellow}10`, color: NEON.yellow, border: `1px solid ${NEON.yellow}40` }}
+              >
+                ◉ dry-run first
+              </span>
+              <span
+                className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                style={{ background: `${NEON.purple}10`, color: NEON.purple, border: `1px solid ${NEON.purple}35` }}
+              >
+                propose, never auto-apply
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={refreshCurator}
+            disabled={runsLoading || recsLoading}
+            className="flex items-center gap-2 px-4 py-2 chamfer-sm text-[11px] font-bold tracking-wide font-hud uppercase transition-all"
+            style={{
+              background: `${NEON.purple}12`,
+              border: `1px solid ${NEON.purple}40`,
+              color: NEON.purple,
+              opacity: runsLoading ? 0.5 : 1,
+              cursor: runsLoading ? 'not-allowed' : 'pointer',
+              boxShadow: `0 0 12px ${NEON.purple}20`,
+              minHeight: '40px',
+            }}
+          >
+            {runsLoading || recsLoading ? <Loader size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+            {runsLoading || recsLoading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
+
+        {curatorError && (
+          <div
+            className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+            style={{ background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }}
+          >
+            ⚠ {curatorError}
+          </div>
+        )}
+
+        {curatorNotice && (
+          <div
+            className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+            style={
+              curatorNotice.startsWith('Prune not eligible')
+                ? { background: `${NEON.yellow}08`, border: `1px solid ${NEON.yellow}40`, color: NEON.yellow }
+                : { background: `${NEON.green}06`, border: `1px solid ${NEON.green}40`, color: NEON.green }
+            }
+          >
+            {curatorNotice}
+          </div>
+        )}
+
+        {/* How a curator run works (static, approved preview content) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+        >
+          <div className="px-4 py-3" style={{ borderBottom: `1px solid ${NEON.cyan}12` }}>
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+              ◇ How a curator run works
+            </span>
+          </div>
+          <div className="p-3 flex flex-wrap items-stretch gap-1.5">
+            {CURATOR_PIPELINE.map((s, i) => (
+              <div key={s.n} className="flex items-stretch gap-1.5 flex-1 min-w-[130px]">
+                <div
+                  className="chamfer-sm p-2.5 flex-1"
+                  style={{ background: BG.surface, border: `1px solid ${NEON.cyan}15` }}
+                >
+                  <div className="text-[12px] font-bold font-hud" style={{ color: NEON.cyan }}>{s.n}</div>
+                  <div className="text-[10px] mt-1" style={{ color: '#8b94a7' }}>{s.d}</div>
+                </div>
+                {i < CURATOR_PIPELINE.length - 1 && (
+                  <span className="self-center shrink-0" style={{ color: NEON.cyan }}>→</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Latest-run report */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.purple}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.purple}12` }}
+          >
+            <History size={13} style={{ color: NEON.purple }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.purple }}>
+              ◇ Latest curator run
+            </span>
+            {latestMode && (
+              <span className="ml-auto">
+                <Chip color={latestMode.color}>{latestMode.label}</Chip>
+              </span>
+            )}
+          </div>
+          <div className="p-3 flex flex-col gap-2.5">
+            {runsLoading && !latestRun && (
+              <div className="flex items-center justify-center py-8 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                <Loader size={16} className="animate-spin" /> Loading curator runs…
+              </div>
+            )}
+            {!runsLoading && !latestRun && (
+              <div className="text-center py-8 text-[11px] font-hud" style={{ color: '#444' }}>
+                No curator runs yet — run the first dry-run below to see what the catalog looks like.
+              </div>
+            )}
+            {latestRun && (
+              <>
+                <div className="flex flex-wrap gap-x-5 gap-y-1.5 text-[12px] font-hud" style={{ color: '#8b94a7' }}>
+                  <span>findings <b style={{ color: NEON.purple }}>{num(latestRun.findings_count)}</b></span>
+                  <span>applied <b style={{ color: NEON.green }}>{num(latestRun.applied_count)}</b></span>
+                  <span>reviewed <b style={{ color: reviewed ? NEON.green : NEON.yellow }}>{reviewed ? 'yes' : 'no'}</b></span>
+                  <span className="text-[11px]" style={{ color: '#555' }}>{fmtDate(latestRun.created_at)}</span>
+                </div>
+                {policyLine(latestRun.policy_snapshot) && (
+                  <div
+                    className="chamfer-sm px-3 py-2 text-[11px] font-hud"
+                    style={{ background: BG.surface, border: `1px dashed ${NEON.purple}40`, color: '#8b94a7' }}
+                  >
+                    {policyLine(latestRun.policy_snapshot)}
+                  </div>
+                )}
+                {isDryRun && !reviewed && (
+                  <div
+                    className="chamfer-sm px-3 py-2 text-[12px]"
+                    style={{ background: `${NEON.yellow}06`, border: `1px dashed ${NEON.yellow}50`, color: '#8b94a7' }}
+                  >
+                    <b style={{ color: NEON.yellow }}>Unreviewed dry run.</b> Mark it reviewed once you've checked the
+                    proposals — two reviewed dry runs unlock prune mode.
+                  </div>
+                )}
+              </>
+            )}
+            <div className="flex gap-2 flex-wrap">
+              <button
+                onClick={() => handleRunCurator('dry_run')}
+                disabled={curatorRunning !== null}
+                className="flex-1 min-w-[130px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all"
+                style={{
+                  background: `${NEON.yellow}10`,
+                  border: `1px solid ${NEON.yellow}60`,
+                  color: NEON.yellow,
+                  opacity: curatorRunning !== null ? 0.5 : 1,
+                  cursor: curatorRunning !== null ? 'not-allowed' : 'pointer',
+                  minHeight: '44px',
+                }}
+              >
+                {curatorRunning === 'dry_run' ? <Loader size={13} className="animate-spin inline" /> : <Play size={13} className="inline" />}
+                {' '}{curatorRunning === 'dry_run' ? 'Running…' : 'Run curator'}
+              </button>
+              {pruneEligible && (
+                <button
+                  onClick={() => handleRunCurator('prune')}
+                  disabled={curatorRunning !== null}
+                  className="flex-1 min-w-[130px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all"
+                  style={{
+                    background: `${NEON.purple}10`,
+                    border: `1px solid ${NEON.purple}60`,
+                    color: NEON.purple,
+                    opacity: curatorRunning !== null ? 0.5 : 1,
+                    cursor: curatorRunning !== null ? 'not-allowed' : 'pointer',
+                    boxShadow: `0 0 12px ${NEON.purple}25`,
+                    minHeight: '44px',
+                  }}
+                >
+                  {curatorRunning === 'prune' ? <Loader size={13} className="animate-spin inline" /> : <Hammer size={13} className="inline" />}
+                  {' '}{curatorRunning === 'prune' ? 'Pruning…' : 'Prune run'}
+                </button>
+              )}
+              {isDryRun && !reviewed && (
+                <button
+                  onClick={() => handleReviewRun(latestRun.id)}
+                  disabled={reviewingRun !== null}
+                  className="flex-1 min-w-[130px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all"
+                  style={{
+                    background: `${NEON.green}10`,
+                    border: `1px solid ${NEON.green}60`,
+                    color: NEON.green,
+                    opacity: reviewingRun !== null ? 0.5 : 1,
+                    cursor: reviewingRun !== null ? 'not-allowed' : 'pointer',
+                    minHeight: '44px',
+                  }}
+                >
+                  {reviewingRun !== null ? <Loader size={13} className="animate-spin inline" /> : <CheckCircle2 size={13} className="inline" />}
+                  {' '}{reviewingRun !== null ? 'Marking…' : 'Mark reviewed'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* The maintenance pass (static, approved preview content) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+        >
+          <div className="px-4 py-3" style={{ borderBottom: `1px solid ${NEON.cyan}12` }}>
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+              ◇ The maintenance pass
+            </span>
+            <span
+              className="ml-2 text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.cyan}12`, color: NEON.cyan }}
+            >
+              deterministic
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            {CURATOR_RULES.map(r => (
+              <div
+                key={r.cond}
+                className="chamfer-sm p-3 text-[12px]"
+                style={{ background: BG.surface, border: `1px solid ${NEON.cyan}12` }}
+              >
+                <div className="text-[11px] font-hud" style={{ color: NEON.cyan }}>{r.cond}</div>
+                <div className="my-1" style={{ color: '#555' }}>→</div>
+                <div style={{ color: '#dbe2f1' }}>{r.trans}</div>
+                <span className="block mt-1.5 text-[10px]" style={{ color: NEON.green }}>{r.safe}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Aimi's recommendations */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.purple}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.purple}12` }}
+          >
+            <Sparkles size={13} style={{ color: NEON.purple }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.purple }}>
+              ◇ Aimi's recommendations
+            </span>
+            <span
+              className="ml-auto text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.purple}12`, color: NEON.purple }}
+            >
+              {recs.length} proposed
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            {recsLoading && recs.length === 0 && (
+              <div className="flex items-center justify-center py-10 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                <Loader size={16} className="animate-spin" /> Loading recommendations…
+              </div>
+            )}
+            {!recsLoading && recs.length === 0 && (
+              <div className="text-center py-10 text-[11px] font-hud" style={{ color: '#444' }}>
+                <ShieldCheck size={20} className="mx-auto mb-2" style={{ color: '#333' }} />
+                No pending proposals — the catalog is healthy, or the last dry run found nothing worth flagging.
+              </div>
+            )}
+            {recs.map((rec, ri) => <RecommendationCard key={rec?.id || `rec-${ri}`} rec={rec} />)}
+          </div>
+        </div>
+
+        {/* Recently applied — archive is reversible */}
+        {appliedRecs.length > 0 && (
+          <div
+            className="chamfer-md overflow-hidden"
+            style={{ background: BG.card, border: `1px solid ${NEON.green}18` }}
+          >
+            <div className="px-4 py-3" style={{ borderBottom: `1px solid ${NEON.green}12` }}>
+              <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.green }}>
+                ◇ Recently applied
+              </span>
+            </div>
+            <div className="p-3 flex flex-col gap-2">
+              {appliedRecs.map((r, ri) => {
+                const ks = RECOMMEND_KIND_STYLE[r?.kind]
+                  || { label: String(r?.kind || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+                const busy = recActioning === `${r?.id}:restore`;
+                return (
+                  <div
+                    key={r?.id || `applied-${ri}`}
+                    className="chamfer-sm p-3 flex items-center gap-2.5 flex-wrap"
+                    style={{ background: BG.surface, border: `1px solid ${NEON.green}12` }}
+                  >
+                    <span className="text-[13px]" style={{ color: '#dbe2f1' }}>
+                      {r?.version_title || `version ${String(r?.version_id || '').slice(0, 8)}`}
+                    </span>
+                    <Chip color={ks.color}>{ks.label}</Chip>
+                    <span className="text-[10px] font-hud" style={{ color: '#555' }}>
+                      {fmtDate(r?.decided_at || r?.created_at)}
+                    </span>
+                    {r?.kind === 'archive' && (
+                      <button
+                        onClick={() => handleRestoreVersion(r)}
+                        disabled={busy || recActioning !== null}
+                        className="ml-auto flex items-center gap-1.5 px-3 py-2 chamfer-sm text-[10px] tracking-wider font-hud uppercase font-bold transition-all"
+                        style={{
+                          background: `${NEON.green}10`,
+                          border: `1px solid ${NEON.green}60`,
+                          color: NEON.green,
+                          opacity: busy || recActioning !== null ? 0.4 : 1,
+                          cursor: busy || recActioning !== null ? 'not-allowed' : 'pointer',
+                          minHeight: '36px',
+                        }}
+                      >
+                        {busy ? <Loader size={12} className="animate-spin" /> : <ArchiveRestore size={12} />}
+                        {' '}{busy ? 'Restoring…' : 'Restore'}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Protection rules (static) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.green}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.green}12` }}
+          >
+            <ShieldCheck size={13} style={{ color: NEON.green }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.green }}>
+              ◇ Protection rules
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            <div
+              className="chamfer-sm p-3"
+              style={{ background: `${NEON.green}04`, border: `1px solid ${NEON.green}25` }}
+            >
+              <div className="text-[11px] font-bold tracking-widest uppercase font-hud mb-2" style={{ color: NEON.green }}>
+                🛡 Never auto-touched
+              </div>
+              <ul className="m-0 pl-4 text-[11px] flex flex-col gap-1" style={{ color: '#8b94a7' }}>
+                {PROTECTION_LIST.map(p => <li key={p}>{p}</li>)}
+              </ul>
+            </div>
+            <div
+              className="chamfer-sm p-3 text-[12px]"
+              style={{ background: `${NEON.red}05`, border: `1px solid ${NEON.red}30`, color: '#8b94a7' }}
+            >
+              <b style={{ color: NEON.red }}>Archive ≠ delete.</b> Archived skills restore in one tap with full history.
+              Permanent deletion stays a manual admin action with a warning — the curator can never do it.
+            </div>
+          </div>
+        </div>
+
+        {/* Curator settings (read-only, server-owned) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.cyan}12` }}
+          >
+            <Gauge size={13} style={{ color: NEON.cyan }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+              ◇ Curator settings
+            </span>
+            <span
+              className="ml-auto text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.cyan}12`, color: NEON.cyan }}
+            >
+              read-only
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-1.5">
+            {cfgLoading && (
+              <div className="flex items-center justify-center py-6 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                <Loader size={14} className="animate-spin" /> Loading config…
+              </div>
+            )}
+            {!cfgLoading && !curatorConfig && (
+              <div className="text-center py-6 text-[11px] font-hud" style={{ color: '#444' }}>
+                Config unavailable — backend endpoint not responding.
+              </div>
+            )}
+            {curatorConfig && CURATOR_CONFIG_ROWS.map(row => (
+              <div
+                key={row.key}
+                className="chamfer-sm px-3 py-2 flex items-center gap-2 text-[11px] font-hud"
+                style={{ background: BG.surface, border: `1px solid ${NEON.cyan}10` }}
+              >
+                <span style={{ color: '#8b94a7', flex: 1 }}>{row.label}</span>
+                <span className="text-[10px]" style={{ color: '#555' }}>{row.env}</span>
+                <b style={{ color: NEON.cyan }}>{String(curatorConfig[row.key] ?? '—')}</b>
+              </div>
+            ))}
+            {curatorConfig && (
+              <div
+                className="chamfer-sm px-3 py-2.5 flex items-center gap-2 text-[11px] font-hud"
+                style={{ background: BG.surface, border: `1px dashed ${pruneEligible ? NEON.green : NEON.yellow}60`, color: '#8b94a7' }}
+              >
+                <span style={{ flex: 1 }}>
+                  prune eligibility — <b style={{ color: pruneEligible ? NEON.green : NEON.yellow }}>{reviewedCount}/2</b> dry runs reviewed
+                </span>
+                <Chip color={pruneEligible ? NEON.green : NEON.yellow}>
+                  {pruneEligible ? 'PRUNE UNLOCKED' : 'PRUNE LOCKED'}
+                </Chip>
+              </div>
+            )}
+          </div>
+          <div className="px-3 pb-3">
+            <p className="text-[10px] font-hud m-0" style={{ color: '#555' }}>
+              Values are env-configured server-side — restart the backend to change them.
+              The effective policy is logged on every curator run, so there's always a record
+              of what rules were in force when a proposal was drafted.
+            </p>
+          </div>
+        </div>
+
+        {/* Run history */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.yellow}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.yellow}12` }}
+          >
+            <History size={13} style={{ color: NEON.yellow }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.yellow }}>
+              ◇ Run history
+            </span>
+            <span
+              className="ml-auto text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.yellow}12`, color: NEON.yellow }}
+            >
+              {runs.length} runs
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            {!runsLoading && history.length === 0 && (
+              <div className="text-center py-6 text-[11px] font-hud" style={{ color: '#444' }}>
+                {latestRun ? 'Only one run so far — history builds as the curator runs.' : 'No runs yet.'}
+              </div>
+            )}
+            {history.map((r, ri) => {
+              const m = CURATOR_MODE_STYLE[r?.mode] || { label: String(r?.mode || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+              const rev = r?.reviewed === true || r?.reviewed === 1;
+              return (
+                <div
+                  key={r?.id || `run-${ri}`}
+                  className="chamfer-sm p-3 flex items-center gap-2.5 flex-wrap"
+                  style={{ background: BG.surface, border: `1px solid ${NEON.yellow}12` }}
+                >
+                  <Chip color={m.color}>{m.label}</Chip>
+                  <Chip color={rev ? NEON.green : '#8b94a7'}>{rev ? 'REVIEWED' : 'UNREVIEWED'}</Chip>
+                  <span className="text-[11px] font-hud" style={{ color: '#8b94a7' }}>
+                    {num(r?.findings_count)} findings · {num(r?.applied_count)} applied
+                  </span>
+                  <span className="text-[10px] font-hud ml-auto" style={{ color: '#555' }}>
+                    {fmtDate(r?.created_at)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </>
+    );
+  };
+
   const latestJob = jobs[0];
   const budgetUsed = num(latestJob?.budget_used);
   const budgetLimit = num(latestJob?.budget_limit) || 20;
@@ -1936,6 +2820,7 @@ export default function LearningInbox() {
               const tabCount = t.key === 'clusters' ? clusters.length
                 : t.key === 'compiled' ? versions.length
                 : t.key === 'routing' ? decisions.length
+                : t.key === 'curator' ? recs.length
                 : (lists[t.key] || []).length;
               return (
                 <button
@@ -2291,6 +3176,8 @@ export default function LearningInbox() {
             </>
           ) : tab === 'routing' ? (
             <RoutingTab />
+          ) : tab === 'curator' ? (
+            <CuratorTab />
           ) : (
             <>
               {/* Candidate panel */}
