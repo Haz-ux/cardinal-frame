@@ -544,6 +544,7 @@ export default function aimiRoutes(ctx) {
       const { headers, url: chatUrl } = buildProviderAuth(provider, url);
 
       // Execute one tool call against its local API endpoint.
+      // Intentional direct fetch: this URL is hardcoded localhost by design.
       const executeToolCall = async (toolCall) => {
         const toolDef = stmts.tools.getByName.get(toolCall.tool);
         if (!toolDef) return null;
@@ -558,6 +559,9 @@ export default function aimiRoutes(ctx) {
 
       // Relay one model turn to the client (SSE). Returns the full text and,
       // if the model asked for a tool, the parsed tool call.
+      // Intentional direct fetch: chatUrl is an admin-configured LLM provider URL
+      // (requireRole('admin') on all provider writes); Ollama at localhost:11434 is
+      // an explicitly supported configuration, which safeFetch would block.
       const relayTurn = async (messages) => {
         const payload = buildChatPayload(pType, modelId, messages, true);
         const resp = await fetch(chatUrl, { method: 'POST', headers, body: JSON.stringify(payload) });

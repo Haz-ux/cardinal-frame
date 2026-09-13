@@ -1789,6 +1789,8 @@ app.post('/api/chat/compress-context', authMiddleware, apiLimiter, async (req, r
   const chatPayload = buildChatPayload(pType, modelRecord.model_id, compressionMessages, false);
   if (!chatPayload.max_tokens && pType !== 'google') chatPayload.max_tokens = 2000;
   const body = JSON.stringify(chatPayload);
+  // Intentional direct fetch: provider URL is admin-configured; Ollama
+  // (localhost:11434) is an explicitly supported provider type for compression.
   const fetch = globalThis.fetch;
   const resp = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(30000) });
   if (!resp.ok) return res.status(502).json({ error: `Compression LLM error: ${resp.status}` });

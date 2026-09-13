@@ -155,6 +155,9 @@ export function initNodeRegistry(db) {
    * @returns {Promise<boolean>} true if node is alive and verified
    */
   async function checkNodeLiveness(node, fetchFn = globalThis.fetch, verifyFn = verifyPayload) {
+    // Intentional direct fetch: federation nodes are LAN peers (e.g. http://ikaris.local:8080).
+    // safeFetch would block private/link-local targets and break node heartbeats. Node
+    // registration is admin-only, so the URL is operator-configured, not attacker-influenceable.
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
