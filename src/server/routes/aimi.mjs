@@ -258,7 +258,7 @@ export default function aimiRoutes(ctx) {
                 const row = db.prepare('SELECT rowid FROM memories WHERE id = ?').get(memoryId);
                 if (row) db.prepare('INSERT INTO memories_fts(rowid, content) VALUES (?, ?)').run(row.rowid, r.compressed);
               } catch {}
-              broadcast('memory:created', { id: memoryId, category, content: r.compressed.slice(0, 100) });
+              broadcast('memory:created', { id: memoryId, category });
             } catch (e) {
               memoryId = null;
               send({ choices: [{ delta: { content: `⚠️ Memory store failed: ${e.message} (compressed result below)` } }] });
