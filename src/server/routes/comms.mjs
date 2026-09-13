@@ -36,8 +36,9 @@ function telegramSenderAllowed(config, msg) {
 
 // ── Module-level Telegram helpers ───────────────────────────
 // telegramApiCall is self-contained (token passed per call) so it lives at
-// module level, shared by the route closure and the notifier below.
-async function telegramApiCall(token, method, params = {}) {
+// module level, shared by the route closure, the notifier below, and the
+// learning-source Telegram adapter (exported for read-only getUpdates use).
+export async function telegramApiCall(token, method, params = {}) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
   const resp = await fetch(url, {
     method: 'POST',
