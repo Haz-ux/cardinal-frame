@@ -43,6 +43,7 @@ gemini_api_key.txt
 !AUDIT_AND_PLAN.md
 !docs/adr/
 !docs/adr/**
+!docs/connectors.md
 !ROADMAP.md
 agent.md
 memory.md
