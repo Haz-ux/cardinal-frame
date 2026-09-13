@@ -55,6 +55,7 @@ import llmRoutes, { initOllama } from './routes/llm.mjs';
 import agentRoutes, { callAgentLLM, agentTools, runAgentLoop, registerAgentTool, unregisterAgentTool } from './routes/agent.mjs';
 import connectorsRoutes from './routes/connectors.mjs';
 import learningSourcesRoutes from './routes/learning-sources.mjs';
+import learningRoutes from './routes/learning.mjs';
 import { startMcpManager } from './mcp-manager.mjs';
 import commsRoutes, { createTelegramNotifier } from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
@@ -947,6 +948,22 @@ const stmts = {
    getAll: db.prepare('SELECT * FROM learning_imports ORDER BY created_at DESC LIMIT ?'),
    getByUser: db.prepare('SELECT * FROM learning_imports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'),
    },
+   learningCandidates: {
+   insert: db.prepare(`INSERT INTO learning_candidates (id, user_id, kind, title, draft, eligibility_note, risk_tier, requested_caps, state, support_verified, support_recovered, support_corrections, quality_json, promotion_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`),
+   getById: db.prepare('SELECT * FROM learning_candidates WHERE id = ? AND user_id = ?'),
+   listByUserState: db.prepare(`SELECT id, kind, title, risk_tier, state, promotion_score, support_verified, support_recovered, support_corrections, created_at, updated_at FROM learning_candidates WHERE user_id = ? AND state = ? ORDER BY promotion_score DESC, created_at DESC`),
+   listByUser: db.prepare(`SELECT id, kind, title, risk_tier, state, promotion_score, support_verified, support_recovered, support_corrections, created_at, updated_at FROM learning_candidates WHERE user_id = ? ORDER BY promotion_score DESC, created_at DESC`),
+   countToday: db.prepare(`SELECT COUNT(*) AS c FROM learning_candidates WHERE user_id = ? AND date(created_at) = date('now')`),
+   },
+   candidateEvidence: {
+   insert: db.prepare(`INSERT OR IGNORE INTO candidate_evidence (id, candidate_id, event_id, role, weight, excerpt_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`),
+   getByCandidate: db.prepare(`SELECT e.id, e.role, e.weight, e.event_id, e.excerpt_hash, le.type AS event_type, le.outcome, le.trace_id, le.created_at FROM candidate_evidence e JOIN learning_events le ON le.id = e.event_id JOIN learning_candidates c ON c.id = e.candidate_id WHERE e.candidate_id = ? AND c.user_id = ? ORDER BY le.created_at ASC, le.rowid ASC`),
+   },
+   learningReviewJobs: {
+   insert: db.prepare(`INSERT INTO learning_review_jobs (id, user_id, status, started_at) VALUES (?, ?, 'running', ?)`),
+   finish: db.prepare(`UPDATE learning_review_jobs SET status = ?, events_scanned = ?, candidates_assembled = ?, dead_lettered = ?, budget_used = ?, finished_at = ?, error = ? WHERE id = ?`),
+   getByUser: db.prepare(`SELECT id, status, events_scanned, candidates_assembled, dead_lettered, budget_used, started_at, finished_at, error FROM learning_review_jobs WHERE user_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 20`),
+   },
    deps: {
       insert: db.prepare('INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)'),
       getByTask: db.prepare('SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?'),
@@ -1635,6 +1652,7 @@ app.use('/api', identityRoutes(ctx));
 app.use('/api', defenseRoutes(ctx));
 app.use('/api', connectorsRoutes(ctx));
 app.use('/api', learningSourcesRoutes(ctx));
+app.use('/api', learningRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
