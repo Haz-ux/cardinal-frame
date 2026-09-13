@@ -45,6 +45,19 @@ import {
   getRetrievalFlags,
   recordFeedback,
 } from '../learning/retrieval.mjs';
+import {
+  runCurator,
+  approveRecommendation,
+  dismissRecommendation,
+  restoreVersion,
+  setPinned,
+  markRunReviewed,
+  reviewedDryRunCount,
+  pruneEligible,
+  curatorConfig,
+  getRecommendation,
+  CURATOR_REC_STATES,
+} from '../learning/curator.mjs';
 
 // API state filter → DB state. `review` is the visible untrusted queue
 // (DB state 'candidate').
@@ -787,6 +800,211 @@ export default function learningRoutes(ctx) {
   // Phase kill-switches (curator is Phase 6 — flag only).
   router.get('/learning/retrieval/flags', authMiddleware, (req, res) => {
     res.json({ flags: getRetrievalFlags() });
+  });
+
+  // ─── Curator + lifecycle (Phase 6) ─────────────────────────────────
+  // The curator PROPOSES, Haz disposes. dry_run proposes only; prune
+  // auto-applies ONLY stale transitions, and only when prune-eligible
+  // (>= 2 reviewed dry runs). Nothing is ever deleted: archive/stale/
+  // quarantine are reversible flags, each with an event trail.
+
+  function toCuratorRun(r) {
+    if (!r) return null;
+    return {
+      id: r.id,
+      mode: r.mode,
+      reviewed: r.reviewed === 1 || r.reviewed === true,
+      policy_snapshot: parseVersionJson(r.policy_snapshot),
+      findings_count: r.findings_count ?? 0,
+      applied_count: r.applied_count ?? 0,
+      created_at: r.created_at,
+    };
+  }
+
+  // Recommendation detail projection, with version title from the
+  // candidate title (falling back to the spec's problem_signature).
+  function toRecommendationProjection(r) {
+    let versionTitle = r.candidate_title ?? null;
+    if (!versionTitle && r.spec) {
+      const p = parseVersionJson(r.spec, null);
+      if (p && typeof p === 'object' && p.problem_signature) versionTitle = p.problem_signature;
+    }
+    return {
+      id: r.id,
+      run_id: r.run_id,
+      version_id: r.version_id,
+      version_title: versionTitle,
+      version_kind: r.version_kind ?? null,
+      version_state: r.version_state ?? null,
+      kind: r.kind,
+      reason: r.reason,
+      evidence: parseVersionJson(r.evidence),
+      state: r.state,
+      decided_by: r.decided_by ?? null,
+      decided_at: r.decided_at ?? null,
+      created_at: r.created_at,
+    };
+  }
+
+  function recommendationDetail(id, userId) {
+    return db.prepare(`SELECT r.*, v.kind AS version_kind, v.state AS version_state,
+        v.spec AS spec, c.title AS candidate_title
+      FROM learning_curator_recommendations r
+      JOIN learning_skill_versions v ON v.id = r.version_id
+      LEFT JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE r.id = ? AND r.user_id = ?`).get(id, userId);
+  }
+
+  function listRecommendationDetails(userId, state) {
+    const args = state ? [userId, state] : [userId];
+    return db.prepare(`SELECT r.*, v.kind AS version_kind, v.state AS version_state,
+        v.spec AS spec, c.title AS candidate_title
+      FROM learning_curator_recommendations r
+      JOIN learning_skill_versions v ON v.id = r.version_id
+      LEFT JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE r.user_id = ? ${state ? 'AND r.state = ?' : ''}
+      ORDER BY r.created_at DESC, r.rowid DESC
+      LIMIT 100`).all(...args);
+  }
+
+  function runRecommendationDetails(runId, userId) {
+    return db.prepare(`SELECT r.*, v.kind AS version_kind, v.state AS version_state,
+        v.spec AS spec, c.title AS candidate_title
+      FROM learning_curator_recommendations r
+      JOIN learning_skill_versions v ON v.id = r.version_id
+      LEFT JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE r.run_id = ? AND r.user_id = ?
+      ORDER BY r.created_at ASC, r.rowid ASC`).all(runId, userId);
+  }
+
+  // Recent curator runs, newest first. Owner-scoped.
+  router.get('/learning/curator/runs', authMiddleware, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit ?? '50', 10) || 50));
+    const rows = db.prepare(`SELECT * FROM learning_curator_runs
+      WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(targetUser, limit);
+    res.json({ runs: rows.map(toCuratorRun) });
+  });
+
+  // Run the curator. Prune mode requires >= 2 reviewed dry runs.
+  router.post('/learning/curator/run', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const mode = req.body?.mode === 'prune' ? 'prune' : 'dry_run';
+    if (mode === 'prune' && !pruneEligible(db, targetUser)) {
+      return res.status(400).json({
+        error: 'prune_not_eligible',
+        reviewed: reviewedDryRunCount(db, targetUser),
+      });
+    }
+    const { run, recommendations, error } = await runCurator({ db, userId: targetUser, mode, logger });
+    if (!run) {
+      return res.status(500).json({ error: 'curator run failed', detail: error ?? null });
+    }
+    audit('learning.curator.run', 'learning_curator_run', run.id, req.user.id, {
+      target_user: targetUser, mode, findings: recommendations.length,
+      applied: run.applied_count, error: run.error ?? null,
+    });
+    logger.info(`Learning curator run (${mode}): ${recommendations.length} findings, ${run.applied_count} applied`);
+    res.json({
+      run: toCuratorRun(run),
+      recommendations: runRecommendationDetails(run.id, targetUser).map(toRecommendationProjection),
+    });
+  });
+
+  // Recommendations for the user, newest first, optional state filter.
+  router.get('/learning/curator/recommendations', authMiddleware, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const { state } = req.query;
+    if (state && !CURATOR_REC_STATES.includes(state)) {
+      return res.status(400).json({ error: `state must be one of ${CURATOR_REC_STATES.join('|')}` });
+    }
+    const rows = listRecommendationDetails(targetUser, state ?? null);
+    res.json({ recommendations: rows.map(toRecommendationProjection) });
+  });
+
+  // Approve a proposed recommendation: applies the lifecycle flag
+  // (stale/archive/quarantine) or stages the merge path. Never deletes.
+  router.post('/learning/curator/recommendations/:id/approve', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const rec = getRecommendation(db, req.params.id, targetUser);
+    if (!rec) return res.status(404).json({ error: 'not found' });
+    const result = approveRecommendation(db, rec.id, req.user.id);
+    if (result.error) return res.status(400).json({ error: result.error });
+    audit('learning.curator.recommendation.approve', 'learning_curator_recommendation', rec.id, req.user.id, {
+      target_user: targetUser, kind: rec.kind, version_id: rec.version_id,
+    });
+    logger.info(`Learning curator recommendation approved: ${rec.id} (${rec.kind})`);
+    res.json({
+      recommendation: toRecommendationProjection(recommendationDetail(rec.id, targetUser)),
+      applied: result.applied,
+    });
+  });
+
+  // Dismiss a proposed recommendation.
+  router.post('/learning/curator/recommendations/:id/dismiss', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const rec = getRecommendation(db, req.params.id, targetUser);
+    if (!rec) return res.status(404).json({ error: 'not found' });
+    const result = dismissRecommendation(db, rec.id, req.user.id);
+    if (result.error) return res.status(400).json({ error: result.error });
+    audit('learning.curator.recommendation.dismiss', 'learning_curator_recommendation', rec.id, req.user.id, {
+      target_user: targetUser, kind: rec.kind, version_id: rec.version_id,
+    });
+    logger.info(`Learning curator recommendation dismissed: ${rec.id} (${rec.kind})`);
+    res.json({ recommendation: toRecommendationProjection(recommendationDetail(rec.id, targetUser)) });
+  });
+
+  // Mark a curator run reviewed (counts toward prune eligibility).
+  router.post('/learning/curator/runs/:id/review', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const run = db.prepare('SELECT * FROM learning_curator_runs WHERE id = ? AND user_id = ?')
+      .get(req.params.id, targetUser);
+    if (!run) return res.status(404).json({ error: 'not found' });
+    const updated = markRunReviewed(db, run.id, req.user.id);
+    audit('learning.curator.run.review', 'learning_curator_run', run.id, req.user.id, {
+      target_user: targetUser, mode: run.mode,
+    });
+    res.json({ run: toCuratorRun(updated) });
+  });
+
+  // Pin (protect from curation) or unpin a version.
+  router.post('/learning/skill-versions/:id/pin', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const row = getOwnedVersion(req.params.id, targetUser);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    if (typeof req.body?.pinned !== 'boolean') {
+      return res.status(400).json({ error: 'pinned must be a boolean' });
+    }
+    const updated = setPinned(db, row.id, req.body.pinned, req.user.id);
+    audit('learning.version.pin', 'learning_skill_version', row.id, req.user.id, {
+      target_user: targetUser, pinned: req.body.pinned,
+    });
+    logger.info(`Learning skill version ${req.body.pinned ? 'pinned' : 'unpinned'}: ${row.id}`);
+    res.json({ id: updated.id, pinned: updated.pinned === 1 });
+  });
+
+  // Restore a version: clears stale/archived/quarantined flags.
+  router.post('/learning/skill-versions/:id/restore', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const row = getOwnedVersion(req.params.id, targetUser);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const updated = restoreVersion(db, row.id, req.user.id);
+    if (!updated) return res.status(404).json({ error: 'not found' });
+    audit('learning.version.restore', 'learning_skill_version', row.id, req.user.id, { target_user: targetUser });
+    logger.info(`Learning skill version restored: ${row.id}`);
+    res.json({ id: updated.id, archived: 0, stale: 0, quarantined: 0 });
+  });
+
+  // Effective curator config + prune gating status for the user.
+  router.get('/learning/curator/config', authMiddleware, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    res.json({
+      config: {
+        ...curatorConfig(),
+        prune_eligible: pruneEligible(db, targetUser),
+        reviewed_dry_runs: reviewedDryRunCount(db, targetUser),
+      },
+    });
   });
 
   return router;

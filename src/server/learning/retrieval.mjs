@@ -152,8 +152,10 @@ export function routeScore({ similarity, triggerMatch, successRate: sr, recency,
 /**
  * Exclude versions that must not be routable. Input rows are
  * learning_skill_versions rows joined with the candidate's risk_tier
- * (and candidate title). Never throws: a version that fails filtering
- * itself is excluded with reason 'filter_error'.
+ * (and candidate title). Phase 6 curator flags (stale/archived/
+ * quarantined) also exclude a version from routing. Never throws: a
+ * version that fails filtering itself is excluded with reason
+ * 'filter_error'.
  *
  * @returns {{ kept: object[], excluded: Array<{versionId, reason}> }}
  */
@@ -173,6 +175,15 @@ export function hardFilter({ db, userId, versions, logger = null }) {
         // Only Haz-activated versions are routable. State also covers
         // rolled_back / superseded / approved / compiled / tested.
         reason = `inactive_state:${v.state ?? 'null'}`;
+      } else if (v.stale === 1 || v.stale === true) {
+        // Phase 6 curator: marked stale — out of routing until restored.
+        reason = 'curator_stale';
+      } else if (v.archived === 1 || v.archived === true) {
+        // Phase 6 curator: archived — reversible flag, not routed.
+        reason = 'curator_archived';
+      } else if (v.quarantined === 1 || v.quarantined === true) {
+        // Phase 6 curator: quarantined — failing, not routed until restored.
+        reason = 'curator_quarantined';
       } else if (String(v.risk_tier ?? '').toLowerCase() === 'high') {
         reason = 'high_risk_tier';
       } else if (v.requires_docker && !isDockerAvailable()) {
