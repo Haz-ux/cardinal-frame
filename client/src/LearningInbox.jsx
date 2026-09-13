@@ -13,6 +13,7 @@ import {
   Inbox, FlaskConical, CheckCircle2, XCircle, Sparkles,
   Pencil, ArrowLeft, RefreshCw, Loader,
   Network, GitMerge, Cpu, ShieldCheck, Play, RotateCcw, FileCode2, Hammer,
+  Route, Gauge, Power,
 } from 'lucide-react';
 
 const TABS = [
@@ -22,6 +23,7 @@ const TABS = [
   { key: 'promoted', label: 'PROMOTED' },
   { key: 'clusters', label: 'CLUSTERS' },
   { key: 'compiled', label: 'COMPILED' },
+  { key: 'routing', label: 'ROUTING' },
 ];
 
 // Phase 3 — semantic clustering pipeline steps (approved preview content).
@@ -69,6 +71,45 @@ const COMPILER_SAFETY_RAILS = [
   { title: 'High-risk → Docker only.', body: 'If the compiler emits executable code with elevated capabilities, it only ever executes inside a container — never on the host.' },
   { title: 'Still no live routing.', body: "After Phase 4, Cardinal Frame can produce a tested, reviewable skill — but live requests still don't flow through learned skills. That's Phase 5, and it's your call." },
 ];
+
+// ════════════════════════════════════════════════════════════════════
+// PHASE 5 — RETRIEVAL & SHADOW ROUTING (Routing tab)
+// ════════════════════════════════════════════════════════════════════
+// Phase 5 — retrieval pipeline steps (approved preview content, static).
+const RETRIEVAL_PIPELINE = [
+  { n: '1 · Hard filters', d: 'Owner, role, tool access, risk tier, enabled state. Wrong owner or denied tool = removed before ranking. No score can bypass this.' },
+  { n: '2 · Rank', d: 'Top-3 metadata by route_score. Full procedure loads only for the winner — progressive disclosure, prompt stays lean.' },
+  { n: '3 · Shadow', d: 'Log what would have happened. Execute the normal path. Compare later.' },
+];
+
+// Phase 5 — safety rails (approved preview content, static).
+const ROUTING_SAFETY_RAILS = [
+  { title: 'Shadow first, always.', body: 'The router scores and logs for at least one representative workload window before live routing is even discussable. Thresholds get tuned against false matches, not vibes.' },
+  { title: 'Checksums.', body: "The loaded version's hash must match the approved version's hash. Tamper or drift → refused, logged, normal path." },
+  { title: 'Progressive disclosure.', body: "Only compact metadata enters the prompt for ranking; the full procedure loads solely for the selected winner. Learned skills don't bloat every request." },
+];
+
+// Shadow-decision outcomes → chips. FILTERED_ALL is red: nothing survived
+// hard filters; FALLBACK gray: ranked but declined to route.
+const DECISION_STYLE = {
+  shadow_routed:   { label: 'SHADOW ROUTED', color: NEON.yellow },
+  fallback_normal: { label: 'FALLBACK',      color: '#8b94a7' },
+  filtered_all:    { label: 'FILTERED ALL',  color: NEON.red },
+};
+
+// Kill-switch flags. Env-configured server-side — toggles here are display
+// only. Names follow the LEARNING_<flag>_ENABLED pattern (capture confirmed
+// as LEARNING_CAPTURE_ENABLED; review/retrieval/curator per backend docs).
+const KILL_FLAGS = [
+  { key: 'capture',   label: 'capture',   desc: 'record learning events',   env: 'LEARNING_CAPTURE_ENABLED' },
+  { key: 'review',    label: 'review',    desc: 'reviewer + candidates',    env: 'LEARNING_REVIEW_ENABLED' },
+  { key: 'retrieval', label: 'retrieval', desc: 'shadow routing + scoring', env: 'LEARNING_RETRIEVAL_ENABLED' },
+  { key: 'curator',   label: 'curator',   desc: 'phase 6 — not built yet',  env: 'LEARNING_CURATOR_ENABLED' },
+];
+
+// Score components the ranking formula can emit (preview order). The API
+// currently returns only totals; components are rendered only if present.
+const SCORE_COMPONENTS = ['semantic', 'trigger', 'success', 'recency', 'affinity', 'penalty'];
 
 const VERSION_KIND_STYLE = {
   prompt_template: { label: 'PROMPT TEMPLATE', color: NEON.cyan },
@@ -171,6 +212,17 @@ export default function LearningInbox() {
   const [showFullArtifact, setShowFullArtifact] = useState({}); // version id -> bool
   const [compiling, setCompiling] = useState(false); // candidate→version compile in flight
   const [compileNotice, setCompileNotice] = useState(null);
+
+  // ── Phase 5: retrieval & shadow routing ──
+  const [decisions, setDecisions] = useState([]);
+  const [decisionsLoading, setDecisionsLoading] = useState(false);
+  const [routingError, setRoutingError] = useState(null);
+  const [routingStats, setRoutingStats] = useState(null); // { versions: [], totals: {} }
+  const [flags, setFlags] = useState(null); // { capture, review, retrieval, curator }
+  const [openDecision, setOpenDecision] = useState(null);
+  const [feedbacking, setFeedbacking] = useState(null); // `${decisionId}:${ledger}` in flight
+  const [feedbackNotice, setFeedbackNotice] = useState(null);
+  const [flagNote, setFlagNote] = useState(null); // flag key whose env note is shown
 
   const refresh = useCallback(async () => {
     try {
@@ -285,6 +337,59 @@ export default function LearningInbox() {
   }, [tab, refreshVersions]);
 
   usePolling(refreshVersions, 30000, tab === 'compiled' && openVersion === null && versionActioning === null);
+
+  // ── Phase 5: routing data (decisions + per-version stats + kill flags) ──
+  // Each endpoint degrades independently — a missing backend piece leaves an
+  // empty panel instead of failing the whole tab.
+  const refreshRouting = useCallback(async () => {
+    setDecisionsLoading(true);
+    try {
+      const [dData, sData, fData] = await Promise.all([
+        cachedFetch('/api/learning/routing/decisions').catch(() => null),
+        cachedFetch('/api/learning/routing/stats').catch(() => null),
+        cachedFetch('/api/learning/retrieval/flags').catch(() => null),
+      ]);
+      setDecisions(Array.isArray(dData?.decisions) ? dData.decisions : []);
+      setRoutingStats(sData || null);
+      setFlags(fData?.flags || null);
+      if (!dData) setRoutingError('Shadow-decision log unavailable — backend endpoint not responding.');
+      else setRoutingError(null);
+    } catch (err) {
+      console.error('LearningInbox routing refresh error:', err);
+      setRoutingError(err.message || 'Failed to load routing data');
+    } finally {
+      setDecisionsLoading(false);
+    }
+  }, []);
+
+  // Fetch routing data when the ROUTING tab is selected.
+  useEffect(() => {
+    if (tab === 'routing') refreshRouting();
+  }, [tab, refreshRouting]);
+
+  usePolling(refreshRouting, 30000, tab === 'routing' && openDecision === null && feedbacking === null);
+
+  // Phase 5 — feedback on a shadow decision. Route and execution ledgers are
+  // separate: route feedback tunes the retriever, execution feedback tunes
+  // the skill's own confidence. Never merged.
+  const handleFeedback = async (decisionId, ledger, positive) => {
+    if (!decisionId || feedbacking) return;
+    setFeedbacking(`${decisionId}:${ledger}`);
+    setFeedbackNotice(null);
+    try {
+      await authedFetch(`/api/learning/routing/decisions/${decisionId}/feedback`, {
+        method: 'POST',
+        body: JSON.stringify({ ledger, positive }),
+      });
+      const kind = ledger === 'route' ? 'Route' : 'Execution';
+      setFeedbackNotice(`${kind} feedback recorded: ${positive ? 'positive' : 'negative'}.`);
+    } catch (err) {
+      console.error('LearningInbox feedback error:', err);
+      setFeedbackNotice(`⚠ Feedback failed: ${err.message || 'unknown error'}`);
+    } finally {
+      setFeedbacking(null);
+    }
+  };
 
   const toggleVersion = async (id) => {
     const opening = openVersion !== id;
@@ -1024,6 +1129,533 @@ export default function LearningInbox() {
     );
   };
 
+  // ══════════════════════════════════════════════════════════════
+  // PHASE 5 — ROUTING TAB COMPONENTS
+  // ══════════════════════════════════════════════════════════════
+
+  // Phase 5: score bar (cyan) — same visual pattern as SimBar. value 0..1.
+  const ScoreBar = ({ label, value }) => {
+    const v = Number(value);
+    const finite = Number.isFinite(v);
+    const pct = finite ? Math.max(0, Math.min(100, Math.round(v * 100))) : 0;
+    return (
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-hud shrink-0 w-[104px]" style={{ color: '#555' }}>
+          {label}
+        </span>
+        <div className="h-1.5 flex-1 overflow-hidden" style={{ background: `${NEON.cyan}12` }}>
+          <div
+            className="h-full transition-all duration-500"
+            style={{ width: `${pct}%`, background: NEON.cyan, boxShadow: `0 0 6px ${NEON.cyan}` }}
+          />
+        </div>
+        <span className="text-[10px] font-mono w-9 text-right shrink-0" style={{ color: NEON.cyan }}>
+          {finite ? v.toFixed(2) : '—'}
+        </span>
+      </div>
+    );
+  };
+
+  // Phase 5: shadow-routing decision card (tap-to-expand).
+  // The API returns totals (winner/runner-up/margin); per-component scores
+  // are rendered only if the response actually includes them — never invented.
+  const DecisionCard = ({ d }) => {
+    if (!d || typeof d !== 'object') return null;
+    const open = openDecision === d.id;
+    const style = DECISION_STYLE[d.decision]
+      || { label: String(d.decision || 'UNKNOWN').toUpperCase(), color: '#8b94a7' };
+    const excerpt = d.request_excerpt || 'No request excerpt recorded.';
+    const ws = Number(d.winner_score);
+    const rs = Number(d.runner_up_score);
+    let margin = Number(d.margin);
+    if (!Number.isFinite(margin) && Number.isFinite(ws) && Number.isFinite(rs)) margin = ws - rs;
+    const comps = (d.score_components && typeof d.score_components === 'object') ? d.score_components
+      : (d.components && typeof d.components === 'object') ? d.components : null;
+    const hasComps = comps && SCORE_COMPONENTS.some(k => comps[k] != null);
+    const kind = VERSION_KIND_STYLE[d.winner_kind] || null;
+    const busy = feedbacking && String(feedbacking).startsWith(`${d.id}:`)
+      ? String(feedbacking).split(':')[1]
+      : null;
+
+    const fbBtn = (ledger, positive, label, color) => (
+      <button
+        key={`${ledger}-${positive}`}
+        onClick={() => handleFeedback(d.id, ledger, positive)}
+        disabled={busy !== null}
+        className="flex-1 min-w-[100px] py-3 chamfer-sm text-[11px] tracking-wider font-hud uppercase font-bold transition-all"
+        style={{
+          background: `${color}10`,
+          border: `1px solid ${color}`,
+          color,
+          opacity: busy !== null ? 0.4 : 1,
+          cursor: busy !== null ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {busy === ledger ? <Loader size={12} className="animate-spin inline" /> : null}
+        {' '}{busy === ledger ? 'Sending…' : label}
+      </button>
+    );
+
+    return (
+      <div
+        className="chamfer-sm"
+        style={{ background: BG.surface, border: `1px solid ${NEON.yellow}25` }}
+      >
+        <button
+          onClick={() => setOpenDecision(open ? null : d.id)}
+          className="p-3 flex flex-col gap-2 text-left w-full"
+          style={{ cursor: 'pointer', minHeight: '40px' }}
+        >
+          <span className="text-[13px] italic" style={{ color: '#a9c1e8' }}>
+            “{excerpt}”
+          </span>
+          <div className="flex gap-1.5 flex-wrap items-center">
+            <Chip color={style.color}>{style.label}</Chip>
+            {kind && <Chip color={kind.color}>KIND · {kind.label}</Chip>}
+            <span className="text-[10px] font-hud ml-auto" style={{ color: '#555' }}>
+              {fmtDate(d.created_at)}
+            </span>
+          </div>
+          <div className="text-[13px]" style={{ color: '#dbe2f1' }}>
+            Winner: <b style={{ color: NEON.cyan }}>{d.winner_title || '—'}</b>{' '}
+            <span className="font-mono text-[12px]" style={{ color: NEON.cyan }}>
+              {Number.isFinite(ws) ? ws.toFixed(2) : '—'}
+            </span>
+            <span className="text-[11px]" style={{ color: '#555' }}>
+              {' '}· runner-up {Number.isFinite(rs) ? rs.toFixed(2) : '—'}
+              {' '}· margin {Number.isFinite(margin) ? margin.toFixed(2) : '—'}
+            </span>
+          </div>
+          <span className="text-[10px] font-hud" style={{ color: '#555' }}>
+            Tap to {open ? 'collapse ▲' : 'expand ▾'}
+          </span>
+        </button>
+
+        {open && (
+          <div
+            className="px-3 pb-3 flex flex-col gap-2.5"
+            style={{ borderTop: `1px solid ${NEON.yellow}15`, paddingTop: '12px' }}
+          >
+            {d.decision === 'fallback_normal' && d.fallback_reason && (
+              <div
+                className="chamfer-sm p-3 text-[12px]"
+                style={{ background: `${NEON.yellow}05`, border: `1px dashed ${NEON.yellow}50`, color: '#8b94a7' }}
+              >
+                <b style={{ color: NEON.yellow }}>Fallback reason:</b> {d.fallback_reason}
+              </div>
+            )}
+            {d.decision === 'filtered_all' && (
+              <p className="text-[12px] m-0" style={{ color: '#8b94a7' }}>
+                Every candidate was removed by hard filters before ranking — the normal agent path ran instead.
+              </p>
+            )}
+
+            <div className="text-[10px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.cyan }}>
+              ◇ Score breakdown
+            </div>
+            {Number.isFinite(ws) && <ScoreBar label="winner" value={ws} />}
+            {Number.isFinite(rs) && <ScoreBar label="runner-up" value={rs} />}
+            {hasComps ? (
+              <div className="flex flex-col gap-1.5">
+                {SCORE_COMPONENTS.map(k => comps[k] != null && (
+                  <ScoreBar key={k} label={k} value={comps[k]} />
+                ))}
+              </div>
+            ) : (
+              <p className="text-[11px] m-0 font-hud" style={{ color: '#555' }}>
+                Per-component scores (semantic / trigger / success / recency / affinity / penalty) come from
+                the ranking formula and aren't included in this response — totals only.
+              </p>
+            )}
+
+            <div className="text-[10px] tracking-widest uppercase font-hud font-bold mt-1" style={{ color: NEON.purple }}>
+              ◇ Feedback — two ledgers
+            </div>
+            <div className="flex flex-col gap-2">
+              <div>
+                <div className="text-[11px] font-hud mb-1.5" style={{ color: NEON.cyan }}>
+                  ROUTE · did the retriever pick the right skill?
+                </div>
+                <div className="flex gap-2">
+                  {fbBtn('route', true, '✓ Helpful pick', NEON.green)}
+                  {fbBtn('route', false, '✗ Wrong pick', NEON.red)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-hud mb-1.5" style={{ color: NEON.purple }}>
+                  EXECUTION · did the skill itself work?
+                </div>
+                <div className="flex gap-2">
+                  {fbBtn('execution', true, '✓ Worked', NEON.green)}
+                  {fbBtn('execution', false, '✗ Broke', NEON.red)}
+                </div>
+              </div>
+            </div>
+            <p className="text-[10px] m-0" style={{ color: '#555' }}>
+              Route feedback tunes the retriever only; execution feedback tunes the skill's confidence only.
+              A bad pick must not poison a good skill's record.
+            </p>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Phase 5: display-only kill-switch toggle visual.
+  const FlagToggle = ({ on }) => (
+    <div
+      aria-hidden
+      style={{
+        width: 44, height: 24, flexShrink: 0, position: 'relative',
+        background: on ? `${NEON.green}25` : 'rgba(139,148,167,.15)',
+        border: `1px solid ${on ? NEON.green : '#555'}`,
+      }}
+    >
+      <div
+        style={{
+          position: 'absolute', top: 2, width: 18, height: 18,
+          ...(on ? { right: 2 } : { left: 2 }),
+          background: on ? NEON.green : '#555',
+          boxShadow: on ? `0 0 6px ${NEON.green}` : 'none',
+        }}
+      />
+    </div>
+  );
+
+  const fmtPct = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '—';
+  };
+
+  const fmt2 = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n.toFixed(2) : '—';
+  };
+
+  // ── Phase 5: the whole Routing tab ──
+  const RoutingTab = () => {
+    const totals = routingStats?.totals || {};
+    const vstats = Array.isArray(routingStats?.versions) ? routingStats.versions : [];
+
+    return (
+      <>
+        {/* ══ PHASE 5: RETRIEVAL & SHADOW ROUTING ══ */}
+        <div className="flex items-start justify-between flex-wrap gap-3">
+          <div>
+            <h2
+              className="flex items-center gap-2 text-lg font-bold tracking-wider font-hud"
+              style={{ color: NEON.cyan, filter: `drop-shadow(0 0 8px ${NEON.cyan}60)` }}
+            >
+              ◈ Retrieval & shadow routing
+            </h2>
+            <p className="text-[11px] mt-1" style={{ color: '#555' }}>
+              Phase 5 — learned skills meet live requests (carefully): score, don't steer
+            </p>
+            <div className="flex gap-2 mt-2.5 flex-wrap">
+              <span
+                className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                style={{ background: `${NEON.yellow}10`, color: NEON.yellow, border: `1px solid ${NEON.yellow}40` }}
+              >
+                ◉ shadow mode first
+              </span>
+              <span
+                className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                style={{ background: `${NEON.cyan}10`, color: NEON.cyan, border: `1px solid ${NEON.cyan}35` }}
+              >
+                scores, doesn't steer — yet
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={refreshRouting}
+            disabled={decisionsLoading}
+            className="flex items-center gap-2 px-4 py-2 chamfer-sm text-[11px] font-bold tracking-wide font-hud uppercase transition-all"
+            style={{
+              background: `${NEON.yellow}12`,
+              border: `1px solid ${NEON.yellow}40`,
+              color: NEON.yellow,
+              opacity: decisionsLoading ? 0.5 : 1,
+              cursor: decisionsLoading ? 'not-allowed' : 'pointer',
+              boxShadow: `0 0 12px ${NEON.yellow}20`,
+              minHeight: '40px',
+            }}
+          >
+            {decisionsLoading ? <Loader size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+            {decisionsLoading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
+
+        {routingError && (
+          <div
+            className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+            style={{ background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }}
+          >
+            ⚠ {routingError}
+          </div>
+        )}
+
+        {feedbackNotice && (
+          <div
+            className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+            style={
+              feedbackNotice.startsWith('⚠')
+                ? { background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }
+                : { background: `${NEON.green}06`, border: `1px solid ${NEON.green}40`, color: NEON.green }
+            }
+          >
+            {feedbackNotice}
+          </div>
+        )}
+
+        {/* Two-stage retrieval pipeline (static, approved preview content) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+        >
+          <div className="px-4 py-3" style={{ borderBottom: `1px solid ${NEON.cyan}12` }}>
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+              ◇ Two-stage retrieval
+            </span>
+          </div>
+          <div className="p-3 flex flex-wrap items-stretch gap-1.5">
+            {RETRIEVAL_PIPELINE.map((s, i) => (
+              <div key={s.n} className="flex items-stretch gap-1.5 flex-1 min-w-[130px]">
+                <div
+                  className="chamfer-sm p-2.5 flex-1"
+                  style={{ background: BG.surface, border: `1px solid ${NEON.cyan}15` }}
+                >
+                  <div className="text-[12px] font-bold font-hud" style={{ color: NEON.cyan }}>{s.n}</div>
+                  <div className="text-[10px] mt-1" style={{ color: '#8b94a7' }}>{s.d}</div>
+                </div>
+                {i < RETRIEVAL_PIPELINE.length - 1 && (
+                  <span className="self-center shrink-0" style={{ color: NEON.cyan }}>→</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Shadow decision log */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.yellow}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.yellow}12` }}
+          >
+            <Route size={13} style={{ color: NEON.yellow }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.yellow }}>
+              ◇ Shadow decision log
+            </span>
+            <span
+              className="ml-auto text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.yellow}12`, color: NEON.yellow }}
+            >
+              {decisions.length} decisions
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            {decisionsLoading && decisions.length === 0 && (
+              <div className="flex items-center justify-center py-10 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                <Loader size={16} className="animate-spin" /> Loading shadow decisions…
+              </div>
+            )}
+            {!decisionsLoading && decisions.length === 0 && (
+              <div className="text-center py-10 text-[11px] font-hud" style={{ color: '#444' }}>
+                <Route size={20} className="mx-auto mb-2" style={{ color: '#333' }} />
+                No shadow decisions logged yet — they appear once the router scores live requests.
+              </div>
+            )}
+            {decisions.map((d, di) => <DecisionCard key={d?.id || `decision-${di}`} d={d} />)}
+          </div>
+        </div>
+
+        {/* Outcome attribution (static, approved preview content) */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.purple}20` }}
+        >
+          <div className="px-4 py-3" style={{ borderBottom: `1px solid ${NEON.purple}12` }}>
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.purple }}>
+              ◇ Outcome attribution · two ledgers
+            </span>
+          </div>
+          <div className="flex flex-col gap-2 p-3 md:flex-row">
+            <div className="chamfer-sm p-3 flex-1" style={{ background: BG.surface, border: `1px solid ${NEON.cyan}12` }}>
+              <div className="text-[10px] tracking-widest uppercase font-hud font-bold mb-1.5" style={{ color: NEON.cyan }}>
+                Route feedback
+              </div>
+              <ul className="m-0 pl-4 text-[11px] flex flex-col gap-1" style={{ color: '#8b94a7' }}>
+                <li>Did the retriever pick the right skill?</li>
+                <li>Updates routing stats only</li>
+              </ul>
+            </div>
+            <div className="chamfer-sm p-3 flex-1" style={{ background: BG.surface, border: `1px solid ${NEON.purple}12` }}>
+              <div className="text-[10px] tracking-widest uppercase font-hud font-bold mb-1.5" style={{ color: NEON.purple }}>
+                Execution feedback
+              </div>
+              <ul className="m-0 pl-4 text-[11px] flex flex-col gap-1" style={{ color: '#8b94a7' }}>
+                <li>Did the skill itself work?</li>
+                <li>Updates execution confidence only</li>
+              </ul>
+            </div>
+          </div>
+          <p className="text-[11px] font-hud px-3 pb-3 m-0" style={{ color: '#555' }}>
+            A bad pick must not poison a good skill's record, and a good pick must not excuse a bad execution.
+            The two ledgers stay separate — otherwise one failure corrupts two different models.
+          </p>
+        </div>
+
+        {/* Per-version routing stats */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.green}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.green}12` }}
+          >
+            <Gauge size={13} style={{ color: NEON.green }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.green }}>
+              ◇ Routing stats by version
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            <div
+              className="chamfer-sm p-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[11px] font-hud"
+              style={{ background: BG.surface, border: `1px dashed ${NEON.green}60`, color: '#8b94a7' }}
+            >
+              <span>total decisions <b style={{ color: NEON.green }}>{num(totals.total_decisions)}</b></span>
+              <span>fallback rate <b style={{ color: NEON.green }}>{fmtPct(totals.fallback_rate)}</b></span>
+              <span>avg margin <b style={{ color: NEON.green }}>{fmt2(totals.avg_margin)}</b></span>
+            </div>
+            {vstats.length === 0 && (
+              <div className="text-center py-8 text-[11px] font-hud" style={{ color: '#444' }}>
+                No per-version stats yet — stats accumulate as shadow decisions land.
+              </div>
+            )}
+            {vstats.map((vs, vi) => (
+              <div
+                key={vs?.version_id || `vstat-${vi}`}
+                className="chamfer-sm p-3 flex flex-col gap-1.5"
+                style={{ background: BG.surface, border: `1px solid ${NEON.green}12` }}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px]" style={{ color: '#dbe2f1' }}>
+                    {vs?.title || `version ${String(vs?.version_id || '').slice(0, 8)}`}
+                  </span>
+                  <span className="text-[10px] font-hud ml-auto shrink-0" style={{ color: '#555' }}>
+                    {String(vs?.version_id || '').slice(0, 8)}
+                  </span>
+                </div>
+                <ConfidenceBar confidence={vs?.success_rate} />
+                <div className="flex gap-3 text-[10px] font-hud flex-wrap" style={{ color: '#555' }}>
+                  <span>routed <b style={{ color: '#8b94a7' }}>{num(vs?.routed_count)}</b></span>
+                  <span><span style={{ color: NEON.green }}>✓</span> success <b style={{ color: '#8b94a7' }}>{num(vs?.success_count)}</b></span>
+                  <span><span style={{ color: NEON.red }}>✗</span> failure <b style={{ color: '#8b94a7' }}>{num(vs?.failure_count)}</b></span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Kill switches */}
+        <div
+          className="chamfer-md overflow-hidden"
+          style={{ background: BG.card, border: `1px solid ${NEON.red}20` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center gap-2"
+            style={{ borderBottom: `1px solid ${NEON.red}12` }}
+          >
+            <Power size={13} style={{ color: NEON.red }} />
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.red }}>
+              ◇ Kill switches
+            </span>
+            <span
+              className="ml-auto text-[10px] font-hud px-2 py-0.5"
+              style={{ background: `${NEON.red}12`, color: NEON.red }}
+            >
+              independent flags
+            </span>
+          </div>
+          <div className="p-3 flex flex-col gap-2">
+            {KILL_FLAGS.map(f => {
+              const on = Boolean(flags?.[f.key]);
+              const noted = flagNote === f.key;
+              return (
+                <div
+                  key={f.key}
+                  className="chamfer-sm"
+                  style={{ background: BG.surface, border: `1px solid ${NEON.cyan}12` }}
+                >
+                  <button
+                    onClick={() => setFlagNote(noted ? null : f.key)}
+                    className="w-full flex items-center gap-2.5 p-3 text-left"
+                    style={{ cursor: 'pointer', minHeight: '40px' }}
+                  >
+                    <span className="flex-1">
+                      <span className="text-[13px]" style={{ color: '#dbe2f1' }}>{f.label}</span>
+                      <span className="block text-[10px]" style={{ color: '#555' }}>{f.desc}</span>
+                    </span>
+                    <FlagToggle on={on} />
+                  </button>
+                  {noted && (
+                    <div className="px-3 pb-3">
+                      <div
+                        className="chamfer-sm p-2.5 text-[11px] font-hud"
+                        style={{ background: `${NEON.yellow}06`, border: `1px dashed ${NEON.yellow}50`, color: '#8b94a7' }}
+                      >
+                        Env-configured: <b style={{ color: NEON.yellow }}>{f.env}</b> — restart to change.
+                        This toggle is display-only; tapping never flips it.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="px-3 pb-3">
+            <div
+              className="chamfer-sm p-3 text-[12px]"
+              style={{ background: BG.surface, border: `1px solid ${NEON.yellow}30`, color: '#8b94a7' }}
+            >
+              <b style={{ color: NEON.yellow }}>Kill-switch behavior.</b> Disabling retrieval restores the
+              normal agent path instantly — approved skills stay stored, nothing is deleted, and re-enabling
+              picks up where it left off.
+            </div>
+            <p className="text-[10px] font-hud mt-2 mb-0" style={{ color: '#555' }}>
+              Flag state reads from the server. Var names follow the LEARNING_&lt;flag&gt;_ENABLED pattern
+              (capture confirmed as LEARNING_CAPTURE_ENABLED).
+            </p>
+          </div>
+        </div>
+
+        {/* Safety rails (static, approved preview content) */}
+        <div
+          className="chamfer-md p-4 flex flex-col gap-2"
+          style={{ background: BG.card, border: `1px solid ${NEON.yellow}25` }}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.yellow }}>
+              ◇ Safety rails
+            </span>
+          </div>
+          {ROUTING_SAFETY_RAILS.map((r) => (
+            <div
+              key={r.title}
+              className="chamfer-sm p-3 text-[12px]"
+              style={{ background: BG.surface, border: `1px solid ${NEON.yellow}25`, color: '#8b94a7' }}
+            >
+              <b style={{ color: NEON.yellow }}>{r.title}</b> {r.body}
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  };
+
   const latestJob = jobs[0];
   const budgetUsed = num(latestJob?.budget_used);
   const budgetLimit = num(latestJob?.budget_limit) || 20;
@@ -1301,7 +1933,10 @@ export default function LearningInbox() {
           <div className="flex gap-2 flex-wrap">
             {TABS.map(t => {
               const active = tab === t.key;
-              const tabCount = t.key === 'clusters' ? clusters.length : t.key === 'compiled' ? versions.length : (lists[t.key] || []).length;
+              const tabCount = t.key === 'clusters' ? clusters.length
+                : t.key === 'compiled' ? versions.length
+                : t.key === 'routing' ? decisions.length
+                : (lists[t.key] || []).length;
               return (
                 <button
                   key={t.key}
@@ -1654,6 +2289,8 @@ export default function LearningInbox() {
                 ))}
               </div>
             </>
+          ) : tab === 'routing' ? (
+            <RoutingTab />
           ) : (
             <>
               {/* Candidate panel */}
