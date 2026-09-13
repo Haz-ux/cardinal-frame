@@ -34,6 +34,13 @@ import {
   backfillLegacyClusters,
   MERGEABLE_STATES,
 } from '../learning/cluster.mjs';
+import {
+  compile as compileVersion,
+  runTests,
+  scanArtifact,
+  recordVersionEvent,
+  VERSION_STATES,
+} from '../learning/compiler.mjs';
 
 // API state filter → DB state. `review` is the visible untrusted queue
 // (DB state 'candidate').
@@ -100,7 +107,7 @@ function toJob(j) {
 }
 
 export default function learningRoutes(ctx) {
-  const { db, stmts, logger, audit, authMiddleware, apiLimiter } = ctx;
+  const { db, stmts, logger, audit, auditLog, authMiddleware, requireRole, apiLimiter, executeSkill } = ctx;
   const router = express.Router();
 
   // Owner-scoped; admins may pass ?user_id= to act for another user.
@@ -442,6 +449,217 @@ export default function learningRoutes(ctx) {
       logger.error(`Learning legacy backfill threw: ${err.message}`);
       res.status(500).json({ error: 'Backfill failed' });
     }
+  });
+
+  // ─── Skill versions (Phase 4 compiler, shadow mode) ──────────────
+  // Versions are IMMUTABLE: compile creates version_number+1; there is no
+  // edit endpoint. Even an 'active' version is DISABLED — nothing executes.
+
+  function parseVersionJson(value, fallback = null) {
+    try {
+      const v = JSON.parse(value);
+      return v === undefined ? fallback : v;
+    } catch { return fallback; }
+  }
+
+  // List/detail projection for skill versions (frozen API contract).
+  function toVersionListItem(row, candidateTitle) {
+    const testReport = parseVersionJson(row.test_report);
+    const scanner = parseVersionJson(row.scanner_verdict);
+    return {
+      id: row.id,
+      candidate_id: row.candidate_id,
+      candidate_title: candidateTitle ?? null,
+      version_number: row.version_number,
+      kind: row.kind,
+      state: row.state,
+      content_hash: row.content_hash ? String(row.content_hash).slice(0, 12) : null,
+      rationale: row.rationale,
+      requires_docker: row.requires_docker === 1 || row.requires_docker === true,
+      test_summary: testReport
+        ? { passed: testReport.passed ?? 0, failed: testReport.failed ?? 0 }
+        : null,
+      scanner: scanner
+        ? { verdict: scanner.verdict || null, blocked: scanner.blocked === true }
+        : null,
+      created_at: row.created_at,
+    };
+  }
+
+  function toVersionDetail(row, candidateTitle) {
+    const history = db.prepare(`SELECT action, actor, created_at
+      FROM learning_version_events WHERE version_id = ?
+      ORDER BY created_at ASC, rowid ASC`).all(row.id);
+    return {
+      ...toVersionListItem(row, candidateTitle),
+      spec: parseVersionJson(row.spec, {}),
+      artifact: row.artifact,
+      test_report: parseVersionJson(row.test_report),
+      scanner_verdict: parseVersionJson(row.scanner_verdict),
+      history: history.map(h => ({ action: h.action, actor: h.actor, created_at: h.created_at })),
+    };
+  }
+
+  function getOwnedVersion(id, userId) {
+    return db.prepare(`SELECT v.*, c.title AS candidate_title
+      FROM learning_skill_versions v
+      JOIN learning_candidates c ON c.id = v.candidate_id
+      WHERE v.id = ? AND v.user_id = ?`).get(id, userId);
+  }
+
+  // Compile a promoted candidate: compile -> generateTests -> runTests ->
+  // scanArtifact (skipped when tests fail; failed versions never scan).
+  router.post('/learning/candidates/:id/compile', authMiddleware, apiLimiter, async (req, res) => {
+    const c = getCandidate(db, req.params.id, req.user.id);
+    if (!c) return res.status(404).json({ error: 'not found' });
+
+    let compiled;
+    try {
+      compiled = compileVersion(db, c.id, req.user.id);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!compiled.ok) {
+      // Invalid spec: quarantined — nothing was written.
+      return res.status(400).json({ error: 'spec invalid — quarantined, nothing written', errors: compiled.errors });
+    }
+
+    let version = compiled.version;
+    // Tests are generated from the stored spec inside runTests; the row is
+    // re-read after each stage so the projection reflects fresh state.
+    const testRes = await runTests(version);
+    version = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(version.id);
+
+    if (testRes.ok && testRes.report.failed === 0) {
+      await scanArtifact(version, { db, stmts, executeSkill, logger, auditLog });
+      version = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(version.id);
+    }
+
+    audit('learning.version.compile', 'learning_skill_version', version.id, req.user.id, {
+      candidate_id: c.id,
+      version_number: version.version_number,
+      kind: version.kind,
+      state: version.state,
+      tests_failed: testRes.ok ? testRes.report.failed > 0 : true,
+    });
+    logger.info(`Learning skill version compiled: ${version.id} (v${version.version_number}, ${version.kind}) -> ${version.state}`);
+    res.json({ version: toVersionListItem(version, c.title) });
+  });
+
+  // List versions, optionally filtered by state. Owner-scoped.
+  router.get('/learning/skill-versions', authMiddleware, (req, res) => {
+    const { state } = req.query;
+    if (state && !VERSION_STATES.includes(state)) {
+      return res.status(400).json({ error: `state must be one of ${VERSION_STATES.join('|')}` });
+    }
+    const rows = state
+      ? db.prepare(`SELECT v.*, c.title AS candidate_title
+          FROM learning_skill_versions v
+          JOIN learning_candidates c ON c.id = v.candidate_id
+          WHERE v.user_id = ? AND v.state = ?
+          ORDER BY v.created_at DESC, v.rowid DESC`).all(req.user.id, state)
+      : db.prepare(`SELECT v.*, c.title AS candidate_title
+          FROM learning_skill_versions v
+          JOIN learning_candidates c ON c.id = v.candidate_id
+          WHERE v.user_id = ?
+          ORDER BY v.created_at DESC, v.rowid DESC`).all(req.user.id);
+    res.json({ versions: rows.map(r => toVersionListItem(r, r.candidate_title)) });
+  });
+
+  // Version detail with spec, artifact, test report, scanner verdict, history.
+  router.get('/learning/skill-versions/:id', authMiddleware, (req, res) => {
+    const row = getOwnedVersion(req.params.id, req.user.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    res.json({ version: toVersionDetail(row, row.candidate_title) });
+  });
+
+  // Approve: scanned -> approved. Still DISABLED — nothing executes.
+  router.post('/learning/skill-versions/:id/approve', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const row = getOwnedVersion(req.params.id, targetUser);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    if (row.state !== 'scanned') {
+      return res.status(400).json({ error: 'only scanned versions can be approved' });
+    }
+    const report = parseVersionJson(row.test_report);
+    if (!report || report.failed > 0) {
+      return res.status(400).json({ error: 'version has a failing or missing test report' });
+    }
+    const scanner = parseVersionJson(row.scanner_verdict);
+    if (!scanner || scanner.blocked === true) {
+      return res.status(400).json({ error: 'version is blocked by the scanner gate' });
+    }
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE learning_skill_versions SET state = 'approved', updated_at = ?
+      WHERE id = ? AND user_id = ?`).run(now, row.id, targetUser);
+    recordVersionEvent(db, row.id, 'approved', req.user.id, {
+      disabled: true,
+      note: 'approved but DISABLED — shadow mode, nothing executes',
+    });
+    audit('learning.version.approve', 'learning_skill_version', row.id, req.user.id, {
+      target_user: targetUser, version_number: row.version_number, kind: row.kind,
+    });
+    logger.info(`Learning skill version approved (still disabled): ${row.id}`);
+    const updated = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(row.id);
+    res.json({ version: toVersionListItem(updated, row.candidate_title) });
+  });
+
+  // Activate: approved -> active. Atomic: any currently active version for
+  // the same candidate is rolled back first (exactly one active enforced).
+  router.post('/learning/skill-versions/:id/activate', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const row = getOwnedVersion(req.params.id, targetUser);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    if (row.state !== 'approved') {
+      return res.status(400).json({ error: 'only approved versions can be activated' });
+    }
+    const now = new Date().toISOString();
+    const tx = db.transaction(() => {
+      const actives = db.prepare(`SELECT id, version_number FROM learning_skill_versions
+        WHERE candidate_id = ? AND state = 'active' AND id != ?`).all(row.candidate_id, row.id);
+      for (const a of actives) {
+        db.prepare(`UPDATE learning_skill_versions SET state = 'rolled_back', updated_at = ?
+          WHERE id = ?`).run(now, a.id);
+        recordVersionEvent(db, a.id, 'rolled_back', req.user.id, {
+          reason: `superseded by activation of version ${row.version_number}`,
+        });
+      }
+      db.prepare(`UPDATE learning_skill_versions SET state = 'active', updated_at = ?
+        WHERE id = ? AND user_id = ?`).run(now, row.id, targetUser);
+      recordVersionEvent(db, row.id, 'activated', req.user.id, {
+        disabled: true,
+        note: 'active but DISABLED — shadow mode, nothing executes',
+      });
+      return actives.map(a => a.id);
+    });
+    const rolledBack = tx();
+    audit('learning.version.activate', 'learning_skill_version', row.id, req.user.id, {
+      target_user: targetUser, version_number: row.version_number, rolled_back: rolledBack,
+    });
+    logger.info(`Learning skill version activated (still disabled): ${row.id}; rolled back ${rolledBack.length}`);
+    const updated = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(row.id);
+    res.json({ version: toVersionListItem(updated, row.candidate_title), rolled_back: rolledBack });
+  });
+
+  // Rollback: active|approved -> rolled_back.
+  router.post('/learning/skill-versions/:id/rollback', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    const row = getOwnedVersion(req.params.id, targetUser);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    if (!['active', 'approved'].includes(row.state)) {
+      return res.status(400).json({ error: 'only active or approved versions can be rolled back' });
+    }
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE learning_skill_versions SET state = 'rolled_back', updated_at = ?
+      WHERE id = ? AND user_id = ?`).run(now, row.id, targetUser);
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 500) : '';
+    recordVersionEvent(db, row.id, 'rolled_back', req.user.id, { from_state: row.state, reason });
+    audit('learning.version.rollback', 'learning_skill_version', row.id, req.user.id, {
+      target_user: targetUser, version_number: row.version_number, from_state: row.state, reason,
+    });
+    logger.info(`Learning skill version rolled back: ${row.id} (was ${row.state})`);
+    const updated = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(row.id);
+    res.json({ version: toVersionListItem(updated, row.candidate_title) });
   });
 
   return router;
