@@ -5,13 +5,14 @@
 // API contract (backend): /api/learning/candidates?state=review|testing|
 // rejected|promoted, /candidates/:id, /candidates/:id/approve,
 // /candidates/:id/reject, /review/run, /review/jobs. Bearer from 'cf_token'.
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { NEON, BG } from './theme';
 import { cachedFetch, invalidateCache } from './dataCache';
 import { usePolling } from './usePolling';
 import {
   Inbox, FlaskConical, CheckCircle2, XCircle, Sparkles,
   Pencil, ArrowLeft, RefreshCw, Loader,
+  Network, GitMerge,
 } from 'lucide-react';
 
 const TABS = [
@@ -19,6 +20,22 @@ const TABS = [
   { key: 'testing', label: 'TESTING' },
   { key: 'rejected', label: 'REJECTED' },
   { key: 'promoted', label: 'PROMOTED' },
+  { key: 'clusters', label: 'CLUSTERS' },
+];
+
+// Phase 3 — semantic clustering pipeline steps (approved preview content).
+const PIPELINE_STEPS = [
+  { n: '1 · Signature', d: "Each candidate's title + draft → text signature" },
+  { n: '2 · Embed', d: "MiniLM 384-dim vector, on-device. Lexical fallback if the model can't load" },
+  { n: '3 · Cluster', d: 'Cosine similarity ≥ threshold joins a cluster' },
+  { n: '4 · Propose', d: 'Merge proposal lands in your inbox. You tap, it merges. Nothing auto-merges' },
+];
+
+// Phase 3 — safety rails (approved preview content).
+const SAFETY_RAILS = [
+  { title: 'Lexical fallback.', body: "If MiniLM can't load (no model, offline box), clustering falls back to token-overlap similarity — cruder, but the pipeline never breaks." },
+  { title: 'Legacy patterns, read-only.', body: 'Old threshold-promoted patterns get backfilled into clusters as reference only. They can inform merges but can never trigger one.' },
+  { title: 'Merge errors measured first.', body: "The clusterer runs in shadow mode, logging would-be merges. Auto-merge only ever becomes an option after the error rate is measured — and even then, only with your explicit opt-in." },
 ];
 
 const KIND_STYLE = {
@@ -93,6 +110,17 @@ export default function LearningInbox() {
   const [showReject, setShowReject] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
 
+  // ── Phase 3: semantic clustering ──
+  const [clusters, setClusters] = useState([]);
+  const [clustersLoading, setClustersLoading] = useState(false);
+  const [clusterError, setClusterError] = useState(null);
+  const [proposals, setProposals] = useState([]);
+  const [clusterStats, setClusterStats] = useState(null);
+  const [clustering, setClustering] = useState(false); // run clustering in flight
+  const [openCluster, setOpenCluster] = useState(null);
+  const [deciding, setDeciding] = useState(null); // merge proposal id in flight
+  const [mergeNotice, setMergeNotice] = useState(null);
+
   const refresh = useCallback(async () => {
     try {
       const [review, testing, rejected, promoted, jobsData] = await Promise.all([
@@ -119,6 +147,71 @@ export default function LearningInbox() {
   }, []);
 
   usePolling(refresh, 30000, !detail && !showEdit && !showReject);
+
+  // ── Phase 3: clustering data ──
+  const refreshClusters = useCallback(async () => {
+    setClustersLoading(true);
+    try {
+      const [cData, pData] = await Promise.all([
+        cachedFetch('/api/learning/clusters'),
+        cachedFetch('/api/learning/merge-proposals?state=proposed'),
+      ]);
+      setClusters(Array.isArray(cData?.clusters) ? cData.clusters : []);
+      setProposals(Array.isArray(pData?.proposals) ? pData.proposals : []);
+      setClusterError(null);
+    } catch (err) {
+      console.error('LearningInbox clusters refresh error:', err);
+      setClusterError(err.message || 'Failed to load clusters');
+    } finally {
+      setClustersLoading(false);
+    }
+  }, []);
+
+  // Fetch clusters when the CLUSTERS tab is selected.
+  useEffect(() => {
+    if (tab === 'clusters') refreshClusters();
+  }, [tab, refreshClusters]);
+
+  usePolling(refreshClusters, 30000, tab === 'clusters' && !detail && deciding === null);
+
+  const handleRunClustering = async () => {
+    if (clustering) return;
+    setClustering(true);
+    try {
+      const data = await authedFetch('/api/learning/cluster/run', { method: 'POST' });
+      if (data?.stats) setClusterStats(data.stats);
+      invalidateCache('/api/learning/clusters');
+      invalidateCache('/api/learning/merge-proposals?state=proposed');
+      await refreshClusters();
+    } catch (err) {
+      console.error('LearningInbox run clustering error:', err);
+      setClusterError(err.message || 'Clustering run failed');
+    } finally {
+      setClustering(false);
+    }
+  };
+
+  const handleProposalDecision = async (proposalId, action) => {
+    if (!proposalId || deciding) return;
+    setDeciding(proposalId);
+    try {
+      const data = await authedFetch(`/api/learning/merge-proposals/${proposalId}/${action}`, { method: 'POST' });
+      if (action === 'approve') {
+        const survivor = data?.survivor || {};
+        setMergeNotice(`Merged → "${survivor.title || survivor.id || 'survivor'}" — losers archived, evidence preserved.`);
+      } else {
+        setMergeNotice('Kept separate — the cluster stays as independent candidates.');
+      }
+      invalidateCache('/api/learning/clusters');
+      invalidateCache('/api/learning/merge-proposals?state=proposed');
+      await refreshClusters();
+    } catch (err) {
+      console.error('LearningInbox merge decision error:', err);
+      setClusterError(err.message || 'Merge decision failed');
+    } finally {
+      setDeciding(null);
+    }
+  };
 
   const invalidateLists = () => {
     for (const s of TABS) invalidateCache(`/api/learning/candidates?state=${s.key}`);
@@ -268,6 +361,30 @@ export default function LearningInbox() {
     );
   };
 
+  // ── Similarity bar (Phase 3) — same visual pattern as ConfidenceBar,
+  //    purple per the clustering preview. similarity 0..1 → percent.
+  const SimBar = ({ similarity, label }) => {
+    const raw = num(similarity);
+    const pct = Math.max(0, Math.min(100, Math.round(raw * 100)));
+    const color = NEON.purple;
+    return (
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-hud shrink-0 w-[104px]" style={{ color: '#555' }}>
+          {label || 'sim to centroid'}
+        </span>
+        <div className="h-1.5 flex-1 overflow-hidden" style={{ background: `${NEON.purple}12` }}>
+          <div
+            className="h-full transition-all duration-500"
+            style={{ width: `${pct}%`, background: color, boxShadow: `0 0 6px ${color}` }}
+          />
+        </div>
+        <span className="text-[10px] font-mono w-9 text-right shrink-0" style={{ color }}>
+          {raw.toFixed(2)}
+        </span>
+      </div>
+    );
+  };
+
   const Chip = ({ color, children }) => (
     <span
       className="text-[9px] font-semibold chamfer-sm px-2 py-0.5 font-hud uppercase"
@@ -301,6 +418,128 @@ export default function LearningInbox() {
           <span><span style={{ color: NEON.orange }}>✎</span> {num(c.support_corrections)} corrections</span>
         </div>
       </button>
+    );
+  };
+
+  // ── Phase 3: cluster card (tap-to-expand) ──
+  const ClusterCard = ({ cluster }) => {
+    const members = Array.isArray(cluster.members) ? cluster.members : [];
+    const memberCount = num(cluster.member_count) || members.length;
+    const legacy = Boolean(cluster.is_legacy_readonly);
+    const open = openCluster === cluster.id;
+    const proposal = proposals.find(p => p && p.cluster_id === cluster.id);
+    const support = proposal?.combined_support || {};
+    const proposalCount = num(proposal?.from_candidate_ids?.length) || memberCount;
+
+    return (
+      <div
+        className="chamfer-sm"
+        style={{ background: BG.surface, border: `1px solid ${NEON.purple}25` }}
+      >
+        <button
+          onClick={() => setOpenCluster(open ? null : cluster.id)}
+          className="p-3 flex flex-col gap-2 text-left w-full"
+          style={{ cursor: 'pointer', minHeight: '40px' }}
+        >
+          <span className="text-[15px] font-medium" style={{ color: '#dbe2f1' }}>
+            {cluster.label || 'Unnamed cluster'}
+          </span>
+          <div className="flex gap-1.5 flex-wrap">
+            {legacy ? (
+              <Chip color={NEON.yellow}>LEGACY · READ-ONLY</Chip>
+            ) : memberCount >= 2 ? (
+              <Chip color={NEON.green}>{memberCount} MEMBERS · MERGEABLE</Chip>
+            ) : (
+              <Chip color="#8b94a7">{memberCount} MEMBER · SINGLETON</Chip>
+            )}
+            {!legacy && memberCount >= 2 && (
+              <Chip color={NEON.green}>AVG SIM {num(cluster.avg_similarity).toFixed(2)}</Chip>
+            )}
+          </div>
+          <span className="text-[10px] font-hud" style={{ color: '#555' }}>
+            Tap to {open ? 'collapse ▲' : 'expand ▾'}
+          </span>
+        </button>
+
+        {open && (
+          <div
+            className="px-3 pb-3 flex flex-col gap-2"
+            style={{ borderTop: `1px solid ${NEON.purple}15`, paddingTop: '12px' }}
+          >
+            {members.map((m, i) => (
+              <div
+                key={m?.candidate_id || m?.title || i}
+                className="chamfer-sm p-2.5"
+                style={{ background: BG.card, border: `1px solid ${NEON.cyan}10` }}
+              >
+                <div className="text-[13px] mb-1.5" style={{ color: '#dbe2f1' }}>
+                  {m?.title || 'Untitled'}
+                </div>
+                <div className="flex gap-1.5 mb-1.5 flex-wrap">
+                  {m?.is_centroid && <Chip color={NEON.cyan}>CENTROID</Chip>}
+                  {m?.state && <Chip color="#aab4cc">{stateChipLabel(m.state)}</Chip>}
+                </div>
+                <SimBar similarity={m?.similarity} label={m?.is_centroid ? 'centroid' : 'sim to centroid'} />
+              </div>
+            ))}
+            {members.length === 0 && (
+              <span className="text-[12px]" style={{ color: '#555' }}>No members recorded for this cluster.</span>
+            )}
+
+            {proposal && !legacy && (
+              <div
+                className="chamfer-sm p-3 flex flex-col gap-2"
+                style={{ background: `${NEON.green}04`, border: `1px dashed ${NEON.green}60` }}
+              >
+                <div className="flex items-center gap-1.5 text-[11px] tracking-widest uppercase font-hud font-bold" style={{ color: NEON.green }}>
+                  <GitMerge size={13} /> Merge proposal
+                </div>
+                <p className="text-[12px] m-0" style={{ color: '#8b94a7' }}>
+                  Fold <b style={{ color: '#dbe2f1' }}>{proposalCount} candidates → 1</b>.{' '}
+                  Support adds up: <b style={{ color: '#dbe2f1' }}>
+                    {num(support.verified)} verified + {num(support.recovered)} recovered + {num(support.corrections)} corrections
+                  </b> instead of thin entries. Evidence links are preserved on the survivor; the losers are archived, not deleted.
+                </p>
+                {Array.isArray(proposal.member_titles) && proposal.member_titles.length > 0 && (
+                  <ul className="m-0 pl-4 text-[12px] flex flex-col gap-0.5" style={{ color: '#8b94a7' }}>
+                    {proposal.member_titles.map((t, i) => <li key={i}>{t}</li>)}
+                  </ul>
+                )}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleProposalDecision(proposal.id, 'approve')}
+                    disabled={deciding !== null}
+                    className="flex-1 py-3 chamfer-sm text-[12px] font-hud uppercase font-bold transition-all"
+                    style={{
+                      background: `${NEON.green}12`, border: `1px solid ${NEON.green}`, color: NEON.green,
+                      opacity: deciding ? 0.5 : 1, cursor: deciding ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {deciding === proposal.id ? 'Merging…' : `Merge ${proposalCount} → 1`}
+                  </button>
+                  <button
+                    onClick={() => handleProposalDecision(proposal.id, 'dismiss')}
+                    disabled={deciding !== null}
+                    className="flex-1 py-3 chamfer-sm text-[12px] font-hud uppercase font-bold transition-all"
+                    style={{
+                      background: 'transparent', border: '1px solid #555', color: '#8b94a7',
+                      opacity: deciding ? 0.5 : 1, cursor: deciding ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {deciding === proposal.id ? 'Working…' : 'Keep separate'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {legacy && (
+              <p className="text-[11px] font-hud m-0" style={{ color: '#666' }}>
+                Legacy backfill — reference only. It can inform merges but can never trigger one.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
     );
   };
 
@@ -544,6 +783,7 @@ export default function LearningInbox() {
           <div className="flex gap-2 flex-wrap">
             {TABS.map(t => {
               const active = tab === t.key;
+              const tabCount = t.key === 'clusters' ? clusters.length : (lists[t.key] || []).length;
               return (
                 <button
                   key={t.key}
@@ -561,14 +801,191 @@ export default function LearningInbox() {
                     className="inline-block min-w-[20px] px-1.5 py-0.5 ml-1.5 text-[11px] font-hud"
                     style={{ background: `${NEON.cyan}12`, color: active ? NEON.cyan : '#666' }}
                   >
-                    {(lists[t.key] || []).length}
+                    {tabCount}
                   </span>
                 </button>
               );
             })}
           </div>
 
-          {/* Candidate panel */}
+          {tab === 'clusters' ? (
+            <>
+              {/* ══ PHASE 3: SEMANTIC CLUSTERING ══ */}
+              <div className="flex items-start justify-between flex-wrap gap-3">
+                <div>
+                  <h2
+                    className="flex items-center gap-2 text-lg font-bold tracking-wider font-hud"
+                    style={{ color: NEON.purple, filter: `drop-shadow(0 0 8px ${NEON.purple}60)` }}
+                  >
+                    ◈ Semantic clustering
+                  </h2>
+                  <p className="text-[11px] mt-1" style={{ color: '#555' }}>
+                    Repetition becomes evidence, never the trigger — merges are proposed, never automatic
+                  </p>
+                  <div className="flex gap-2 mt-2.5 flex-wrap">
+                    <span
+                      className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                      style={{ background: `${NEON.yellow}10`, color: NEON.yellow, border: `1px solid ${NEON.yellow}40` }}
+                    >
+                      ◉ Shadow mode
+                    </span>
+                    <span
+                      className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                      style={{ background: `${NEON.purple}10`, color: NEON.purple, border: `1px solid ${NEON.purple}35` }}
+                    >
+                      merges proposed, never automatic
+                    </span>
+                    <span
+                      className="text-[10px] tracking-wider px-3 py-1 chamfer-sm font-hud uppercase"
+                      style={{ background: `${NEON.cyan}10`, color: NEON.cyan, border: `1px solid ${NEON.cyan}35` }}
+                    >
+                      threshold {clusterStats?.threshold != null ? num(clusterStats.threshold).toFixed(2) : '0.80'} · calibrated
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={handleRunClustering}
+                  disabled={clustering}
+                  className="flex items-center gap-2 px-4 py-2 chamfer-sm text-[11px] font-bold tracking-wide font-hud uppercase transition-all"
+                  style={{
+                    background: `${NEON.purple}15`,
+                    border: `1px solid ${NEON.purple}40`,
+                    color: NEON.purple,
+                    opacity: clustering ? 0.5 : 1,
+                    cursor: clustering ? 'not-allowed' : 'pointer',
+                    boxShadow: `0 0 12px ${NEON.purple}20`,
+                    minHeight: '40px',
+                  }}
+                >
+                  {clustering ? <Loader size={14} className="animate-spin" /> : <Network size={14} />}
+                  {clustering ? 'Clustering…' : 'Run clustering'}
+                </button>
+              </div>
+
+              {clusterError && (
+                <div
+                  className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+                  style={{ background: `${NEON.red}08`, border: `1px solid ${NEON.red}30`, color: NEON.red }}
+                >
+                  ⚠ {clusterError}
+                </div>
+              )}
+
+              {mergeNotice && (
+                <div
+                  className="chamfer-sm px-4 py-3 text-[12px] font-hud"
+                  style={{ background: `${NEON.green}06`, border: `1px solid ${NEON.green}40`, color: NEON.green }}
+                >
+                  ✓ {mergeNotice}
+                </div>
+              )}
+
+              {clusterStats && (
+                <div
+                  className="chamfer-sm p-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[11px] font-hud"
+                  style={{ background: BG.surface, border: `1px dashed ${NEON.green}60`, color: '#8b94a7' }}
+                >
+                  <span>method <b style={{ color: NEON.green }}>{clusterStats.method || '—'}</b></span>
+                  <span>threshold <b style={{ color: NEON.green }}>{num(clusterStats.threshold || 0.80).toFixed(2)}</b></span>
+                  <span>scanned <b style={{ color: NEON.green }}>{num(clusterStats.candidates_scanned)}</b></span>
+                  <span>clusters formed <b style={{ color: NEON.green }}>{num(clusterStats.clusters_formed)}</b></span>
+                  <span>proposals created <b style={{ color: NEON.green }}>{num(clusterStats.proposals_created)}</b></span>
+                  {num(clusterStats.avg_similarity) > 0 && (
+                    <span>avg sim <b style={{ color: NEON.green }}>{num(clusterStats.avg_similarity).toFixed(2)}</b></span>
+                  )}
+                </div>
+              )}
+
+              {/* How it works */}
+              <div
+                className="chamfer-md overflow-hidden"
+                style={{ background: BG.card, border: `1px solid ${NEON.cyan}18` }}
+              >
+                <div
+                  className="px-4 py-3"
+                  style={{ borderBottom: `1px solid ${NEON.cyan}12` }}
+                >
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.cyan }}>
+                    ◇ How it works
+                  </span>
+                </div>
+                <div className="p-3 flex flex-wrap items-stretch gap-1.5">
+                  {PIPELINE_STEPS.map((s, i) => (
+                    <div key={s.n} className="flex items-stretch gap-1.5 flex-1 min-w-[130px]">
+                      <div
+                        className="chamfer-sm p-2.5 flex-1"
+                        style={{ background: BG.surface, border: `1px solid ${NEON.cyan}15` }}
+                      >
+                        <div className="text-[12px] font-bold font-hud" style={{ color: NEON.cyan }}>{s.n}</div>
+                        <div className="text-[10px] mt-1" style={{ color: '#8b94a7' }}>{s.d}</div>
+                      </div>
+                      {i < PIPELINE_STEPS.length - 1 && (
+                        <span className="self-center shrink-0" style={{ color: NEON.cyan }}>→</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Clusters panel */}
+              <div
+                className="chamfer-md overflow-hidden"
+                style={{ background: BG.card, border: `1px solid ${NEON.purple}20` }}
+              >
+                <div
+                  className="px-4 py-3 flex items-center gap-2"
+                  style={{ borderBottom: `1px solid ${NEON.purple}12` }}
+                >
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.purple }}>
+                    ◇ Clusters
+                  </span>
+                  <span
+                    className="ml-auto text-[10px] font-hud px-2 py-0.5"
+                    style={{ background: `${NEON.purple}12`, color: NEON.purple }}
+                  >
+                    {clusters.length} clusters · {proposals.length} proposals
+                  </span>
+                </div>
+                <div className="p-3 flex flex-col gap-2">
+                  {clustersLoading && clusters.length === 0 && (
+                    <div className="flex items-center justify-center py-10 gap-2 text-[12px] font-hud" style={{ color: '#555' }}>
+                      <Loader size={16} className="animate-spin" /> Loading clusters…
+                    </div>
+                  )}
+                  {!clustersLoading && clusters.length === 0 && (
+                    <div className="text-center py-10 text-[11px] font-hud" style={{ color: '#444' }}>
+                      <Network size={20} className="mx-auto mb-2" style={{ color: '#333' }} />
+                      No clusters yet — run clustering to group near-duplicate candidates.
+                    </div>
+                  )}
+                  {clusters.map((cl, ci) => <ClusterCard key={cl.id || cl.label || `cluster-${ci}`} cluster={cl} />)}
+                </div>
+              </div>
+
+              {/* Safety rails */}
+              <div
+                className="chamfer-md p-4 flex flex-col gap-2"
+                style={{ background: BG.card, border: `1px solid ${NEON.yellow}25` }}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[11px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.yellow }}>
+                    ◇ Safety rails
+                  </span>
+                </div>
+                {SAFETY_RAILS.map((r) => (
+                  <div
+                    key={r.title}
+                    className="chamfer-sm p-3 text-[12px]"
+                    style={{ background: BG.surface, border: `1px solid ${NEON.yellow}25`, color: '#8b94a7' }}
+                  >
+                    <b style={{ color: NEON.yellow }}>{r.title}</b> {r.body}
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              {/* Candidate panel */}
           <div
             className="chamfer-md overflow-hidden"
             style={{ background: BG.card, border: `1px solid ${NEON.magenta}20` }}
@@ -659,6 +1076,8 @@ export default function LearningInbox() {
               <span style={{ color: NEON.purple, marginLeft: 4 }}>↻</span>
             </div>
           </div>
+            </>
+          )}
         </>
       )}
 
