@@ -52,7 +52,10 @@ import heartbeatRulesRoutes from './routes/heartbeat-rules.mjs';
 import toolsRoutes from './routes/tools.mjs';
 import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './routes/aimi.mjs';
 import llmRoutes, { initOllama } from './routes/llm.mjs';
-import agentRoutes, { callAgentLLM, agentTools, runAgentLoop } from './routes/agent.mjs';
+import agentRoutes, { callAgentLLM, agentTools, runAgentLoop, registerAgentTool, unregisterAgentTool } from './routes/agent.mjs';
+import connectorsRoutes from './routes/connectors.mjs';
+import learningSourcesRoutes from './routes/learning-sources.mjs';
+import { startMcpManager } from './mcp-manager.mjs';
 import commsRoutes, { createTelegramNotifier } from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
@@ -926,6 +929,24 @@ const stmts = {
    updateStatus: db.prepare('UPDATE mcp_servers SET status = ?, connected_at = ?, last_ping = ? WHERE id = ?'),
    delete: db.prepare('DELETE FROM mcp_servers WHERE id = ?'),
    },
+   connectors: {
+   upsert: db.prepare(`INSERT INTO connectors (id, connector_id, name, kind, enabled, config_json, secret_json, status, oauth_state, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'), datetime('now'))
+    ON CONFLICT(connector_id) DO UPDATE SET name=excluded.name, kind=excluded.kind, config_json=excluded.config_json, secret_json=excluded.secret_json, updated_at=datetime('now')`),
+   getByConnectorId: db.prepare('SELECT * FROM connectors WHERE connector_id = ?'),
+   getAll: db.prepare('SELECT * FROM connectors ORDER BY connector_id'),
+   updateStatus: db.prepare("UPDATE connectors SET status = ?, last_test_at = ?, last_error = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   updateEnabled: db.prepare("UPDATE connectors SET enabled = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   setSecrets: db.prepare("UPDATE connectors SET secret_json = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   setOauthState: db.prepare("UPDATE connectors SET oauth_state = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   getByOauthState: db.prepare('SELECT * FROM connectors WHERE oauth_state = ? AND oauth_state IS NOT NULL'),
+   clearOauthState: db.prepare("UPDATE connectors SET oauth_state = NULL, updated_at = datetime('now') WHERE connector_id = ?"),
+   },
+   learningImports: {
+   insert: db.prepare(`INSERT INTO learning_imports (id, source, user_id, label, status, total, imported, deduplicated, errors, dry_run) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+   getAll: db.prepare('SELECT * FROM learning_imports ORDER BY created_at DESC LIMIT ?'),
+   getByUser: db.prepare('SELECT * FROM learning_imports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'),
+   },
    deps: {
       insert: db.prepare('INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)'),
       getByTask: db.prepare('SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?'),
@@ -1612,6 +1633,8 @@ app.use('/api', compressionRoutes(ctx));
 app.use('/api', companionRoutes(ctx));
 app.use('/api', identityRoutes(ctx));
 app.use('/api', defenseRoutes(ctx));
+app.use('/api', connectorsRoutes(ctx));
+app.use('/api', learningSourcesRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
@@ -2298,6 +2321,16 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
     );
    learnLoop.start();
    globalThis._learnLoop = learnLoop;
+
+   // Start the MCP manager — auto-connects auto_connect servers on boot,
+   // health-pings them, reconnects with backoff, and surfaces each
+   // server's tools as callable agent tools.
+   const mcpManager = startMcpManager({
+     db, stmts, logger, broadcast, mcp,
+     registerAgentTool, unregisterAgentTool,
+     healthIntervalMs: parseInt(process.env.MCP_HEALTH_INTERVAL || '30') * 1000,
+   });
+   globalThis._mcpManager = mcpManager;
   });
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
