@@ -4,13 +4,13 @@ import { GraphResponseSchema } from '../../shared/schemas.mjs';
 /**
  * Graph routes: /api/graph, /api/graph/core, /api/graph/expand
  * Neural Map — clustered Obsidian-style connection graph
- * Dependencies: db, stmts, optionalAuth, logger
+ * Dependencies: db, stmts, authMiddleware, logger
  */
 export default function graphRoutes(ctx) {
-  const { db, stmts, optionalAuth, logger, nodeRegistry } = ctx;
+  const { db, stmts, authMiddleware, logger, nodeRegistry } = ctx;
   const router = express.Router();
 
-router.get('/graph', optionalAuth, async (_req, res) => {
+router.get('/graph', authMiddleware, async (_req, res) => {
  const nodes = [];
  const links = [];
  const nodeIndex = new Set();
@@ -395,7 +395,7 @@ for (let i = 0; i < clusterIds.length; i++) {
 });
 
 // ─── Graph: Core entities only (galaxy seed view) ──────────────────
-router.get('/graph/core', optionalAuth, async (req, res) => {
+router.get('/graph/core', authMiddleware, async (req, res) => {
   const nodes = [];
   const links = [];
   const nodeIndex = new Set();
@@ -487,7 +487,7 @@ router.get('/graph/core', optionalAuth, async (req, res) => {
 });
 
 // ─── Graph: Expand a node's neighbors on demand ───────────────────
-router.get('/graph/expand', optionalAuth, async (req, res) => {
+router.get('/graph/expand', authMiddleware, async (req, res) => {
   const { node_id } = req.query;
   if (!node_id) return res.status(400).json({ error: 'node_id is required' });
 

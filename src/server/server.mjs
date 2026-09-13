@@ -83,7 +83,28 @@ const app = express();
 app.set('etag', false); // Disable ETags — prevents 304 stale cache on auth routes
 let PORT = process.env.PORT || 8080; // fixed unless PORT env var is set
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(import.meta.dirname, '..', '..', 'data'));
-const JWT_SECRET = process.env.JWT_SECRET || 'cardinal-frame-dev-secret-change-me';
+// L3: never boot with the public dev default unless it was explicitly set.
+// Without JWT_SECRET we generate a per-instance secret once and persist it
+// to DATA_DIR/.jwt-secret (mode 600) — same pattern as .admin-credentials /
+// .encrypt-key — so sessions survive restarts in any NODE_ENV.
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  const jwtFile = path.join(DATA_DIR, '.jwt-secret');
+  try {
+    const saved = readFileSync(jwtFile, 'utf8').trim();
+    if (saved.length >= 32) JWT_SECRET = saved;
+  } catch { /* missing/unreadable → generate below */ }
+  if (!JWT_SECRET) {
+    try { mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+    JWT_SECRET = randomBytes(48).toString('hex');
+    try {
+      writeFileSync(jwtFile, JWT_SECRET + '\n', { mode: 0o600 });
+      console.log(`[security] generated instance JWT secret at ${jwtFile} (mode 600). Set JWT_SECRET to manage it explicitly.`);
+    } catch (e) {
+      console.error(`[security] WARNING: cannot persist JWT secret (${e.message}); sessions will not survive restart. Set JWT_SECRET.`);
+    }
+  }
+}
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'cardinal-frame-dev-secret-change-me') {
   console.error('FATAL: JWT_SECRET must be set in production. Set the JWT_SECRET env var.');
   process.exit(1);
@@ -172,7 +193,7 @@ const apiLimiter = writeLimiter;
 app.set('trust proxy', 1);
 
 // ─── SQLite Database ───────────────────────────────────────────────
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'fs';
 mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'cardinal.db'));

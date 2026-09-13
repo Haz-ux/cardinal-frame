@@ -3,6 +3,7 @@
 // and auto-triggers chains, skills, or alerts based on rules.
 
 import vm from 'node:vm';
+import { safeFetch } from './safe-fetch.mjs';
 
 /**
  * Evaluate a heartbeat condition against current system state.
@@ -448,7 +449,9 @@ export class HeartbeatDaemon {
         } else if (rule.action_type === 'alert') {
           this.broadcast('heartbeat:alert', { rule: rule.name, message: rule.description, state });
         } else if (rule.action_type === 'webhook') {
-          // POST alert data to an external URL
+          // POST alert data to an external URL.
+          // L1: SSRF-guarded — safeFetch blocks localhost, private IPs and
+          // cloud metadata targets even if an admin configures a bad URL.
           try {
             const payload = {
               rule: rule.name,
@@ -460,7 +463,7 @@ export class HeartbeatDaemon {
             };
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 10000);
-            const resp = await fetch(rule.action_target, {
+            const resp = await safeFetch(rule.action_target, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),

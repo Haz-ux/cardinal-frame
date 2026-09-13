@@ -199,7 +199,7 @@ audit('create', 'task', id, req.user?.id, { name, command });
 res.status(201).json({ ...task, dependsOn: deps });
 });
 
-router.get('/tasks', optionalAuth, (req, res) => {
+router.get('/tasks', authMiddleware, (req, res) => {
  let tasks = stmts.tasks.getAll.all();
  const { status, search } = req.query;
  if (status) tasks = tasks.filter(t => t.status === status);
@@ -214,7 +214,7 @@ router.get('/tasks', optionalAuth, (req, res) => {
  res.json(tasksWithDeps);
 });
 
-router.get('/tasks/:id', optionalAuth, (req, res) => {
+router.get('/tasks/:id', authMiddleware, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   const deps = stmts.deps.getByTask.all(req.params.id).map(d => d.depends_on_task_id);
@@ -222,7 +222,7 @@ router.get('/tasks/:id', optionalAuth, (req, res) => {
 });
 
 // Get full dependency chain for a task (recursively resolves all transitive deps)
-router.get('/tasks/:id/dependencies', optionalAuth, (req, res) => {
+router.get('/tasks/:id/dependencies', authMiddleware, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 

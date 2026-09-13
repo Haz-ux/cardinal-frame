@@ -38,7 +38,7 @@ export default function chatCompletionsRoutes(ctx) {
   const { db, stmts, logger, authMiddleware, optionalAuth, apiLimiter, audit, broadcast, randomUUID, fireHook } = ctx;
   const router = express.Router();
 
-  router.get('/personas', optionalAuth, (_req, res) => {
+  router.get('/personas', authMiddleware, (_req, res) => {
     res.json({ personas: listPersonas(stmts), default: getActivePersonaId(db) });
   });
 
@@ -53,7 +53,7 @@ export default function chatCompletionsRoutes(ctx) {
     res.json({ ok: true, active: id, persona });
   });
 
-  router.get('/personas/:id', optionalAuth, (req, res) => {
+  router.get('/personas/:id', authMiddleware, (req, res) => {
     if (!PERSONAS[req.params.id]) return res.status(404).json({ error: 'Unknown persona' });
     res.json({ persona: getPersonaDetail(stmts, req.params.id) });
   });

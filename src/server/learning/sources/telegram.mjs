@@ -31,7 +31,7 @@
  *    is one event); reactions, polls, and service messages are skipped.
  */
 
-import { telegramApiCall } from '../../routes/comms.mjs';
+import { telegramApiCall, decryptCommsSecrets } from '../../routes/comms.mjs';
 import { record, buildIdempotencyKey } from '../events.mjs';
 
 const FETCH_CAP = 100; // hard cap: one getUpdates call returns at most ~100 updates
@@ -65,7 +65,7 @@ export function resolveTelegramBotToken({ stmts }, channelId) {
   }
   if (!channel || channel.platform !== 'telegram') return null;
   try {
-    const config = JSON.parse(channel.config || '{}');
+    const config = decryptCommsSecrets(JSON.parse(channel.config || '{}'));
     return typeof config.bot_token === 'string' && config.bot_token ? config.bot_token : null;
   } catch {
     return null;

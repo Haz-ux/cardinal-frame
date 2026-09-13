@@ -1,6 +1,7 @@
 import express from 'express';
 import { randomUUID, randomBytes, timingSafeEqual } from 'crypto';
 import { WebSocket } from 'ws';
+import { encryptSecret, decryptSecret, isAesPacked } from './settings.mjs';
 
 /**
  * Comms Engine: Telegram + Discord integration.
@@ -54,6 +55,34 @@ export async function telegramApiCall(token, method, params = {}) {
   return data.result;
 }
 
+// ── Comms secret handling (M3) ──────────────────────────────────────
+// bot_token / webhook_secret are encrypted at rest with the same
+// AES-256-GCM store as LLM provider keys. isAesPacked() detects the
+// `iv:tag:ciphertext` format so plaintext is never double-encrypted and
+// already-encrypted values are never mistaken for plaintext.
+const COMMS_SECRET_KEYS = ['bot_token', 'webhook_secret'];
+
+export function encryptCommsSecrets(config) {
+  const out = { ...(config || {}) };
+  for (const k of COMMS_SECRET_KEYS) {
+    const v = out[k];
+    if (typeof v === 'string' && v && !isAesPacked(v)) out[k] = encryptSecret(v);
+  }
+  return out;
+}
+
+export function decryptCommsSecrets(config) {
+  const out = { ...(config || {}) };
+  for (const k of COMMS_SECRET_KEYS) {
+    const v = out[k];
+    if (isAesPacked(v)) {
+      const d = decryptSecret(v);
+      if (d != null) out[k] = d;
+    }
+  }
+  return out;
+}
+
 // ── Proactive Telegram notifier ───────────────────────────────
 // Used by the heartbeat agent pulse ("calls me" half of the on-call loop).
 // Sends `text` to every enabled Telegram channel's configured chat —
@@ -74,7 +103,7 @@ export function createTelegramNotifier({ stmts, logger }) {
     const sent = [];
     for (const ch of channels) {
       let config;
-      try { config = JSON.parse(ch.config); } catch { continue; }
+      try { config = decryptCommsSecrets(JSON.parse(ch.config)); } catch { continue; }
       if (!config.bot_token) continue;
       const chatId = config.chat_id
         || (Array.isArray(config.allowed_user_ids) && config.allowed_user_ids[0]);
@@ -100,6 +129,25 @@ export function createTelegramNotifier({ stmts, logger }) {
 export default function commsRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
   const router = express.Router();
+
+// Parse a channel row's config, migrating any plaintext secrets to
+// encrypted-at-rest in place, then return the decrypted config.
+// All in-closure config reads go through here.
+function loadChannelConfig(channel) {
+  let config = {};
+  try { config = JSON.parse(channel.config || '{}'); } catch { return {}; }
+  const migrated = encryptCommsSecrets(config);
+  if (JSON.stringify(migrated) !== JSON.stringify(config)) {
+    try {
+      stmts.commsChannels.update.run(channel.name, JSON.stringify(migrated), channel.enabled, channel.id);
+      channel.config = JSON.stringify(migrated);
+      logger.info(`[comms] migrated plaintext secrets to encrypted storage for channel "${channel.name}"`);
+    } catch (e) {
+      logger.warn(`[comms] secret migration failed for channel ${channel.id}: ${e.message}`);
+    }
+  }
+  return decryptCommsSecrets(migrated);
+}
 
 
 // In-memory state
@@ -140,7 +188,7 @@ function storeCommsMessage(channelId, platform, direction, { remote_id, remote_u
 // ── Send agent result back to the comms channel ──
 
 async function sendCommsReply(channel, originalMsg, agentResult) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   const replyText = `🤖 ${agentResult.slice(0, 3000)}`;
 
   if (channel.platform === 'telegram') {
@@ -214,7 +262,7 @@ async function sendCommsReply(channel, originalMsg, agentResult) {
 // ── Telegram long-polling ──
 
 async function pollTelegram(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
   
   const state = telegramPollers.get(channel.id) || { offset: 0, stopFlag: false };
@@ -304,7 +352,7 @@ async function pollTelegram(channel) {
 // ── Discord (webhook for outbound, bot polling for inbound) ──
 
 async function pollDiscord(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
   
   const state = discordPollers.get(channel.id) || { lastMsgId: null, stopFlag: false };
@@ -390,7 +438,7 @@ async function pollDiscord(channel) {
 // ── Auto-reply generator (uses LLM if configured, else echo) ──
 
 async function generateAutoReply(text, channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   
   if (config.auto_reply_template) {
     return config.auto_reply_template.replace('{text}', text);
@@ -417,7 +465,7 @@ async function generateAutoReply(text, channel) {
 // ── Trigger an agent session from an incoming comms message ──
 
 async function triggerAgentFromComms(channel, commsMsg, cfUserId) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   const userId = cfUserId || config.user_id || 'haz-001'; // default to admin
   
   // Find or create a user mapping
@@ -451,7 +499,7 @@ async function triggerAgentFromComms(channel, commsMsg, cfUserId) {
 const discordGateways = new Map(); // channelId -> { ws, heartbeatTimer, seq, sessionId, stopFlag }
 
 async function connectDiscordGateway(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
 
   // Stop REST poller if running — gateway replaces it
@@ -665,7 +713,7 @@ setTimeout(() => {
   try {
     const channels = stmts.commsChannels.getEnabled.all();
     for (const ch of channels) {
-      const config = JSON.parse(ch.config);
+      const config = loadChannelConfig(ch);
       if (ch.platform === 'telegram' && config.bot_token) startChannelPoller(ch);
       if (ch.platform === 'discord' && config.bot_token && config.channel_id) {
         if (config.gateway_mode) {
@@ -686,7 +734,7 @@ router.get('/comms/channels', authMiddleware, (_req, res) => {
   try {
     const channels = stmts.commsChannels.getAll.all().map(c => ({
       ...c,
-      config: JSON.parse(c.config),
+      config: loadChannelConfig(c),
       polling: c.polling,
     }));
     res.json(channels);
@@ -701,7 +749,7 @@ router.post('/comms/channels', authMiddleware, requireRole('admin'), apiLimiter,
     if (!['telegram', 'discord'].includes(platform)) return res.status(400).json({ error: 'Invalid platform' });
     
     const id = randomUUID();
-    const configStr = JSON.stringify(config || {});
+    const configStr = JSON.stringify(encryptCommsSecrets(config || {}));
     stmts.commsChannels.insert.run(id, platform, name, configStr, enabled ? 1 : 0);
     const channel = stmts.commsChannels.getById.get(id);
     
@@ -715,7 +763,7 @@ router.post('/comms/channels', authMiddleware, requireRole('admin'), apiLimiter,
     }
     
     broadcast('comms:channel', { type: 'created', channel });
-    res.status(201).json({ ...channel, config: JSON.parse(channel.config) });
+    res.status(201).json({ ...channel, config: decryptCommsSecrets(JSON.parse(channel.config)) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -727,7 +775,7 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     
     const { name, config, enabled } = req.body;
     const newName = name ?? channel.name;
-    const newConfig = config ? JSON.stringify(config) : channel.config;
+    const newConfig = config ? JSON.stringify(encryptCommsSecrets(config)) : channel.config;
     const newEnabled = enabled !== undefined ? (enabled ? 1 : 0) : channel.enabled;
     
     stmts.commsChannels.update.run(newName, newConfig, newEnabled, channel.id);
@@ -735,7 +783,7 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     
     // Start/stop pollers
     if (newEnabled) {
-      const configParsed = JSON.parse(newConfig);
+      const configParsed = decryptCommsSecrets(JSON.parse(newConfig));
       if (channel.platform === 'telegram' && configParsed.bot_token) startChannelPoller(updated);
       if (channel.platform === 'discord' && configParsed.bot_token && configParsed.channel_id) {
         if (configParsed.gateway_mode) connectDiscordGateway(updated);
@@ -746,7 +794,7 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     }
     
     broadcast('comms:channel', { type: 'updated', channel: updated });
-    res.json({ ...updated, config: JSON.parse(updated.config) });
+    res.json({ ...updated, config: decryptCommsSecrets(JSON.parse(updated.config)) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -771,7 +819,7 @@ router.post('/comms/dispatch', authMiddleware, requireRole('admin'), apiLimiter,
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
     
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     
     if (channel.platform === 'telegram') {
       if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
@@ -856,7 +904,7 @@ router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
 
     // Sender allowlist: lock the bot to specific Telegram user ids. Accepts
@@ -906,7 +954,7 @@ router.post('/comms/telegram/remove-webhook', authMiddleware, requireRole('admin
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
 
     await telegramApiCall(config.bot_token, 'deleteWebhook', {});
@@ -929,7 +977,7 @@ router.post('/comms/discord/setup-commands', authMiddleware, requireRole('admin'
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
 
     // Register global slash commands
@@ -1016,7 +1064,7 @@ router.post('/comms/telegram/webhook', async (req, res) => {
         status: 'received',
       });
       
-      const config = JSON.parse(channel.config);
+      const config = loadChannelConfig(channel);
       if (config.auto_reply) {
         try {
           const reply = await generateAutoReply(msg.text, channel);
@@ -1086,7 +1134,7 @@ router.post('/comms/discord/webhook', async (req, res) => {
         status: 'received',
       });
       
-      const config = JSON.parse(channel.config);
+      const config = loadChannelConfig(channel);
       if (config.trigger_agent) {
         try {
           const agentSessionId = await triggerAgentFromComms(channel, commsMsg);
@@ -1123,7 +1171,7 @@ router.post('/comms/discord/:id/start-gateway', authMiddleware, requireRole('adm
     const channel = stmts.commsChannels.getById.get(req.params.id);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
     if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token || !config.channel_id) return res.status(400).json({ error: 'bot_token and channel_id required' });
 
     config.gateway_mode = true;
@@ -1141,7 +1189,7 @@ router.post('/comms/discord/:id/stop-gateway', authMiddleware, requireRole('admi
     if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
 
     disconnectDiscordGateway(channel.id);
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     config.gateway_mode = false;
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel.id);
 

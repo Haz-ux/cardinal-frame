@@ -104,13 +104,13 @@ export default function llmRoutes(ctx) {
     res.status(201).json({ id, name, type, base_url: url, enabled: enabled !== false });
   });
 
-  router.get('/llm/providers', optionalAuth, (_req, res) => {
+  router.get('/llm/providers', authMiddleware, (_req, res) => {
     const providers = stmts.providers.getAll.all();
     const masked = providers.map(p => ({ ...p, api_key: p.api_key ? `${p.api_key.slice(0, 6)}…${p.api_key.slice(-4)}` : '', has_key: !!p.api_key }));
     res.json(masked);
   });
 
-  router.get('/llm/providers/:id', optionalAuth, (req, res) => {
+  router.get('/llm/providers/:id', authMiddleware, (req, res) => {
     const provider = stmts.providers.getById.get(req.params.id);
     if (!provider) return res.status(404).json({ error: 'Provider not found' });
     provider.api_key = provider.api_key ? `${provider.api_key.slice(0, 6)}…${provider.api_key.slice(-4)}` : '';
@@ -207,7 +207,7 @@ export default function llmRoutes(ctx) {
   });
 
   // ─── Models CRUD ─────────────────────────────────────────────
-  router.get('/llm/models', optionalAuth, (_req, res) => {
+  router.get('/llm/models', authMiddleware, (_req, res) => {
     const models = stmts.models.getAll.all();
     const providers = stmts.providers.getAll.all();
     const providerMap = Object.fromEntries(providers.map(p => [p.id, p.name]));
@@ -215,7 +215,7 @@ export default function llmRoutes(ctx) {
     res.json(enriched);
   });
 
-  router.get('/llm/models/default', optionalAuth, (_req, res) => {
+  router.get('/llm/models/default', authMiddleware, (_req, res) => {
     const model = stmts.models.getDefault.get();
     if (!model) return res.json(null);
     const provider = stmts.providers.getById.get(model.provider_id);
