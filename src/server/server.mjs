@@ -1181,6 +1181,34 @@ const stmts = {
         delete: db.prepare('DELETE FROM tool_chains WHERE id = ?'),
       },
       // ─── Evolution & Hub Tables ────────────────────────────────
+      // ─── Identity & Avatar Tables ────────────────────────────────
+      identity: {
+        getSingleton: db.prepare("SELECT * FROM companion_identity WHERE id = 'singleton'"),
+        upsert: db.prepare(`INSERT INTO companion_identity (id, name, character, vibe, color_language, style_anchors, avatar_master_ref, updated_at)
+          VALUES ('singleton', ?, ?, ?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(id) DO UPDATE SET name=excluded.name, character=excluded.character, vibe=excluded.vibe,
+            color_language=excluded.color_language, style_anchors=excluded.style_anchors,
+            avatar_master_ref=excluded.avatar_master_ref, updated_at=datetime('now')`),
+        setAvatarMaster: db.prepare("UPDATE companion_identity SET avatar_master_ref = ?, updated_at = datetime('now') WHERE id = 'singleton'"),
+      },
+      avatarCandidates: {
+        insert: db.prepare('INSERT INTO avatar_candidates (id, persona_id, label, prompt, negative_prompt, image_ref, status) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getById: db.prepare('SELECT * FROM avatar_candidates WHERE id = ?'),
+        getByPersona: db.prepare('SELECT * FROM avatar_candidates WHERE persona_id = ? ORDER BY created_at DESC'),
+        getActive: db.prepare("SELECT * FROM avatar_candidates WHERE persona_id = ? AND status = 'active' LIMIT 1"),
+        setStatus: db.prepare("UPDATE avatar_candidates SET status = ?, activated_at = CASE WHEN ? = 'active' THEN datetime('now') ELSE activated_at END WHERE id = ?"),
+        archiveActive: db.prepare("UPDATE avatar_candidates SET status = 'archived' WHERE persona_id = ? AND status = 'active'"),
+        delete: db.prepare('DELETE FROM avatar_candidates WHERE id = ?'),
+      },
+      personaVoices: {
+        get: db.prepare('SELECT * FROM persona_voices WHERE persona_id = ?'),
+        getAll: db.prepare('SELECT * FROM persona_voices'),
+        upsert: db.prepare(`INSERT INTO persona_voices (persona_id, provider, voice_id, voice_label, updated_at)
+          VALUES (?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(persona_id) DO UPDATE SET provider=excluded.provider, voice_id=excluded.voice_id,
+            voice_label=excluded.voice_label, updated_at=datetime('now')`),
+        delete: db.prepare('DELETE FROM persona_voices WHERE persona_id = ?'),
+      },
       evolution: {
         insert: db.prepare('INSERT INTO skill_evolution (id, skill_id, chain_id, generation, evolution_type, parent_skill_id, trigger, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
         getBySkill: db.prepare('SELECT * FROM skill_evolution WHERE skill_id = ? ORDER BY generation DESC'),
@@ -1486,6 +1514,9 @@ logger.info('Node registry initialized — heartbeat loop started');
 
 // ─── Modularized Routes ─────────────────────────────────────────
 app.use('/api/auth', authRoutes(ctx));
+// Avatar uploads are served read-only; writes go through the admin-gated
+// identity routes only.
+app.use('/media/avatars', express.static(path.join(DATA_DIR, 'avatars'), { maxAge: '7d', immutable: true }));
 app.use('/api', dashboardRoutes(ctx));
 app.use('/api', graphRoutes(ctx));
 app.use('/api', taskRoutes(ctx));
