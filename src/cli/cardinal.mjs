@@ -2,6 +2,7 @@
 // Cardinal Frame CLI — manage tasks, agents, config, and comms from the terminal
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import fs from 'node:fs';
 
 // Repo root resolved from this file's location (src/cli/cardinal.mjs),
 // overridable via CF_DIR. Never hardcode a machine-specific path.
@@ -283,11 +284,9 @@ async function doctor(args) {
   process.exit(2);
 }
 
-// `cardinal chat <message>` — POST /api/aimi/chat (SSE stream), print reply deltas
-async function chat(args) {
-  await ensureAuth();
-  const message = args.join(' ');
-  if (!message) { console.error('Usage: cardinal chat <message>'); process.exit(1); }
+// Stream one message to /api/aimi/chat, printing SSE content deltas live.
+// Shared by `cardinal chat` (one-shot) and the REPL.
+async function streamAimiChat(message) {
   const headers = { 'Content-Type': 'application/json' };
   if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
   let res;
@@ -325,6 +324,171 @@ async function chat(args) {
     }
   }
   if (printed) process.stdout.write('\n');
+}
+
+// `cardinal chat <message>` — one-shot chat with Aimi
+async function chat(args) {
+  await ensureAuth();
+  const message = args.join(' ');
+  if (!message) { console.error('Usage: cardinal chat <message>'); process.exit(1); }
+  await streamAimiChat(message);
+}
+
+// Interactive REPL — `cardinal` with no args, or `cardinal repl`
+async function repl() {
+  await ensureAuth();
+  const readline = await import('node:readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'aimi> ' });
+  console.log('Cardinal Frame REPL — chatting with Aimi. /exit to quit.');
+  rl.prompt();
+  rl.on('line', async (line) => {
+    const input = line.trim();
+    if (!input) { rl.prompt(); return; }
+    if (input === '/exit' || input === '/quit') { rl.close(); return; }
+    if (input === '/clear') { console.clear(); rl.prompt(); return; }
+    try {
+      await streamAimiChat(input);
+    } catch (e) {
+      console.error(e instanceof CliError ? `Error: ${e.message}` : `Fatal: ${e.message}`);
+    }
+    rl.prompt();
+  });
+  rl.on('close', () => { console.log('Bye.'); process.exit(0); });
+}
+
+// Minimal `--flag value` parser for commands that need named options.
+function parseFlags(args) {
+  const flags = {}, positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--') && a.length > 2) {
+      const key = a.slice(2);
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++; }
+      else flags[key] = true;
+    } else positional.push(a);
+  }
+  return { flags, positional };
+}
+
+// ─── DAGs ───────────────────────────────────────────────────
+// `cardinal dags` — list; `dags:create|get|update|delete|run`
+async function dags() {
+  await ensureAuth();
+  const rows = await req('GET', '/dags');
+  table(rows.map(d => ({
+    id: d.id,
+    name: d.name,
+    status: d.status,
+    nodes: Array.isArray(d.nodes) ? d.nodes.length : '?',
+    edges: Array.isArray(d.edges) ? d.edges.length : '?',
+  })), ['id', 'name', 'status', 'nodes', 'edges']);
+}
+
+function loadDagFile(path) {
+  let raw;
+  try { raw = fs.readFileSync(path, 'utf8'); }
+  catch { throw new CliError(`Cannot read DAG file: ${path}`); }
+  let obj;
+  try { obj = JSON.parse(raw); }
+  catch { throw new CliError(`DAG file is not valid JSON: ${path}`); }
+  if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges))
+    throw new CliError(`DAG file must be a JSON object with "nodes" and "edges" arrays: ${path}`);
+  return { nodes: obj.nodes, edges: obj.edges };
+}
+
+async function dagCreate(args) {
+  const { flags, positional } = parseFlags(args);
+  const name = positional[0];
+  if (!name) { console.error('Usage: cardinal dags:create <name> [--file dag.json]'); process.exit(1); }
+  const { nodes, edges } = flags.file ? loadDagFile(flags.file) : { nodes: [], edges: [] };
+  await ensureAuth();
+  const dag = await req('POST', '/dags', { name, nodes, edges });
+  console.log(`Created DAG "${dag.name}" (${dag.id})`);
+}
+
+async function dagGet(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:get <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('GET', `/dags/${id}`));
+}
+
+async function dagUpdate(args) {
+  const { flags, positional } = parseFlags(args);
+  const id = positional[0];
+  if (!id) { console.error('Usage: cardinal dags:update <id> [--file dag.json] [--name <name>]'); process.exit(1); }
+  const body = {};
+  if (flags.name) body.name = flags.name;
+  if (flags.file) { const { nodes, edges } = loadDagFile(flags.file); body.nodes = nodes; body.edges = edges; }
+  if (!Object.keys(body).length) { console.error('Nothing to update — pass --file and/or --name.'); process.exit(1); }
+  await ensureAuth();
+  const dag = await req('PUT', `/dags/${id}`, body);
+  console.log(`Updated DAG "${dag.name}" (${dag.id})`);
+}
+
+async function dagDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/dags/${id}`);
+  console.log(`Deleted DAG ${id}`);
+}
+
+async function dagRun(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:run <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('POST', `/dags/${id}/run`));
+}
+
+// ─── Schedules (heartbeat rules) ────────────────────────────
+// `cardinal schedules` — list; `schedules:create|toggle|delete`
+async function schedules() {
+  await ensureAuth();
+  const rows = await req('GET', '/heartbeat/rules');
+  table(rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    condition: r.condition,
+    action: `${r.action_type} → ${r.action_target}`,
+    enabled: r.enabled ? 'on' : 'off',
+  })), ['id', 'name', 'condition', 'action', 'enabled']);
+}
+
+async function scheduleCreate(args) {
+  const { flags, positional } = parseFlags(args);
+  const name = positional[0] || flags.name;
+  const condition = flags.condition, action = flags.action, target = flags.target;
+  if (!name || !condition || !action || !target) {
+    console.error('Usage: cardinal schedules:create <name> --condition "<expr>" --action <chain|skill|alert|webhook> --target <target> [--cooldown <sec>] [--description "..."]');
+    process.exit(1);
+  }
+  await ensureAuth();
+  const rule = await req('POST', '/heartbeat/rules', {
+    name,
+    condition,
+    action_type: action,
+    action_target: target,
+    cooldown_seconds: flags.cooldown ? Number(flags.cooldown) : 300,
+    description: flags.description || '',
+  });
+  console.log(`Created rule "${rule.name}" (${rule.id})`);
+}
+
+async function scheduleToggle(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal schedules:toggle <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('PATCH', `/heartbeat/rules/${id}/toggle`));
+}
+
+async function scheduleDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal schedules:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/heartbeat/rules/${id}`);
+  console.log(`Deleted rule ${id}`);
 }
 
 const HEALTH_URL = `${API_ROOT}/api/health`;
@@ -515,7 +679,22 @@ Commands:
   tasks:create <title> [aid]   Create a task (POST /api/tasks)
   token                        Login as admin, print JWT (POST /api/auth/login)
   port                         Show current dev port (fixed to 8080; set PORT env var to change)
-  chat <message>               Chat with Aimi (POST /api/aimi/chat, streams the reply)
+  chat <message>               Chat with Aimi, one message (POST /api/aimi/chat, streams the reply)
+  repl                         Interactive chat session with Aimi (same as bare 'cardinal')
+  dags                         List DAGs (GET /api/dags)
+  dags:create <name> [--file dag.json]
+                               Create a DAG (POST /api/dags)
+  dags:get <id>                Show a DAG with its last run result
+  dags:update <id> [--file dag.json] [--name <name>]
+                               Update a DAG (PUT /api/dags/:id)
+  dags:delete <id>             Delete a DAG
+  dags:run <id>                Run a DAG (POST /api/dags/:id/run)
+  schedules                    List heartbeat rules (GET /api/heartbeat/rules)
+  schedules:create <name> --condition "<expr>" --action <chain|skill|alert|webhook>
+                     --target <target> [--cooldown <sec>] [--description "..."]
+                               Create a heartbeat rule
+  schedules:toggle <id>        Enable/disable a rule
+  schedules:delete <id>        Delete a rule
   telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...
                            Register Telegram webhook, optionally locked to sender id(s)
   run [args]                   Start server + dashboard (--no-client, --server-only)
@@ -536,17 +715,21 @@ Environment:
   CF_DIR    Repo root override (default: resolved from the CLI's own location)
   CF_LOG_FILE  Path to log file (default: /tmp/cardinal-server.log)
 
-Run 'cardinal' (no args) or 'cardinal help' for this message.
+Run 'cardinal' (no args) to open the interactive REPL, 'cardinal help' for this message.
 `;
 
-if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
   console.log(HELP);
   process.exit(0);
 }
 
 (async () => {
   try {
+    if (!cmd) { await repl(); return; }
     switch (cmd) {
+      case 'repl':
+        await repl();
+        break;
       case 'status':
         await status();
         break;
@@ -583,6 +766,28 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
       case 'doctor':
         await doctor([sub, ...rest].filter(a => a !== undefined));
         break;
+      case 'dags':
+        if (sub === 'create') await dagCreate(rest);
+        else if (sub === 'get') await dagGet(rest);
+        else if (sub === 'update') await dagUpdate(rest);
+        else if (sub === 'delete') await dagDelete(rest);
+        else if (sub === 'run') await dagRun(rest);
+        else await dags();
+        break;
+      case 'dags:create': await dagCreate(process.argv.slice(3)); break;
+      case 'dags:get': await dagGet(process.argv.slice(3)); break;
+      case 'dags:update': await dagUpdate(process.argv.slice(3)); break;
+      case 'dags:delete': await dagDelete(process.argv.slice(3)); break;
+      case 'dags:run': await dagRun(process.argv.slice(3)); break;
+      case 'schedules':
+        if (sub === 'create') await scheduleCreate(rest);
+        else if (sub === 'toggle') await scheduleToggle(rest);
+        else if (sub === 'delete') await scheduleDelete(rest);
+        else await schedules();
+        break;
+      case 'schedules:create': await scheduleCreate(process.argv.slice(3)); break;
+      case 'schedules:toggle': await scheduleToggle(process.argv.slice(3)); break;
+      case 'schedules:delete': await scheduleDelete(process.argv.slice(3)); break;
       case 'run':
         await run(process.argv.slice(3));
         break;
