@@ -491,6 +491,131 @@ async function scheduleDelete(args) {
   console.log(`Deleted rule ${id}`);
 }
 
+// ─── Sessions (chat conversations) ──────────────────────────
+// `cardinal sessions` — list; `sessions:show|delete`
+async function sessions() {
+  await ensureAuth();
+  const convs = await req('GET', '/chat/conversations');
+  table(convs.map(c => ({
+    id: c.id,
+    title: c.title,
+    model: c.model || '-',
+    updated: (c.updated_at || '').slice(0, 16).replace('T', ' '),
+  })), ['id', 'title', 'model', 'updated']);
+}
+
+async function sessionShow(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal sessions:show <id>'); process.exit(1); }
+  await ensureAuth();
+  const msgs = await req('GET', `/chat/conversations/${id}/messages`);
+  if (!msgs.length) { console.log('(no messages)'); return; }
+  for (const m of msgs) {
+    const role = (m.role || '?').toUpperCase();
+    let content = m.content || '';
+    if (content.length > 1200) content = content.slice(0, 1200) + '…';
+    console.log(`\n[${role}] ${content}`);
+    const calls = m.tool_calls || [];
+    if (calls.length) console.log(`  (tool calls: ${calls.map(t => t.name || t.function?.name || '?').join(', ')})`);
+  }
+}
+
+async function sessionDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal sessions:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/chat/conversations/${id}`);
+  console.log(`Deleted conversation ${id}`);
+}
+
+// ─── Memory ─────────────────────────────────────────────────
+// `cardinal memory` — stats; `memory:search|get|add|delete`
+async function memory() {
+  await ensureAuth();
+  const stats = await req('GET', '/memory/stats');
+  console.log(`Total memories: ${stats.total}`);
+  const cats = Object.entries(stats.by_category || {});
+  if (cats.length) table(cats.map(([category, count]) => ({ category, count })), ['category', 'count']);
+}
+
+async function memorySearch(args) {
+  const q = args.join(' ');
+  if (!q) { console.error('Usage: cardinal memory:search <query>'); process.exit(1); }
+  await ensureAuth();
+  const results = await req('GET', `/memory?q=${encodeURIComponent(q)}`);
+  const rows = Array.isArray(results) ? results : results.results || [];
+  if (!rows.length) { console.log('(no matches)'); return; }
+  table(rows.map(m => ({
+    id: String(m.id).slice(0, 8),
+    category: m.category,
+    content: (m.content || '').slice(0, 80),
+    confidence: m.confidence,
+  })), ['id', 'category', 'content', 'confidence']);
+}
+
+async function memoryGet(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal memory:get <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('GET', `/memory/${id}`));
+}
+
+async function memoryAdd(args) {
+  const { flags, positional } = parseFlags(args);
+  const content = positional.join(' ');
+  if (!content) { console.error('Usage: cardinal memory:add <content...> [--category <cat>]'); process.exit(1); }
+  await ensureAuth();
+  const m = await req('POST', '/memory', { category: flags.category || 'memory', content });
+  console.log(`Saved memory (${m.id}) [${m.category}]`);
+}
+
+async function memoryDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal memory:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/memory/${id}`);
+  console.log(`Deleted memory ${id}`);
+}
+
+// ─── Skills ─────────────────────────────────────────────────
+// `cardinal skills` — list; `skills:run|stats`
+async function skills() {
+  await ensureAuth();
+  const rows = await req('GET', '/skills');
+  table(rows.map(s => ({
+    name: s.name,
+    category: s.category,
+    enabled: s.enabled ? 'on' : 'off',
+    description: (s.description || '').slice(0, 60),
+  })), ['name', 'category', 'enabled', 'description']);
+}
+
+async function skillRun(args) {
+  const name = args[0];
+  if (!name) { console.error('Usage: cardinal skills:run <name> [json-input]'); process.exit(1); }
+  await ensureAuth();
+  const rawInput = args.slice(1).join(' ');
+  let body = {};
+  if (rawInput) {
+    try { body = { input: JSON.parse(rawInput) }; }
+    catch { body = { input: rawInput }; }
+  }
+  pretty(await req('POST', `/skills/execute/${encodeURIComponent(name)}`, body));
+}
+
+async function skillStats() {
+  await ensureAuth();
+  const stats = await req('GET', '/skills/stats/failure-rates');
+  if (!stats.length) { console.log('(no invocations yet)'); return; }
+  table(stats.map(s => ({
+    skill: s.skill_name || s.name || s.skill_id,
+    total: s.total,
+    failures: s.failures,
+    rate: `${(s.failureRate * 100).toFixed(1)}%`,
+    review: s.needsReview ? 'YES' : '',
+  })), ['skill', 'total', 'failures', 'rate', 'review']);
+}
+
 const HEALTH_URL = `${API_ROOT}/api/health`;
 const PID_FILE = '/tmp/cardinal.pid';
 const LOG_FILE = process.env.CF_LOG_FILE || '/tmp/cardinal-server.log';
@@ -695,6 +820,18 @@ Commands:
                                Create a heartbeat rule
   schedules:toggle <id>        Enable/disable a rule
   schedules:delete <id>        Delete a rule
+  sessions                     List chat conversations (GET /api/chat/conversations)
+  sessions:show <id>           Read a conversation's messages
+  sessions:delete <id>         Delete a conversation
+  memory                       Memory stats: total + by category
+  memory:search <query>        Full-text search memories
+  memory:get <id>              Show one memory
+  memory:add <text...> [--category <cat>]
+                               Save a memory
+  memory:delete <id>           Delete a memory
+  skills                       List skills (GET /api/skills)
+  skills:run <name> [json]     Execute a skill by name (admin)
+  skills:stats                 Invocation counts + failure rates per skill
   telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...
                            Register Telegram webhook, optionally locked to sender id(s)
   run [args]                   Start server + dashboard (--no-client, --server-only)
@@ -788,6 +925,31 @@ if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
       case 'schedules:create': await scheduleCreate(process.argv.slice(3)); break;
       case 'schedules:toggle': await scheduleToggle(process.argv.slice(3)); break;
       case 'schedules:delete': await scheduleDelete(process.argv.slice(3)); break;
+      case 'sessions':
+        if (sub === 'show') await sessionShow(rest);
+        else if (sub === 'delete') await sessionDelete(rest);
+        else await sessions();
+        break;
+      case 'sessions:show': await sessionShow(process.argv.slice(3)); break;
+      case 'sessions:delete': await sessionDelete(process.argv.slice(3)); break;
+      case 'memory':
+        if (sub === 'search') await memorySearch(rest);
+        else if (sub === 'get') await memoryGet(rest);
+        else if (sub === 'add') await memoryAdd(rest);
+        else if (sub === 'delete') await memoryDelete(rest);
+        else await memory();
+        break;
+      case 'memory:search': await memorySearch(process.argv.slice(3)); break;
+      case 'memory:get': await memoryGet(process.argv.slice(3)); break;
+      case 'memory:add': await memoryAdd(process.argv.slice(3)); break;
+      case 'memory:delete': await memoryDelete(process.argv.slice(3)); break;
+      case 'skills':
+        if (sub === 'run') await skillRun(rest);
+        else if (sub === 'stats') await skillStats();
+        else await skills();
+        break;
+      case 'skills:run': await skillRun(process.argv.slice(3)); break;
+      case 'skills:stats': await skillStats(); break;
       case 'run':
         await run(process.argv.slice(3));
         break;
