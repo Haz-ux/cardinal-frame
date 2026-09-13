@@ -16,6 +16,7 @@
 
 import { randomUUID } from 'crypto';
 import { embedBatch, cosineSimilarity, unloadEmbeddingModel } from '../embeddings.mjs';
+import { recordMergeProposalHistory, avgProposalSimilarity } from './merge-history.mjs';
 
 // ─── Threshold (env) ────────────────────────────────────────────────
 
@@ -320,6 +321,22 @@ export async function runClustering({ db, userId, logger = console, threshold, s
     // row written after the transaction (one row per re-cluster run).
     let deletedClusters = 0;
     let deletedProposals = 0;
+    // Durable history (migration 033): capture the open proposals with
+    // their full rows + avg member similarity BEFORE the delete, so each
+    // killed proposal gets a superseded_by_recluster history row even
+    // though its proposal row disappears. Best-effort — must not fail
+    // the run (never-throw contract).
+    let openProposals = [];
+    try {
+      openProposals = db.prepare(`SELECT * FROM learning_merge_proposals
+        WHERE user_id = ? AND state = 'proposed'`).all(userId);
+      for (const pr of openProposals) {
+        pr._historySimilarity = avgProposalSimilarity(db, pr);
+        pr._historySnapshot = { ...pr };
+      }
+    } catch {
+      openProposals = [];
+    }
     const tx = db.transaction(() => {
       // Fresh re-cluster: drop this user's non-legacy clusters, their
       // member rows (cascade), and their open proposals. Legacy
@@ -328,6 +345,21 @@ export async function runClustering({ db, userId, logger = console, threshold, s
         WHERE user_id = ? AND is_legacy_readonly = 0`).run(userId).changes ?? 0;
       deletedProposals = db.prepare(`DELETE FROM learning_merge_proposals
         WHERE user_id = ? AND state = 'proposed'`).run(userId).changes ?? 0;
+
+      // History rows for the killed open proposals, in the same
+      // transaction as the delete. The helper never throws, so this
+      // cannot break the re-cluster transaction.
+      for (const pr of openProposals) {
+        recordMergeProposalHistory(db, {
+          proposalId: pr.id,
+          userId,
+          decision: 'superseded_by_recluster',
+          decidedBy: 'system',
+          similarity: pr._historySimilarity ?? null,
+          reason: 'open proposal deleted by fresh re-cluster run',
+          snapshot: pr._historySnapshot,
+        }, logger);
+      }
 
       const insCluster = db.prepare(`INSERT INTO learning_clusters
         (id, user_id, label, centroid_signature, member_count, state, created_at, updated_at)

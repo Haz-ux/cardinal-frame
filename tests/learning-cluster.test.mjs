@@ -37,7 +37,8 @@ function freshDb() {
   const d = new Database(':memory:');
   // 014/022 first: 026 ALTERs learning_events, so the table must exist.
   for (const f of ['014_learning_events.sql', '022_learning_events.sql',
-                   '026_learning_candidates.sql', '027_learning_clusters.sql']) {
+                   '026_learning_candidates.sql', '027_learning_clusters.sql',
+                   '033_learning_merge_proposal_history.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   return d;
@@ -247,6 +248,80 @@ describe('runClustering + proposeMerges', () => {
       VALUES ('other-1', 'u2', 'x', 1, ?, ?)`).run(now, now);
     await runClustering({ db, userId: USER, logger: QUIET, similarity: stubSimFactory(['c1', 'c2', 'c3', 'c4']) });
     expect(db.prepare('SELECT * FROM learning_clusters WHERE id = ?').get('other-1')).toBeTruthy();
+  });
+});
+
+describe('merge proposal history (033) — superseded_by_recluster', () => {
+  let db;
+  const USER = 'u1';
+
+  beforeEach(() => {
+    db = freshDb();
+    seedCandidate(db, USER, { id: 'c1', title: 'Deploy health check', draft: ['ping /health'], score: 0.9, verified: 3 });
+    seedCandidate(db, USER, { id: 'c2', title: 'Staging health monitor', draft: ['check /health'], score: 0.85, verified: 2 });
+    seedCandidate(db, USER, { id: 'c3', title: 'Health check deploy', draft: ['watch /health'], score: 0.7, corrections: 2 });
+    seedCandidate(db, USER, { id: 'c4', title: 'Log rotation', draft: ['rotate logs'], score: 0.8 });
+    db.exec(`CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      details TEXT DEFAULT '{}',
+      trace_id TEXT,
+      ts TEXT DEFAULT (datetime('now')))`);
+  });
+
+  it('writes a history row when re-clustering deletes an open proposal, audit row kept', async () => {
+    const sim = stubSimFactory(['c1', 'c2', 'c3', 'c4']);
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    const open = db.prepare(`SELECT id FROM learning_merge_proposals
+      WHERE user_id = ? AND state = 'proposed'`).get(USER);
+    expect(open).toBeTruthy();
+
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+
+    // Proposal row is gone...
+    expect(db.prepare('SELECT * FROM learning_merge_proposals WHERE id = ?').get(open.id)).toBeFalsy();
+    // ...but the durable history row survives.
+    const h = db.prepare('SELECT * FROM learning_merge_proposal_history WHERE proposal_id = ?').get(open.id);
+    expect(h).toBeTruthy();
+    expect(h.decision).toBe('superseded_by_recluster');
+    expect(h.decided_by).toBe('system');
+    expect(h.user_id).toBe(USER);
+    expect(h.survivor_candidate_id).toBeNull();
+    expect(JSON.parse(h.merged_candidate_ids)).toEqual([]);
+    expect(h.reason).toContain('re-cluster');
+    const snap = JSON.parse(h.proposal_snapshot);
+    expect(snap.id).toBe(open.id);
+    expect(snap.state).toBe('proposed');
+    expect(JSON.parse(snap.from_candidate_ids)).toEqual(['c1', 'c2', 'c3']);
+    expect(h.similarity).toBeGreaterThan(0); // avg member similarity captured pre-delete
+    expect(h.decided_at).toBeTruthy();
+
+    // L9 audit row is still written alongside the history rows.
+    const audits = db.prepare(`SELECT * FROM audit_log WHERE action = 'learning.clusters.reclustered'`).all();
+    expect(audits.length).toBe(2);
+    expect(JSON.parse(audits[1].details).deletedProposals).toBe(1);
+  });
+
+  it('a missing history table does not fail the run (best-effort)', async () => {
+    db.exec('DROP TABLE learning_merge_proposal_history');
+    const sim = stubSimFactory(['c1', 'c2', 'c3', 'c4']);
+    const r1 = await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    expect(r1.ok).toBe(true);
+    const r2 = await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    expect(r2.ok).toBe(true);
+    expect(r2.stats.deleted_proposals).toBe(1);
+  });
+
+  it('history rows are owner-scoped: a second user writes none for the first', async () => {
+    const sim = stubSimFactory(['c1', 'c2', 'c3', 'c4']);
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    const mine = db.prepare('SELECT COUNT(*) c FROM learning_merge_proposal_history WHERE user_id = ?').get(USER).c;
+    expect(mine).toBe(1);
+    const theirs = db.prepare('SELECT COUNT(*) c FROM learning_merge_proposal_history WHERE user_id = ?').get('u2').c;
+    expect(theirs).toBe(0);
   });
 });
 

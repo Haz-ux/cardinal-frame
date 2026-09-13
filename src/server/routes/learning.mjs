@@ -36,6 +36,10 @@ import {
   MERGEABLE_STATES,
 } from '../learning/cluster.mjs';
 import {
+  recordMergeProposalHistory,
+  avgProposalSimilarity,
+} from '../learning/merge-history.mjs';
+import {
   compile as compileVersion,
   runTests,
   scanArtifact,
@@ -340,8 +344,25 @@ export default function learningRoutes(ctx) {
       return res.status(400).json({ error: 'only proposed merges can be dismissed' });
     }
     const decidedAt = new Date().toISOString();
-    db.prepare(`UPDATE learning_merge_proposals SET state = 'dismissed', decided_at = ?
-      WHERE id = ? AND user_id = ?`).run(decidedAt, p.id, req.user.id);
+    const tx = db.transaction(() => {
+      db.prepare(`UPDATE learning_merge_proposals SET state = 'dismissed', decided_at = ?
+        WHERE id = ? AND user_id = ?`).run(decidedAt, p.id, req.user.id);
+      // Durable history (migration 033): one row per decision, in the
+      // same transaction as the state flip. The helper never throws, so
+      // the dismissal cannot fail on a history write.
+      const hist = recordMergeProposalHistory(db, {
+        proposalId: p.id,
+        userId: req.user.id,
+        decision: 'dismissed',
+        decidedBy: req.user.id,
+        decidedAt,
+        similarity: avgProposalSimilarity(db, p),
+        reason: req.body?.reason ?? null,
+        snapshot: { ...p, state: 'dismissed', decided_at: decidedAt },
+      }, logger);
+      if (!hist.ok) logger.warn(`Learning merge dismiss: history row not written for ${p.id}`);
+    });
+    tx();
     audit('learning.merge.dismiss', 'learning_merge_proposal', p.id, req.user.id, {
       cluster_id: p.cluster_id,
     });
@@ -419,6 +440,22 @@ export default function learningRoutes(ctx) {
       db.prepare(`UPDATE learning_merge_proposals
         SET state = 'approved', into_candidate_id = ?, decided_at = ?
         WHERE id = ? AND user_id = ?`).run(survivor.id, now, p.id, req.user.id);
+      // Durable history (migration 033): one row per decision, in the
+      // same transaction as the merge itself. The helper never throws,
+      // so an approval cannot fail on a history write.
+      const hist = recordMergeProposalHistory(db, {
+        proposalId: p.id,
+        userId: req.user.id,
+        survivorCandidateId: survivor.id,
+        mergedCandidateIds: losers.map(l => l.id),
+        decision: 'approved',
+        decidedBy: req.user.id,
+        decidedAt: now,
+        similarity: avgProposalSimilarity(db, p),
+        reason: `merged ${losers.length} candidate(s) into ${survivor.id}`,
+        snapshot: { ...p, state: 'approved', into_candidate_id: survivor.id, decided_at: now },
+      }, logger);
+      if (!hist.ok) logger.warn(`Learning merge approve: history row not written for ${p.id}`);
     });
     tx();
 

@@ -28,7 +28,8 @@ function freshDb() {
   const d = new Database(':memory:');
   for (const f of ['014_learning_events.sql', '022_learning_events.sql',
                    '026_learning_candidates.sql', '027_learning_clusters.sql',
-                   '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql']) {
+                   '028_learning_skill_versions.sql', '032_learning_skill_versions_one_active.sql',
+                   '033_learning_merge_proposal_history.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   return d;
@@ -288,6 +289,79 @@ describe('POST /api/learning/cluster/backfill-legacy', () => {
     // Idempotent: second call imports nothing
     const again = await request(app).post('/api/learning/cluster/backfill-legacy').set(hdr);
     expect(again.body.result.imported).toBe(0);
+  });
+});
+
+describe('merge proposal history (033) — approve/dismiss', () => {
+  function seedPair() {
+    seedCandidate(U, { id: 'c1', title: 'Deploy health check',
+      draft: ['ping the staging health endpoint'], score: 0.9, verified: 2 });
+    seedCandidate(U, { id: 'c2', title: 'Staging health monitor',
+      draft: ['check the staging health endpoint'], score: 0.8, verified: 3 });
+  }
+  async function runAndGetProposal(app) {
+    const run = await request(app).post('/api/learning/cluster/run')
+      .set(hdr).send({ threshold: 0.4 });
+    expect(run.body.stats.proposals_created).toBe(1);
+    const props = await request(app).get('/api/learning/merge-proposals').set(hdr);
+    return props.body.proposals[0].id;
+  }
+
+  it('approve writes a history row with survivor, losers, snapshot, user', async () => {
+    const { app } = makeCtx();
+    seedPair();
+    const pid = await runAndGetProposal(app);
+
+    const res = await request(app).post(`/api/learning/merge-proposals/${pid}/approve`).set(hdr);
+    expect(res.status).toBe(200);
+
+    const h = db.prepare('SELECT * FROM learning_merge_proposal_history WHERE proposal_id = ?').get(pid);
+    expect(h).toBeTruthy();
+    expect(h.decision).toBe('approved');
+    expect(h.decided_by).toBe(U);
+    expect(h.user_id).toBe(U);
+    expect(h.survivor_candidate_id).toBe('c1');
+    expect(JSON.parse(h.merged_candidate_ids)).toEqual(['c2']);
+    expect(h.reason).toContain('c1');
+    expect(h.similarity).toBeGreaterThan(0);
+    const snap = JSON.parse(h.proposal_snapshot);
+    expect(snap.id).toBe(pid);
+    expect(snap.state).toBe('approved');
+    expect(snap.into_candidate_id).toBe('c1');
+    expect(JSON.parse(snap.from_candidate_ids)).toEqual(['c1', 'c2']);
+    expect(h.decided_at).toBeTruthy();
+  });
+
+  it('dismiss writes a history row with no survivor and an optional reason', async () => {
+    const { app } = makeCtx();
+    seedPair();
+    const pid = await runAndGetProposal(app);
+
+    const res = await request(app).post(`/api/learning/merge-proposals/${pid}/dismiss`)
+      .set(hdr).send({ reason: 'keeping them separate for now' });
+    expect(res.status).toBe(200);
+
+    const h = db.prepare('SELECT * FROM learning_merge_proposal_history WHERE proposal_id = ?').get(pid);
+    expect(h).toBeTruthy();
+    expect(h.decision).toBe('dismissed');
+    expect(h.decided_by).toBe(U);
+    expect(h.user_id).toBe(U);
+    expect(h.survivor_candidate_id).toBeNull();
+    expect(JSON.parse(h.merged_candidate_ids)).toEqual([]);
+    expect(h.reason).toBe('keeping them separate for now');
+    const snap = JSON.parse(h.proposal_snapshot);
+    expect(snap.id).toBe(pid);
+    expect(snap.state).toBe('dismissed');
+  });
+
+  it('history writes are owner-scoped: cross-user approve leaves no row for the other user', async () => {
+    const { app } = makeCtx();
+    seedPair();
+    const pid = await runAndGetProposal(app);
+    const cross = await request(app).post(`/api/learning/merge-proposals/${pid}/approve`)
+      .set({ 'x-test-user': 'u-other' });
+    expect(cross.status).toBe(404);
+    expect(db.prepare('SELECT COUNT(*) c FROM learning_merge_proposal_history').get().c).toBe(0);
   });
 });
 
