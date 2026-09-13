@@ -193,19 +193,77 @@ describe('generateTests / runTests', () => {
     const r = await runTests(null);
     expect(r.ok).toBe(false);
   });
+  it('never executes learned step text: U+2028 comment-breakout is inert (H2)', async () => {
+    // The audit's live repro: a learned step action breaking out of its
+    // `//` comment via U+2028 and executing in the server process.
+    const payload = 'do thing\u2028; throw new Error(\'PWNED-41\'); //'; // contains \u2028
+    const id = seedCandidate('u1', {
+      risk_tier: 'high',
+      caps: JSON.stringify(['exec']),
+      draft: JSON.stringify([payload, 'second step']),
+    });
+    const { version } = compile(db, id, 'u1');
+    expect(version.kind).toBe('script');
+    const r = await runTests(version);
+    expect(r.ok).toBe(true);
+    const dyn = r.report.tests.find(t => t.name.includes('validate()'));
+    expect(dyn).toBeTruthy();
+    expect(dyn.status).toBe('pass');
+    // The injected statement must NOT have executed: no test detail may
+    // carry the sentinel.
+    expect(r.report.tests.some(t => (t.detail || '').includes('PWNED-41'))).toBe(false);
+    // Steps survive only as JSON string data plus terminator-stripped
+    // comments — no raw line terminators in the evaluated handler.
+    const handler = JSON.parse(version.artifact).handler;
+    expect(handler).not.toMatch(new RegExp('[\\r\u2028\u2029]'));
+    const m = handler.match(/steps:\s*(\[[\s\S]*?\]),\s*\n\s*\/\/ Pure/);
+    expect(m).toBeTruthy();
+    expect(JSON.parse(m[1])[0].action).toContain('PWNED-41');
+  });
 });
 
 describe('scanArtifact', () => {
-  it('scans clean when no scanner skill is installed (graceful degradation)', async () => {
+  it('blocks when no scanner skill is installed (fail-closed, H3)', async () => {
     const id = seedCandidate('u1');
     const { version } = compile(db, id, 'u1');
     await runTests(version);
     const v = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(version.id);
     const r = await scanArtifact(v, scannerCtx());
-    expect(r.ok).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(r.blocked).toBe(true);
     expect(r.verdict.verdict).toBe('no_scanner');
+    const row = db.prepare('SELECT state, scanner_verdict FROM learning_skill_versions WHERE id = ?').get(version.id);
+    expect(row.state).toBe('rejected');
+    expect(JSON.parse(row.scanner_verdict).verdict).toBe('no_scanner');
+  });
+  it('blocks when the scanner skill is disabled (fail-closed, H3)', async () => {
+    db.prepare('INSERT INTO skills (id, name, enabled) VALUES (?, ?, 0)').run('sk1', 'skill-scanner');
+    const id = seedCandidate('u1');
+    const { version } = compile(db, id, 'u1');
+    await runTests(version);
+    const v = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(version.id);
+    const r = await scanArtifact(v, scannerCtx());
+    expect(r.ok).toBe(false);
+    expect(r.blocked).toBe(true);
+    expect(r.verdict.verdict).toBe('scanner_disabled');
     const row = db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get(version.id);
-    expect(row.state).toBe('scanned');
+    expect(row.state).toBe('rejected');
+  });
+  it('permits the degraded scan only when LEARNING_REQUIRE_SCANNER=false', async () => {
+    process.env.LEARNING_REQUIRE_SCANNER = 'false';
+    try {
+      const id = seedCandidate('u1');
+      const { version } = compile(db, id, 'u1');
+      await runTests(version);
+      const v = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(version.id);
+      const r = await scanArtifact(v, scannerCtx());
+      expect(r.ok).toBe(true);
+      expect(r.verdict.verdict).toBe('no_scanner');
+      const row = db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get(version.id);
+      expect(row.state).toBe('scanned');
+    } finally {
+      delete process.env.LEARNING_REQUIRE_SCANNER;
+    }
   });
   it('rejects when the scanner gate blocks', async () => {
     db.prepare('INSERT INTO skills (id, name, enabled) VALUES (?, ?, 1)').run('sk1', 'skill-scanner');

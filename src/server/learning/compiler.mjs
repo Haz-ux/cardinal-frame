@@ -42,6 +42,29 @@ export const VERSION_STATES = [
   'compiled', 'tested', 'scanned', 'approved', 'active', 'rolled_back', 'rejected',
 ];
 
+// Every line terminator V8 treats as ending a `//` comment. \n is not
+// enough: \r, \u2028 and \u2029 also terminate line comments, which is
+// exactly how learned step text broke out of its comment (H2). Strip all
+// of them from any interpolation into evaluated code.
+const LINE_TERMINATORS_RE = /[\r\n\u2028\u2029]/g;
+
+function stripLineTerminators(value) {
+  return String(value ?? '').replace(LINE_TERMINATORS_RE, ' ');
+}
+
+/**
+ * LEARNING_REQUIRE_SCANNER — fail-closed switch for the learning scanner
+ * gate (H3). Defaults to TRUE: when the skill-scanner skill is missing or
+ * disabled, learning versions are BLOCKED instead of waved through with a
+ * 'no_scanner' verdict. Set explicitly to 'false' to allow the old
+ * degraded behavior; the approve route then requires an explicit admin
+ * acknowledgement (acknowledge_no_scanner: true). Read at call time so
+ * tests/operators can toggle it without a restart of this module.
+ */
+export function learningRequiresScanner() {
+  return process.env.LEARNING_REQUIRE_SCANNER !== 'false';
+}
+
 // Capability fragments that put a version in the Docker-only bucket.
 // Matching is case-insensitive substring on each requested cap.
 const DOCKER_CAPS = [
@@ -161,13 +184,24 @@ function renderMemory(candidate, spec) {
   });
 }
 
-// Safe handler skeleton for script/hybrid kinds. Steps are rendered as
-// comments — NEVER as raw exec strings. The only executable part is the
-// pure validate() function (no I/O), which the test gate runs in a vm
-// sandbox. run() always refuses: execution is not wired (shadow mode).
+// Safe handler skeleton for script/hybrid kinds. Learned step text is
+// embedded as JSON string DATA (it can never become code), and the
+// human-readable `//` comments are stripped of every V8 line terminator
+// (H2). The only executable part is the pure validate() function (no I/O),
+// which the test gate runs in a vm sandbox. run() always refuses:
+// execution is not wired (shadow mode).
 function renderHandlerSkeleton(kind, candidate, spec, caps) {
-  const stepComments = spec.procedure
-    .map(p => `    // ${p.step}. ${p.action.replace(/\n/g, ' ')}`)
+  // Defense in depth: step text exists here twice — once as JSON-encoded
+  // string data (string literals cannot break out of themselves), and once
+  // as terminator-stripped `//` comments for human readability. validate()
+  // never touches learned text at all.
+  const stepData = (spec.procedure || []).map(p => ({
+    step: Number(p && p.step) || 0,
+    action: String(p && p.action != null ? p.action : ''),
+    why: String(p && p.why != null ? p.why : ''),
+  }));
+  const stepComments = stepData
+    .map(p => `    // ${p.step}. ${stripLineTerminators(p.action)}`)
     .join('\n');
   const manifest = JSON.stringify({
     kind,
@@ -181,6 +215,9 @@ function renderHandlerSkeleton(kind, candidate, spec, caps) {
 // executeVersion() in src/server/learning/compiler.mjs.
 module.exports = {
   manifest: ${manifest},
+  // Procedure steps from the validated spec, as JSON string data only —
+  // learned text is data here, never interpolated into executable code.
+  steps: ${JSON.stringify(stepData, null, 2)},
   // Pure input validation (no I/O). The test gate executes this in a
   // sandboxed vm context.
   validate(input) {
@@ -414,8 +451,15 @@ export async function runTests(version) {
 /**
  * Run the pre-ingest scanner gate over the version artifact.
  * Refuses versions with failing tests. On verdict.blocked the version
- * goes to 'rejected' (with a 'rejected' event); otherwise it goes to
- * 'scanned'. Never throws outward.
+ * goes to 'rejected' (with a 'rejected' event).
+ *
+ * H3 FAIL-CLOSED: the learning path has no shallow-scan fallback (unlike
+ * skill-hub/plugin-market), so a missing or disabled scanner skill
+ * ('no_scanner'/'scanner_disabled') BLOCKS the version by default
+ * (state='rejected') instead of waving it through as 'scanned'. Set
+ * LEARNING_REQUIRE_SCANNER=false to permit the old degraded behavior;
+ * the approve route then requires explicit admin acknowledgement.
+ * Never throws outward.
  *
  * ctx: { db, stmts, executeSkill, logger, auditLog } — the scanner
  * gate's server ctx; routes pass their own.
@@ -453,6 +497,28 @@ export async function scanArtifact(version, ctx) {
         verdict: verdict.verdict,
       });
       return { ok: false, blocked: true, verdict };
+    }
+
+    // H3: fail closed on a degraded scanner verdict. A missing/disabled
+    // scanner must not produce 'scanned' learning versions — the verdict
+    // is recorded on the row (visible in the version detail payload) and
+    // the version is rejected with a clear reason.
+    const degradedVerdict = verdict
+      && (verdict.verdict === 'no_scanner' || verdict.verdict === 'scanner_disabled');
+    if (degradedVerdict && learningRequiresScanner()) {
+      db.prepare(`UPDATE learning_skill_versions
+        SET state = 'rejected', updated_at = ? WHERE id = ?`).run(now, version.id);
+      recordVersionEvent(db, version.id, 'rejected', version.user_id, {
+        reason: 'scanner unavailable — the learning pipeline requires the scanner gate (set LEARNING_REQUIRE_SCANNER=false to permit degraded scans)',
+        verdict: verdict.verdict,
+      });
+      return {
+        ok: false,
+        blocked: true,
+        degraded: true,
+        verdict,
+        error: `scanner unavailable (verdict=${verdict.verdict}) — learning versions require the scanner gate`,
+      };
     }
 
     db.prepare(`UPDATE learning_skill_versions

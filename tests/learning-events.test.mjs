@@ -79,6 +79,101 @@ describe('redact.mjs', () => {
     expect(redaction_status).toBe('clean');
     expect(JSON.parse(json).tool).toBe('file_read');
   });
+
+  it('masks compound/camelCase secret key names but not benign lookalikes', () => {
+    const { payload } = redactPayload({
+      db_password: 'hunter2',
+      aws_secret_access_key: 'wJalrXUtnFEMI',
+      smtp_password: 'pw',
+      secret_key: 'k',
+      dbPassword: 'camel',
+      nested: { github_pat: 'github_pat_11ABCDEFG_0abcDEF1234567890' },
+      monkey: 'banana',
+      keyboard: 'qwerty',
+      secretary: 'notes',
+      safe: 'hello',
+    });
+    for (const k of ['db_password', 'aws_secret_access_key', 'smtp_password', 'secret_key', 'dbPassword']) {
+      expect(payload[k]).toBe('[redacted-secret]');
+    }
+    expect(payload.nested.github_pat).toBe('[redacted-secret]');
+    expect(payload.monkey).toBe('banana');
+    expect(payload.keyboard).toBe('qwerty');
+    expect(payload.secretary).toBe('notes');
+    expect(payload.safe).toBe('hello');
+  });
+
+  it('masks extended token shapes', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const tokens = [
+      `123456789:${'A'.repeat(35)}`, // Telegram bot token
+      'xoxo-FAKE-TOKEN-123456789012-abcdef', // Slack org token
+      'xoxe-1-FAKE-TOKEN-abcdef1234', // Slack external token
+      'ASIAIOSFODNN7EXAMPLE', // AWS temp credentials
+      'ghu_abcDEF1234567890', // GitHub user token
+      'ghs_abcDEF1234567890', // GitHub server token
+      'ghr_abcDEF1234567890', // GitHub refresh token
+      'github_pat_11ABCDEFG_0abcDEF1234567890', // GitHub fine-grained PAT
+      jwt,
+      'whsec_abcDEF1234567890abcdef', // Stripe webhook secret
+      'npm_abcDEF1234567890abcdef', // npm token
+    ];
+    for (const tok of tokens) {
+      const { text } = redactText(`leaked ${tok} here`);
+      expect(text).not.toContain(tok);
+      expect(text).toContain('[redacted-api-key]');
+    }
+  });
+
+  it('masks token=/session= assignments in prose', () => {
+    const { text } = redactText('login with token=abc123def and session=xyz789qrs now');
+    expect(text).not.toContain('abc123def');
+    expect(text).not.toContain('xyz789qrs');
+    expect(text).toContain('[redacted-secret]');
+    const { text: plain } = redactText('the token expired yesterday, no session here');
+    expect(plain).toBe('the token expired yesterday, no session here');
+  });
+
+  it('masks DB connection-string passwords', () => {
+    const { text, redactions } = redactText('db=postgres://admin:s3cr3t@db.internal:5432/app');
+    expect(text).not.toContain('s3cr3t');
+    expect(text).toContain('postgres://admin:[redacted-secret]@');
+    expect(redactions).toContain('connString');
+    const { text: nopw } = redactText('db=mysql://root@db.internal:3306/shop');
+    expect(nopw).not.toContain('[redacted-secret]');
+  });
+
+  it('masks PGP private-key blocks', () => {
+    const pgp = '-----BEGIN PGP PRIVATE KEY BLOCK-----\nxsBNBFabc\n-----END PGP PRIVATE KEY BLOCK-----';
+    const { text } = redactText(`key:\n${pgp}`);
+    expect(text).not.toContain('xsBNBFabc');
+    expect(text).toContain('[redacted-private-key]');
+  });
+
+  it('masks dashless SSNs only with SSN context and plausible area', () => {
+    const { text } = redactText('ssn 123456789 on file');
+    expect(text).not.toContain('123456789');
+    expect(text).toContain('[redacted-ssn]');
+    expect(redactText('order 123456789 shipped').text).toContain('123456789');
+    expect(redactText('ssn 900123456 on file').text).toContain('900123456');
+    expect(redactText('ssn 666123456 on file').text).toContain('666123456');
+  });
+
+  it('masks numeric phone values only under phone-like keys', () => {
+    const { payload } = redactPayload({ phoneNumber: 5551234567, orderId: 1234567890, hotel: 5551234567 });
+    expect(payload.phoneNumber).toBe('[redacted-phone]');
+    expect(payload.orderId).toBe(1234567890);
+    expect(payload.hotel).toBe(5551234567);
+  });
+
+  it('partially masks IPv4 addresses but keeps dotted phones as phones', () => {
+    const { text, redactions } = redactText('from 192.168.1.10 at noon');
+    expect(text).not.toContain('192.168.1.10');
+    expect(text).toContain('192.168.x.x');
+    expect(redactions).toContain('ip');
+    const { text: phone } = redactText('call me at 555.123.4567');
+    expect(phone).toContain('[redacted-phone]');
+  });
 });
 
 describe('learning events writer (Phase 1)', () => {

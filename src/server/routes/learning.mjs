@@ -39,6 +39,7 @@ import {
   runTests,
   scanArtifact,
   recordVersionEvent,
+  learningRequiresScanner,
   VERSION_STATES,
 } from '../learning/compiler.mjs';
 import {
@@ -526,7 +527,11 @@ export default function learningRoutes(ctx) {
 
   // Compile a promoted candidate: compile -> generateTests -> runTests ->
   // scanArtifact (skipped when tests fail; failed versions never scan).
-  router.post('/learning/candidates/:id/compile', authMiddleware, apiLimiter, async (req, res) => {
+  // Admin-gated (H2/L8): the compile pipeline evaluates the handler
+  // skeleton in a vm sandbox, so it must not be reachable by arbitrary
+  // authenticated users. Owner-scoped: admins compile their own
+  // candidates; a cross-user id 404s.
+  router.post('/learning/candidates/:id/compile', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     const c = getCandidate(db, req.params.id, req.user.id);
     if (!c) return res.status(404).json({ error: 'not found' });
 
@@ -606,12 +611,33 @@ export default function learningRoutes(ctx) {
     if (!scanner || scanner.blocked === true) {
       return res.status(400).json({ error: 'version is blocked by the scanner gate' });
     }
+    // H3 fail-closed: a version that never saw a real scanner
+    // ('no_scanner'/'scanner_disabled') is un-approvable by default. When
+    // the scanner requirement is explicitly disabled
+    // (LEARNING_REQUIRE_SCANNER=false), an admin may still approve by
+    // explicitly acknowledging the degraded scan in the request body. The
+    // degraded verdict stays visible in the version detail payload.
+    const scannerDegraded =
+      scanner.verdict === 'no_scanner' || scanner.verdict === 'scanner_disabled';
+    if (scannerDegraded) {
+      if (learningRequiresScanner()) {
+        return res.status(400).json({
+          error: `scanner unavailable (verdict=${scanner.verdict}) — install/enable the skill-scanner skill before approving`,
+        });
+      }
+      if (req.body?.acknowledge_no_scanner !== true) {
+        return res.status(400).json({
+          error: `version has a degraded scanner verdict (${scanner.verdict}) — pass acknowledge_no_scanner: true to approve anyway`,
+        });
+      }
+    }
     const now = new Date().toISOString();
     db.prepare(`UPDATE learning_skill_versions SET state = 'approved', updated_at = ?
       WHERE id = ? AND user_id = ?`).run(now, row.id, targetUser);
     recordVersionEvent(db, row.id, 'approved', req.user.id, {
       disabled: true,
       note: 'approved but DISABLED — shadow mode, nothing executes',
+      scanner_degraded: scannerDegraded,
     });
     audit('learning.version.approve', 'learning_skill_version', row.id, req.user.id, {
       target_user: targetUser, version_number: row.version_number, kind: row.kind,

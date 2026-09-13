@@ -14,6 +14,7 @@ import os from 'os';
 import { createServer } from 'http';
 import { createRequire } from 'module';
 import { validateBody, schemas } from './validate.mjs';
+import { sanitizeCommand } from './command-safety.mjs';
 import * as mcp from './mcp-client.mjs';
 import * as embeddings from './embeddings.mjs';
 import { WebSocketServer } from 'ws';
@@ -1510,24 +1511,9 @@ function requireRole(...roles) {
 }
 
 // ─── Command Sanitization ─────────────────────────────────────────
-const ALLOWED_COMMANDS = ['echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort', 'uniq', 'curl', 'wget', 'python3', 'node', 'bash'];
-
-function sanitizeCommand(cmd) {
-  const trimmed = String(cmd || '').trim();
-  if (!trimmed) return { safe: false, error: 'Empty command' };
-  // Shell metacharacters are never allowed: execution is shell-free, so
-  // `;`, `|`, `$()`, backticks, etc. can only be injection attempts.
-  if (/[;&|><$`\\!{}()\[\]*?~#\n\r]/.test(trimmed)) {
-    return { safe: false, error: 'Shell metacharacters are not allowed; use a single simple command' };
-  }
-  const parts = trimmed.split(/\s+/);
-  const baseName = parts[0].split('/').pop();
-  if (!ALLOWED_COMMANDS.includes(baseName)) {
-    return { safe: false, error: `Command '${baseName}' not allowed. Allowed: ${ALLOWED_COMMANDS.join(', ')}` };
-  }
-  // argv0 + args: executed with shell:false, so no shell ever interprets this.
-  return { safe: true, command: parts[0], args: parts.slice(1), display: trimmed };
-}
+// ALLOWED_COMMANDS + sanitizeCommand live in command-safety.mjs (shared
+// with routes/agent.mjs to avoid a circular import); re-exported through
+// ctx.get sanitizeCommand() below for the existing call sites.
 
 // ─── Task Execution with Log Streaming ─────────────────────────────
 function executeTask(taskId, command) {

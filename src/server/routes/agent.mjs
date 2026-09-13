@@ -9,6 +9,8 @@ import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 import { record as recordLearningEvent } from '../learning/events.mjs';
 import { shadowRoute } from '../learning/retrieval.mjs';
+import { sanitizeCommand } from '../command-safety.mjs';
+import { safeFetch } from '../safe-fetch.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -30,10 +32,6 @@ import { shadowRoute } from '../learning/retrieval.mjs';
 
 const SANDBOX_DIR = process.env.AGENT_SANDBOX_DIR || '/home/haz/ai-workspace';
 const HOME_DIR = process.env.AGENT_HOME_DIR || '/home/haz';
-const CMD_BLOCKLIST = [
-  'rm -rf', 'sudo', 'reboot', 'shutdown', 'mkfs', 'dd if=', 'kill -9',
-  'systemctl stop', 'systemctl disable', 'chmod 777 /', 'chown root',
-];
 const ALLOWED_READ_EXT = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.json', '.md', '.txt', '.py', '.sh', '.html', '.css', '.yaml', '.yml', '.env', '.sql', '.xml'];
 const MAX_AGENT_STEPS = 20;
 const AGENT_STEP_DELAY_MS = 100;
@@ -54,13 +52,35 @@ function resolveSandboxPath(scope, targetPath) {
   return resolved;
 }
 
-function isCmdSafe(cmd) {
-  const lower = (cmd || '').toLowerCase().trim();
-  if (!lower || lower.length > 2000) return false;
-  for (const blocked of CMD_BLOCKLIST) {
-    if (lower.includes(blocked)) return false;
-  }
-  return true;
+// ─── Shared shell-free command runner (C1 fix) ─────────────────────
+// The agent's shell_exec tool and POST /api/agent/exec both run through
+// here: the shared sanitizeCommand allowlist + spawn(shell:false) — the same
+// path as executeTask. No shell ever interprets the command string, so
+// shell metacharacters are rejected, never executed. Returns a result
+// object (never throws for bad input) so agent loops stay alive.
+async function runAgentCommand(command, workDir) {
+  const check = sanitizeCommand(command);
+  if (!check.safe) return { error: `Command blocked by safety filter: ${check.error}` };
+  try { (await import('fs')).mkdirSync(workDir, { recursive: true }); }
+  catch (e) { return { error: `Cannot create working directory: ${e.message}` }; }
+  return new Promise((resolve) => {
+    const child = spawn(check.command, check.args, {
+      timeout: 30000,
+      shell: false,
+      env: { PATH: process.env.PATH },
+      cwd: workDir,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (e) => resolve({ error: `Execution failed: ${e.message}` }));
+    child.on('close', (code) => resolve({
+      exitCode: code ?? 0,
+      stdout: stdout.slice(0, 10000),
+      stderr: stderr.slice(0, 2000),
+      truncated: stdout.length > 10000,
+    }));
+  });
 }
 
 // ─── Agent Tool Registry ──────────────────────────────────────────
@@ -210,26 +230,21 @@ registerAgentTool(
 
 registerAgentTool(
   'shell_exec',
-  'Execute a shell command in the workspace. Dangerous commands are blocked.',
+  'Execute a command in the workspace. Runs through the server command allowlist with no shell: only allowlisted commands (echo, ls, cat, pwd, date, whoami, hostname, uname, df, free, uptime, ps, wc, head, tail, grep, sort, uniq, curl, wget, python3, node, bash) and no shell metacharacters (; | & > < $ ` \\ ! {} () [] * ? ~ #). Chained commands, pipes, redirects, and command substitution are rejected.',
   {
     type: 'object',
     properties: {
-      command: { type: 'string', description: 'Shell command to execute' },
+      command: { type: 'string', description: 'Single command to execute (no shell syntax: no pipes, redirects, or command substitution)' },
       scope: { type: 'string', enum: ['sandbox', 'home'] },
       cwd: { type: 'string', description: 'Working directory (relative to scope)' },
     },
     required: ['command'],
   },
   async (args, ctx) => {
-    if (!isCmdSafe(args.command)) return { error: 'Command blocked by safety filter' };
-    // execSync is injected by the skill runtime
+    // C1 fix: shared sanitizeCommand allowlist + shell:false argv execution
+    // (see runAgentCommand above). No shell ever interprets this string.
     const workDir = (ctx.scope || args.scope || 'sandbox') === 'home' ? HOME_DIR : resolveSandboxPath(ctx.scope || args.scope || 'sandbox', args.cwd || '.');
-    try {
-      const stdout = execSync(args.command, { timeout: 30000, maxBuffer: 1024 * 100, cwd: workDir, encoding: 'utf-8' });
-      return { exitCode: 0, stdout: stdout.slice(0, 5000), stderr: '' };
-    } catch (e) {
-      return { exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || '').toString().slice(0, 2000) };
-    }
+    return runAgentCommand(args.command, workDir);
   }
 );
 
@@ -273,7 +288,7 @@ registerAgentTool(
 
 registerAgentTool(
   'web_fetch',
-  'Fetch a URL and extract text content.',
+  'Fetch a URL and extract text content. Server-side request (SSRF-safe): private/loopback/metadata addresses are blocked; 15s timeout.',
   {
     type: 'object',
     properties: {
@@ -283,7 +298,9 @@ registerAgentTool(
   },
   async (args) => {
     try {
-      const resp = await fetch(args.url, { timeout: 15000 });
+      // H1 fix: route through safeFetch (blocks private/link-local/169.254.169.254,
+      // re-validates redirects) with a real timeout via AbortSignal.timeout.
+      const resp = await safeFetch(args.url, { signal: AbortSignal.timeout(15000) });
       const text = await resp.text();
       // Strip HTML tags if it's HTML
       const stripped = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
@@ -1276,13 +1293,14 @@ router.post('/agent/reject', authMiddleware, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/agent/exec — execute a shell command (agent mode only)
+// POST /api/agent/exec — execute a command (admin only). Same allowlist +
+// shell-free execution as the shell_exec tool (see runAgentCommand).
 router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   try {
     const { command, scope = 'sandbox', session_id, cwd } = req.body;
     if (!command) return res.status(400).json({ error: 'command required' });
-    if (!isCmdSafe(command)) return res.status(403).json({ error: 'Command blocked by safety filter' });
-    // execSync is injected by the skill runtime
+    const check = sanitizeCommand(command);
+    if (!check.safe) return res.status(403).json({ error: `Command blocked by safety filter: ${check.error}` });
     const workDir = scope === 'home' ? HOME_DIR : resolveSandboxPath(scope, cwd || '.');
     const actionId = randomUUID();
     const sessionId = (session_id && stmts.agentSessions.getById.get(session_id)) ? session_id : null;
@@ -1291,18 +1309,17 @@ router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, asy
     try {
       const { mkdirSync } = await import('fs');
       mkdirSync(workDir, { recursive: true });
-      const stdout = execSync(command, {
-        timeout: 30000,
-        maxBuffer: 1024 * 100,
-        cwd: workDir,
-        encoding: 'utf-8',
-      });
-      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, stdout.slice(0, 5000), 'completed', 'completed');
+      const result = await runAgentCommand(command, workDir);
+      if (result.error) {
+        stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', result.error.slice(0, 2000), 'failed');
+        return res.json({ exitCode: 1, stdout: '', stderr: result.error.slice(0, 2000), action_id: actionId });
+      }
+      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, result.stdout.slice(0, 5000), 'completed', 'completed');
       broadcast('agent:action', { type: 'exec', command, session_id: sessionId, action_id: actionId });
-      res.json({ exitCode: 0, stdout: stdout.slice(0, 5000), stderr: '', action_id: actionId });
+      res.json({ exitCode: result.exitCode, stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 2000), action_id: actionId });
     } catch (e) {
-      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || '').slice(0, 2000), 'failed');
-      res.json({ exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || '').toString().slice(0, 2000), action_id: actionId });
+      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || e.message || '').toString().slice(0, 2000), 'failed');
+      res.json({ exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || e.message).toString().slice(0, 2000), action_id: actionId });
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

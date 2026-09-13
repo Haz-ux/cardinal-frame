@@ -15,6 +15,14 @@ const MIGRATIONS = join(__dirname, '..', 'src', 'server', 'migrations');
 let db;
 let app;
 let auditCalls;
+// Mock scanner skill output for tests that need a genuinely 'scanned'
+// version (the real scanner skill is not installed in test DBs).
+let mockScannerOutput = null;
+
+function installMockScanner(output = { verdict: 'clean', blocked: false, risk_score: 0, reasons: [] }) {
+  db.prepare('INSERT INTO skills (id, name, enabled) VALUES (?, ?, 1)').run('sk-scanner', 'skill-scanner');
+  mockScannerOutput = output;
+}
 
 function freshDb() {
   const d = new Database(':memory:');
@@ -29,13 +37,16 @@ function makeApp() {
   auditCalls = [];
   const ctx = {
     db,
-    stmts: {},
+    stmts: { skills: { getByName: db.prepare('SELECT * FROM skills WHERE name = ?') } },
     logger: { info() {}, debug() {}, warn() {}, error() {} },
     audit: (action, resourceType, resourceId, userId, details) => {
       auditCalls.push({ action, resourceType, resourceId, userId, details });
     },
     auditLog: () => {},
-    executeSkill: async () => { throw new Error('no skills'); },
+    executeSkill: async () => {
+      if (mockScannerOutput) return { ok: true, output: mockScannerOutput };
+      throw new Error('no skills');
+    },
     authMiddleware: (req, res, next) => {
       const u = req.headers['x-test-user'];
       if (!u) return res.status(401).json({ error: 'unauthorized' });
@@ -85,17 +96,41 @@ function seedCandidate(userId, overrides = {}) {
 
 async function compileAs(userId) {
   const cand = seedCandidate(userId);
-  const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H(userId));
+  const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H(userId, 'admin'));
   return { cand, res };
+}
+
+// A version row that reached 'scanned' with a degraded scanner verdict —
+// what legacy rows (and LEARNING_REQUIRE_SCANNER=false rows) look like.
+function legacyNoScannerVersion(userId = 'u1') {
+  const cand = seedCandidate(userId);
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO learning_skill_versions
+    (id, user_id, candidate_id, version_number, kind, spec, rationale, artifact,
+     content_hash, requires_docker, state, test_report, scanner_verdict, created_at, updated_at)
+    VALUES (?, ?, ?, 1, 'prompt_template', '{}', 'r', '{}', 'abc', 0, 'scanned',
+      ?, ?, ?, ?)`)
+    .run(id, userId, cand, JSON.stringify({ passed: 2, failed: 0 }),
+      JSON.stringify({ blocked: false, verdict: 'no_scanner', note: 'legacy row' }), now, now);
+  return id;
 }
 
 beforeEach(() => {
   db = freshDb();
   app = makeApp();
+  mockScannerOutput = null;
+  delete process.env.LEARNING_REQUIRE_SCANNER;
 });
 
 describe('POST /learning/candidates/:id/compile', () => {
+  it('requires admin (H2/L8)', async () => {
+    const cand = seedCandidate('u1');
+    expect((await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'))).status).toBe(403);
+    expect((await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'))).status).toBe(200);
+  });
   it('compiles a promoted candidate through the full pipeline', async () => {
+    installMockScanner();
     const { res } = await compileAs('u1');
     expect(res.status).toBe(200);
     const v = res.body.version;
@@ -106,24 +141,30 @@ describe('POST /learning/candidates/:id/compile', () => {
     expect(v.content_hash).toHaveLength(12);
     expect(v.requires_docker).toBe(false);
     expect(v.test_summary).toEqual({ passed: 2, failed: 0 });
-    expect(v.scanner).toEqual({ verdict: 'no_scanner', blocked: false });
+    expect(v.scanner).toEqual({ verdict: 'clean', blocked: false });
     expect(v.candidate_title).toBe('Fix the stuck queue');
     expect(auditCalls.some(a => a.action === 'learning.version.compile')).toBe(true);
   });
+  it('rejects the version when no scanner skill is installed (fail-closed, H3)', async () => {
+    const { res } = await compileAs('u1');
+    expect(res.status).toBe(200);
+    expect(res.body.version.state).toBe('rejected');
+    expect(res.body.version.scanner).toEqual({ verdict: 'no_scanner', blocked: false });
+  });
   it('404s for a missing or cross-user candidate', async () => {
     const cand = seedCandidate('u1');
-    expect((await request(app).post('/api/learning/candidates/nope/compile').set(H('u1'))).status).toBe(404);
-    expect((await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u2'))).status).toBe(404);
+    expect((await request(app).post('/api/learning/candidates/nope/compile').set(H('u1', 'admin'))).status).toBe(404);
+    expect((await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u2', 'admin'))).status).toBe(404);
   });
   it('400s when the candidate is not promoted', async () => {
     const cand = seedCandidate('u1', { state: 'candidate' });
-    const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'));
+    const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'));
     expect(res.status).toBe(400);
   });
   it('400s with errors and writes nothing when the spec is invalid', async () => {
     const cand = seedCandidate('u1', { draft: JSON.stringify('prose blob, not steps') });
     const before = db.prepare('SELECT COUNT(*) c FROM learning_skill_versions').get().c;
-    const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'));
+    const res = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'));
     expect(res.status).toBe(400);
     expect(res.body.errors.length).toBeGreaterThan(0);
     expect(db.prepare('SELECT COUNT(*) c FROM learning_skill_versions').get().c).toBe(before);
@@ -131,7 +172,7 @@ describe('POST /learning/candidates/:id/compile', () => {
   it('bumps version_number on re-compile', async () => {
     const { cand, res } = await compileAs('u1');
     expect(res.body.version.version_number).toBe(1);
-    const res2 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'));
+    const res2 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'));
     expect(res2.body.version.version_number).toBe(2);
   });
 });
@@ -148,6 +189,7 @@ describe('GET /learning/skill-versions', () => {
     expect(res.body.version.id).toBe(list.body.versions[0].id);
   });
   it('filters by state and rejects bad states', async () => {
+    installMockScanner();
     await compileAs('u1');
     const ok = await request(app).get('/api/learning/skill-versions?state=scanned').set(H('u1'));
     expect(ok.body.versions).toHaveLength(1);
@@ -164,6 +206,7 @@ describe('GET /learning/skill-versions', () => {
 
 describe('GET /learning/skill-versions/:id', () => {
   it('returns full detail with history', async () => {
+    installMockScanner();
     const { res } = await compileAs('u1');
     const id = res.body.version.id;
     const det = await request(app).get(`/api/learning/skill-versions/${id}`).set(H('u1'));
@@ -172,8 +215,15 @@ describe('GET /learning/skill-versions/:id', () => {
     expect(v.spec.procedure).toHaveLength(2);
     expect(v.artifact).toContain('## Procedure');
     expect(v.test_report.passed).toBe(2);
-    expect(v.scanner_verdict.verdict).toBe('no_scanner');
+    expect(v.scanner_verdict.verdict).toBe('clean');
     expect(v.history.map(h => h.action)).toEqual(['compiled', 'tested', 'scanned']);
+  });
+  it('exposes the degraded scanner verdict in the detail payload (H3)', async () => {
+    const id = legacyNoScannerVersion('u1');
+    const det = await request(app).get(`/api/learning/skill-versions/${id}`).set(H('u1'));
+    expect(det.status).toBe(200);
+    expect(det.body.version.scanner_verdict.verdict).toBe('no_scanner');
+    expect(det.body.version.scanner).toEqual({ verdict: 'no_scanner', blocked: false });
   });
   it('404s for other users (no existence leak)', async () => {
     const { res } = await compileAs('u1');
@@ -183,6 +233,7 @@ describe('GET /learning/skill-versions/:id', () => {
 
 describe('approve / activate / rollback', () => {
   async function approvedVersion(userId = 'u1') {
+    installMockScanner();
     const { res } = await compileAs(userId);
     const id = res.body.version.id;
     const ap = await request(app).post(`/api/learning/skill-versions/${id}/approve?user_id=${userId}`).set(H('admin', 'admin'));
@@ -194,6 +245,7 @@ describe('approve / activate / rollback', () => {
     expect((await request(app).post(`/api/learning/skill-versions/${res.body.version.id}/approve`).set(H('u1'))).status).toBe(403);
   });
   it('admin approve without ?user_id= 404s (owner-scoped)', async () => {
+    installMockScanner();
     const { res } = await compileAs('u1');
     expect((await request(app).post(`/api/learning/skill-versions/${res.body.version.id}/approve`).set(H('admin', 'admin'))).status).toBe(404);
   });
@@ -205,6 +257,28 @@ describe('approve / activate / rollback', () => {
     const det = await request(app).get(`/api/learning/skill-versions/${id}`).set(H('u1'));
     expect(det.body.version.history.map(h => h.action)).toContain('approved');
   });
+  it('approve rejects a no_scanner version by default (H3 fail-closed)', async () => {
+    const id = legacyNoScannerVersion('u1');
+    const ap = await request(app).post(`/api/learning/skill-versions/${id}/approve?user_id=u1`).set(H('admin', 'admin'));
+    expect(ap.status).toBe(400);
+    expect(ap.body.error).toMatch(/no_scanner/);
+  });
+  it('approve with LEARNING_REQUIRE_SCANNER=false requires explicit acknowledgement (H3)', async () => {
+    const id = legacyNoScannerVersion('u1');
+    process.env.LEARNING_REQUIRE_SCANNER = 'false';
+    try {
+      const noAck = await request(app).post(`/api/learning/skill-versions/${id}/approve?user_id=u1`)
+        .set(H('admin', 'admin')).send({});
+      expect(noAck.status).toBe(400);
+      expect(noAck.body.error).toMatch(/acknowledge_no_scanner/);
+      const ack = await request(app).post(`/api/learning/skill-versions/${id}/approve?user_id=u1`)
+        .set(H('admin', 'admin')).send({ acknowledge_no_scanner: true });
+      expect(ack.status).toBe(200);
+      expect(ack.body.version.state).toBe('approved');
+    } finally {
+      delete process.env.LEARNING_REQUIRE_SCANNER;
+    }
+  });
   it('approve rejects non-scanned states', async () => {
     const { id, ap } = await approvedVersion();
     expect(ap.status).toBe(200);
@@ -212,14 +286,15 @@ describe('approve / activate / rollback', () => {
     expect(again.status).toBe(400);
   });
   it('activate rolls back the previously active version atomically', async () => {
+    installMockScanner();
     const cand = seedCandidate('u1');
-    const c1 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'));
+    const c1 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'));
     const v1 = c1.body.version.id;
     await request(app).post(`/api/learning/skill-versions/${v1}/approve?user_id=u1`).set(H('admin', 'admin'));
     const a1 = await request(app).post(`/api/learning/skill-versions/${v1}/activate?user_id=u1`).set(H('admin', 'admin'));
     expect(a1.body.version.state).toBe('active');
 
-    const c2 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1'));
+    const c2 = await request(app).post(`/api/learning/candidates/${cand}/compile`).set(H('u1', 'admin'));
     const v2 = c2.body.version.id;
     expect(c2.body.version.version_number).toBe(2);
     await request(app).post(`/api/learning/skill-versions/${v2}/approve?user_id=u1`).set(H('admin', 'admin'));
@@ -236,6 +311,7 @@ describe('approve / activate / rollback', () => {
     expect(auditCalls.some(a => a.action === 'learning.version.activate')).toBe(true);
   });
   it('activate only works from approved', async () => {
+    installMockScanner();
     const { res } = await compileAs('u1');
     const r = await request(app).post(`/api/learning/skill-versions/${res.body.version.id}/activate?user_id=u1`).set(H('admin', 'admin'));
     expect(r.status).toBe(400);
