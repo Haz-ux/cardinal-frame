@@ -1,5 +1,5 @@
 import express from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { execSync, spawn } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
@@ -7,6 +7,7 @@ import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } fro
 import { sanitizeFtsQuery } from './memory.mjs';
 import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
+import { record as recordLearningEvent } from '../learning/events.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -464,6 +465,29 @@ function writeSessionMemory(session, outcome, detail) {
   } catch (e) { _deps.logger.error(`Agent loop memory write-back failed: ${e.message}`); }
 }
 
+// ─── Phase 1: durable learning events (capture-only) ─────────────
+// Writes one redacted, user-scoped, idempotent evidence row per tool
+// outcome and per terminal turn. recordLearningEvent() never throws and
+// never triggers reviews, candidates, or skill changes — the loop's
+// behavior is unchanged when capture is disabled or fails.
+function captureLearningEvent(session, { type, payload, outcome, terminalVersion }) {
+  try {
+    recordLearningEvent(_deps.db, {
+      userId: session.user_id,
+      conversationId: session.conversation_id || session.id,
+      traceId: session.id,
+      type,
+      payload,
+      outcome,
+      terminalVersion,
+    });
+  } catch { /* record() is already never-throw; belt and suspenders */ }
+}
+
+function terminalVersionFor(text, step) {
+  return createHash('sha256').update(`${step}|${String(text || '').slice(0, 2000)}`).digest('hex').slice(0, 16);
+}
+
 async function runAgentLoop(sessionId, options = {}) {
   const session = _deps.stmts.agentSessions.getById.get(sessionId);
   if (!session) throw new Error('Session not found');
@@ -556,6 +580,13 @@ Remember:
       stepCounter++;
 
       writeSessionMemory(session, 'failed', e.message);
+      // Phase 1 capture: terminal turn (LLM failure)
+      captureLearningEvent(session, {
+        type: 'turn_terminal',
+        outcome: 'failed',
+        terminalVersion: terminalVersionFor(e.message, step + 1),
+        payload: { step: step + 1, errorPreview: String(e.message).slice(0, 500) },
+      });
       return { completed: false, error: e.message, steps: step + 1, tokens: totalTokens };
     }
 
@@ -604,6 +635,13 @@ Remember:
 
           _deps.stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
           stepCounter++;
+          // Phase 1 capture: terminal turn (paused for approval)
+          captureLearningEvent(session, {
+            type: 'turn_terminal',
+            outcome: 'awaiting_approval',
+            terminalVersion: actionId,
+            payload: { step: step + 1, tool: toolName, actionId },
+          });
           return {
             completed: false,
             paused: true,
@@ -632,6 +670,20 @@ Remember:
           'completed'
         );
         stepCounter++;
+
+        // Phase 1 capture: tool outcome evidence (redacted, idempotent on actionId)
+        captureLearningEvent(session, {
+          type: 'tool_outcome',
+          outcome: result && result.error ? 'failed' : 'completed',
+          terminalVersion: actionId,
+          payload: {
+            tool: toolName,
+            target: toolArgs.path || toolArgs.command || toolArgs.query || toolName,
+            step: step + 1,
+            success: !(result && result.error),
+            resultPreview: JSON.stringify(result).slice(0, 500),
+          },
+        });
 
         _deps.broadcast('agent:step', {
           session_id: sessionId,
@@ -689,6 +741,17 @@ Remember:
     } catch (e) { _deps.logger.error(`Comms reply hook failed: ${e.message}`); }
 
     writeSessionMemory(session, 'completed', content);
+    // Phase 1 capture: terminal turn (final response)
+    captureLearningEvent(session, {
+      type: 'turn_terminal',
+      outcome: 'completed',
+      terminalVersion: terminalVersionFor(content, step + 1),
+      payload: {
+        step: step + 1,
+        tokens: totalTokens,
+        summaryPreview: content.slice(0, 500),
+      },
+    });
     return {
       completed: true,
       summary: content,
@@ -702,6 +765,13 @@ Remember:
   _deps.broadcast('agent:loop:complete', { session_id: sessionId, steps: maxSteps, summary: 'Max steps reached', tokens: totalTokens });
 
   writeSessionMemory(session, 'max_steps_reached', `Stopped after ${maxSteps} steps without a final summary.`);
+  // Phase 1 capture: terminal turn (max steps)
+  captureLearningEvent(session, {
+    type: 'turn_terminal',
+    outcome: 'max_steps_reached',
+    terminalVersion: terminalVersionFor('max_steps', maxSteps),
+    payload: { steps: maxSteps, tokens: totalTokens },
+  });
   return {
     completed: false,
     reason: 'max_steps_reached',
