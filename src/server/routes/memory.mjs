@@ -29,8 +29,11 @@ function checkEmbedTexts(texts) {
  * Sanitize a user query for FTS5 MATCH. Each token is double-quoted so FTS5
  * special characters (", *, (, OR, :, etc.) can't break query syntax and 500
  * the search. Returns null when the query has no searchable tokens.
+ *
+ * Exported for reuse anywhere an FTS5 MATCH query is built (e.g. the agent
+ * loop's memory recall) — never hand-build MATCH strings at call sites.
  */
-function sanitizeFtsQuery(q) {
+export function sanitizeFtsQuery(q) {
   const tokens = String(q || '')
     .split(/\s+/)
     .map(t => t.trim())

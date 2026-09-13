@@ -4,6 +4,7 @@ import { execSync, spawn } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
+import { sanitizeFtsQuery } from './memory.mjs';
 import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 
@@ -433,6 +434,36 @@ async function executeAgentTool(toolName, args, ctx) {
 // Runs autonomously server-side: LLM plans → calls tools → gets results → continues
 // Broadcasts progress over WebSocket. Returns final summary.
 
+// ─── Memory write-back (Muse pattern) ─────────────────────────────
+// The agent recalls memories before acting; it also records what the
+// session taught it. One episodic memory per terminal session, redacted,
+// with the session id as provenance. The learning pipeline can distill
+// these into procedures later — this is the fast write-first layer.
+function redactForMemory(text) {
+  return String(text || '')
+    .replace(/(api[_-]?key|secret|password|passwd|token|bearer)\s*[:=]\s*['"]?[^\s'"]+/gi, '$1=[redacted]')
+    .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[redacted private key]');
+}
+
+function writeSessionMemory(session, outcome, detail) {
+  try {
+    const actions = _deps.stmts.agentActions.getBySession.all(session.id);
+    const keyActions = actions
+      .filter(a => ['write', 'exec', 'response'].includes(a.action_type))
+      .slice(-8)
+      .map(a => `- ${a.action_type} ${a.target || ''}: ${String(a.result || a.content || '').slice(0, 160)}`)
+      .join('\n');
+    const content = redactForMemory(
+      `[agent session ${session.id}] Task: ${session.task}\n` +
+      `Outcome: ${outcome}\n` +
+      (detail ? `Detail: ${String(detail).slice(0, 500)}\n` : '') +
+      (keyActions ? `Key actions:\n${keyActions}` : 'No actions recorded.')
+    ).slice(0, 4000);
+    _deps.stmts.memories.insert.run(randomUUID(), session.user_id, 'episodic', content, `agent:${session.id}`, 0.7);
+    _deps.logger.info(`Agent loop: wrote session memory for ${session.id} (${outcome})`);
+  } catch (e) { _deps.logger.error(`Agent loop memory write-back failed: ${e.message}`); }
+}
+
 async function runAgentLoop(sessionId, options = {}) {
   const session = _deps.stmts.agentSessions.getById.get(sessionId);
   if (!session) throw new Error('Session not found');
@@ -465,8 +496,11 @@ Remember:
   ];
 
   // ─── Memory recall: inject relevant memories into context ──────
+  // Uses the shared FTS sanitizer (same as the memory search API) so task
+  // text with quotes/parens can't break the MATCH query.
   try {
-    const memResults = _deps.stmts.memories.search.all(session.task.slice(0, 50) + '*', session.user_id, 5);
+    const ftsQuery = sanitizeFtsQuery(session.task);
+    const memResults = ftsQuery ? _deps.stmts.memories.search.all(ftsQuery, session.user_id, 5) : [];
     if (memResults && memResults.length > 0) {
       const memText = memResults.map(m => `- [${m.category}] ${m.content.slice(0, 200)}`).join('\n');
       messages.splice(1, 0, {
@@ -521,6 +555,7 @@ Remember:
       _deps.stmts.agentActions.insert.run(errActionId, sessionId, errStepIdx, 'error', 'llm_call', e.message, JSON.stringify({ error: e.message }), 'failed');
       stepCounter++;
 
+      writeSessionMemory(session, 'failed', e.message);
       return { completed: false, error: e.message, steps: step + 1, tokens: totalTokens };
     }
 
@@ -541,18 +576,18 @@ Remember:
           args: toolArgs,
         });
 
-        // Execute the tool
-        const result = await executeAgentTool(toolName, toolArgs, ctx);
-
-        // Check if suggest mode requires approval
+        // Suggest mode: consequential tools need approval BEFORE they run
+        // (Muse pattern — the approval card gates the action; it never
+        // reviews something that already executed). The gated call is stored
+        // on the pending action and runs only when POST /agent/approve fires.
         if (session.mode === 'suggest' && ['file_write', 'shell_exec', 'git_op'].includes(toolName)) {
           const actionId = randomUUID();
           const stepIdx = stepCounter;
           _deps.stmts.agentActions.insert.run(
             actionId, sessionId, stepIdx, toolName === 'file_write' ? 'write' : 'exec',
             toolArgs.path || toolArgs.command || toolName,
-            toolArgs.content || JSON.stringify(toolArgs),
-            JSON.stringify(result),
+            JSON.stringify({ tool: toolName, args: toolArgs }),
+            'awaiting approval',
             'pending'
           );
 
@@ -562,7 +597,9 @@ Remember:
             action_id: actionId,
             tool: toolName,
             args: toolArgs,
-            result: result.error ? result : { preview: 'Draft created' },
+            preview: toolName === 'file_write'
+              ? { path: toolArgs.path, content: String(toolArgs.content || '').slice(0, 2000) }
+              : { command: toolArgs.command },
           });
 
           _deps.stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
@@ -576,6 +613,9 @@ Remember:
             tokens: totalTokens,
           };
         }
+
+        // Execute the tool
+        const result = await executeAgentTool(toolName, toolArgs, ctx);
 
         // Record the action
         const actionId = randomUUID();
@@ -648,6 +688,7 @@ Remember:
       }
     } catch (e) { _deps.logger.error(`Comms reply hook failed: ${e.message}`); }
 
+    writeSessionMemory(session, 'completed', content);
     return {
       completed: true,
       summary: content,
@@ -660,6 +701,7 @@ Remember:
   _deps.stmts.agentSessions.updateStatus.run('max_steps_reached', sessionId);
   _deps.broadcast('agent:loop:complete', { session_id: sessionId, steps: maxSteps, summary: 'Max steps reached', tokens: totalTokens });
 
+  writeSessionMemory(session, 'max_steps_reached', `Stopped after ${maxSteps} steps without a final summary.`);
   return {
     completed: false,
     reason: 'max_steps_reached',
@@ -1086,22 +1128,48 @@ router.post('/agent/write', authMiddleware, apiLimiter, async (req, res) => {
   }
 });
 
-// POST /api/agent/approve — approve a pending action (suggest mode)
+// POST /api/agent/approve — approve a pending action (suggest mode).
+// The gated tool call executes HERE, after approval — never before.
+// The result is recorded on the action so a resumed loop sees what happened.
 router.post('/agent/approve', authMiddleware, apiLimiter, async (req, res) => {
   try {
-    const { action_id, scope = 'sandbox' } = req.body;
+    const { action_id } = req.body;
     if (!action_id) return res.status(400).json({ error: 'action_id required' });
     const action = db.prepare('SELECT * FROM agent_actions WHERE id = ?').get(action_id);
     if (!action) return res.status(404).json({ error: 'Action not found' });
     if (action.status !== 'pending') return res.status(400).json({ error: 'Action already processed' });
 
-    const resolved = resolveSandboxPath(scope, action.target);
-    const fs = await import('fs');
-    await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
-    await fs.promises.writeFile(resolved, action.content || '', 'utf-8');
-    stmts.agentActions.updateStatus.run('approved', req.user.id, action_id);
-    broadcast('agent:action', { type: 'approved', action_id, path: action.target });
-    res.json({ action: 'approved', path: action.target, action_id });
+    const session = action.session_id ? stmts.agentSessions.getById.get(action.session_id) : null;
+    if (session && session.user_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Recover the gated tool call. New pending actions store { tool, args };
+    // legacy 'write' drafts stored raw file content.
+    const GATED_TOOLS = ['file_write', 'shell_exec', 'git_op'];
+    let toolName = null;
+    let toolArgs = {};
+    try {
+      const parsed = JSON.parse(action.content || '');
+      if (parsed && GATED_TOOLS.includes(parsed.tool)) { toolName = parsed.tool; toolArgs = parsed.args || {}; }
+    } catch {}
+    if (!toolName && action.action_type === 'write') {
+      toolName = 'file_write';
+      toolArgs = { path: action.target, content: action.content || '' };
+    }
+    if (!toolName) return res.status(400).json({ error: 'Cannot determine gated tool for this action' });
+
+    const result = await executeAgentTool(toolName, toolArgs, {
+      scope: session?.scope || 'sandbox',
+      sessionId: session?.id,
+      userId: req.user.id,
+    });
+    const status = result.error ? 'failed' : 'approved';
+    stmts.agentActions.updateResult.run(JSON.stringify(result).slice(0, 5000), status, action_id);
+    stmts.agentActions.updateStatus.run(status, req.user.id, action_id);
+    broadcast('agent:action', { type: status, action_id, tool: toolName, session_id: session?.id });
+    logger.info(`Agent action ${action_id} ${status} by ${req.user.id}: ${toolName}`);
+    res.json({ action: status, tool: toolName, action_id, error: result.error || undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
