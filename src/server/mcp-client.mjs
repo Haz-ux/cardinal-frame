@@ -14,6 +14,10 @@ import { createInterface } from 'readline';
 // Map<serverId, { process, tools[], pending: Map<id, {resolve,reject,timeout}>, initialized }>
 const connections = new Map();
 
+// Cap concurrent MCP server processes — each connection is a live child
+// process, so an uncapped count is a process-exhaustion DoS vector.
+const MAX_CONNECTIONS = 10;
+
 // ─── JSON-RPC helpers ───────────────────────────────────────────────
 function makeRequest(method, params, id) {
   return JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
@@ -28,6 +32,9 @@ export function connectServer(serverId, command, args = []) {
   return new Promise((resolve, reject) => {
     if (connections.has(serverId)) {
       disconnectServer(serverId); // clean up old connection
+    }
+    if (connections.size >= MAX_CONNECTIONS) {
+      return reject(new Error(`MCP connection limit reached (${MAX_CONNECTIONS}) — disconnect a server first`));
     }
 
     let child;
@@ -136,7 +143,8 @@ function handleResponse(serverId, msg) {
   const conn = connections.get(serverId);
   if (!conn) return;
 
-  if (msg.id && conn.pending.has(msg.id)) {
+  // JSON-RPC ids may be 0 (falsy) — check for null/undefined explicitly.
+  if (msg.id !== undefined && msg.id !== null && conn.pending.has(msg.id)) {
     const p = conn.pending.get(msg.id);
     clearTimeout(p.timeout);
     conn.pending.delete(msg.id);

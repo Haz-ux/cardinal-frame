@@ -12,8 +12,9 @@ export default function metaRoutes(ctx) {
   const router = express.Router();
 
 // ─── MCP Server Management API ─────────────────────────────────────
-// Register a new MCP server
-router.post('/mcp/servers', authMiddleware, apiLimiter, async (req, res) => {
+// Register a new MCP server — ADMIN ONLY. The stdio `command` is spawned as a
+// child process on connect, so registration is equivalent to code execution.
+router.post('/mcp/servers', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const { name, transport, command, args, url } = req.body;
   if (!name) return res.status(400).json({ error: 'Name is required' });
   if (!transport || !['stdio', 'http'].includes(transport)) {
@@ -36,10 +37,16 @@ router.post('/mcp/servers', authMiddleware, apiLimiter, async (req, res) => {
   res.status(201).json(server);
 });
 
-// List all MCP servers
-router.get('/mcp/servers', optionalAuth, (_req, res) => {
+// List all MCP servers — authenticated users only. Command/args/url often
+// contain secrets (API keys), so they are only exposed to admins.
+router.get('/mcp/servers', authMiddleware, (_req, res) => {
   const rows = stmts.mcp.getAll.all();
-  res.json(rows.map(s => ({ ...s, args: JSON.parse(s.args), connected: mcp.isConnected(s.id) })));
+  const isAdmin = _req.user?.role === 'admin';
+  res.json(rows.map(s => {
+    const out = { ...s, args: JSON.parse(s.args), connected: mcp.isConnected(s.id) };
+    if (!isAdmin) { delete out.command; delete out.args; delete out.url; }
+    return out;
+  }));
 });
 
 // Delete an MCP server (admin only)
@@ -57,8 +64,9 @@ router.delete('/mcp/servers/:id', authMiddleware, requireRole('admin'), (req, re
   res.json({ deleted: true });
 });
 
-// Connect to an MCP server
-router.post('/mcp/servers/:id/connect', authMiddleware, apiLimiter, async (req, res) => {
+// Connect to an MCP server — ADMIN ONLY: this spawns the registered command
+// as a child process.
+router.post('/mcp/servers/:id/connect', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
   if (mcp.isConnected(req.params.id)) return res.status(409).json({ error: 'Already connected' });
@@ -82,8 +90,8 @@ router.post('/mcp/servers/:id/connect', authMiddleware, apiLimiter, async (req, 
   }
 });
 
-// Disconnect from an MCP server
-router.post('/mcp/servers/:id/disconnect', authMiddleware, apiLimiter, (req, res) => {
+// Disconnect from an MCP server — ADMIN ONLY: this kills child processes.
+router.post('/mcp/servers/:id/disconnect', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
 
@@ -93,8 +101,8 @@ router.post('/mcp/servers/:id/disconnect', authMiddleware, apiLimiter, (req, res
   res.json({ id: server.id, status: 'disconnected' });
 });
 
-// List tools from a specific MCP server
-router.get('/mcp/servers/:id/tools', optionalAuth, (req, res) => {
+// List tools from a specific MCP server — authenticated users only.
+router.get('/mcp/servers/:id/tools', authMiddleware, (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
 
