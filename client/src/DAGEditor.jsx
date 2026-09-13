@@ -26,6 +26,13 @@ const NODE_W = 200, NODE_H = 72, PORT_R = 6;
 const PORT_GAP = 24;
 const STACK_OFFSET = 28;
 
+// Port label for a node's output port: condition → T/F, branch → A/B/C, else ''.
+// Single source of truth — used both for rendering port tags and for edge labels.
+const portLabel = (type, i) =>
+  type === 'condition' ? (i === 0 ? 'T' : 'F')
+  : type === 'branch' ? (['A', 'B', 'C'][i] || '')
+  : '';
+
 // ─── SVG Glow Defs ─────────────────────────────────────────────────
 const DEFS = (
   <defs>
@@ -104,7 +111,7 @@ const DAGNode = memo(function DAGNode({ node, selected, isDragging, isTopOfStack
       {/* Output ports */}
       {Array.from({ length: outputCount }, (_, i) => {
         const py = NODE_H / 2 + (i - (outputCount - 1) / 2) * PORT_GAP;
-        const label = node.type === 'condition' ? (i === 0 ? 'T' : 'F') : node.type === 'branch' ? (['A','B','C'][i] || '') : '';
+        const label = portLabel(node.type, i);
         return (
           <g key={i}
             onMouseDown={e => { e.stopPropagation(); onPortDown(node.id, 'output', i, x + NODE_W, y + py); }}
@@ -681,21 +688,23 @@ export default function DAGEditor() {
 
   const onPortUp = useCallback((nodeId, portType, portIndex) => {
     if (!connecting) return;
-    let fromId, toId;
-    if (connecting.fromType === 'output' && portType === 'input') { fromId = connecting.fromId; toId = nodeId; }
-    else if (connecting.fromType === 'input' && portType === 'output') { fromId = nodeId; toId = connecting.fromId; }
+    let fromId, toId, sourcePort;
+    if (connecting.fromType === 'output' && portType === 'input') { fromId = connecting.fromId; toId = nodeId; sourcePort = connecting.fromIndex; }
+    else if (connecting.fromType === 'input' && portType === 'output') { fromId = nodeId; toId = connecting.fromId; sourcePort = portIndex; }
     if (fromId && toId && fromId !== toId) {
+      const fromNode = nodes.find(n => n.id === fromId);
+      const label = portLabel(fromNode?.type, sourcePort);
       setEdges(prev => {
-        if (prev.some(e => e.from === fromId && e.to === toId)) return prev;
-        return [...prev, { from: fromId, to: toId }];
+        if (prev.some(e => e.from === fromId && e.to === toId && (e.sourcePort ?? 0) === (sourcePort ?? 0))) return prev;
+        return [...prev, { from: fromId, to: toId, sourcePort, label }];
       });
     }
     setConnecting(null);
     setTempLine(null);
-  }, [connecting]);
+  }, [connecting, nodes]);
 
-  const deleteEdge = useCallback((from, to) => {
-    setEdges(prev => prev.filter(e => !(e.from === from && e.to === to)));
+  const deleteEdge = useCallback((from, to, sourcePort) => {
+    setEdges(prev => prev.filter(e => !(e.from === from && e.to === to && (e.sourcePort ?? 0) === (sourcePort ?? 0))));
     setSelectedEdge(null);
   }, []);
 
@@ -716,6 +725,11 @@ export default function DAGEditor() {
 
   const selectedNode = nodes.find(n => n.id === selectedId);
   const selectedCfg = selectedNode ? (NODE_TYPES[selectedNode.type] || NODE_TYPES.task) : null;
+
+  // Edge selection identity includes the source port — a condition's T and F
+  // edges (or branch A/B/C) between the same nodes are distinct edges.
+  const edgeSelMatch = (e) => selectedEdge && selectedEdge.from === e.from && selectedEdge.to === e.to &&
+    (selectedEdge.sourcePort ?? 0) === (e.sourcePort ?? 0);
 
   const getStackInfo = useCallback((nodeId) => {
     for (const [gid, nids] of Object.entries(stacks)) {
@@ -791,18 +805,18 @@ export default function DAGEditor() {
           <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
             {positionedEdges.map((e, i) => (
               <DAGEdge key={`${e.from.x}-${e.from.y}-${e.to.x}-${e.to.y}-${i}`}
-                from={e.from} to={e.to} color={e.color}
-                active={selectedEdge?.from === e.from && selectedEdge?.to === e.to}
+                from={e.from} to={e.to} color={e.color} label={e.label}
+                active={edgeSelMatch(e)}
                 running={running}
-                selected={selectedEdge?.from === e.from && selectedEdge?.to === e.to}
-                onClick={() => setSelectedEdge({ from: e.from, to: e.to })}
+                selected={edgeSelMatch(e)}
+                onClick={() => setSelectedEdge({ from: e.from, to: e.to, sourcePort: e.sourcePort })}
               />
             ))}
 
             {selectedEdge && (
-              <g style={{ cursor: 'pointer' }} onClick={() => deleteEdge(selectedEdge.from, selectedEdge.to)}>
-                <rect x={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.x + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.x) / 2 - 20} y={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.y + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.y) / 2 - 20} width="40" height="18" rx="4" fill={`${NEON.red}20`} stroke={NEON.red} strokeWidth="1" />
-                <text x={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.x + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.x) / 2} y={(positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.from.y + positionedEdges.find(e => e.from === selectedEdge.from && e.to === selectedEdge.to)?.to.y) / 2 - 10} fontSize="9" fill={NEON.red} textAnchor="middle" fontWeight="700">DELETE</text>
+              <g style={{ cursor: 'pointer' }} onClick={() => deleteEdge(selectedEdge.from, selectedEdge.to, selectedEdge.sourcePort)}>
+                <rect x={(positionedEdges.find(edgeSelMatch)?.from.x + positionedEdges.find(edgeSelMatch)?.to.x) / 2 - 20} y={(positionedEdges.find(edgeSelMatch)?.from.y + positionedEdges.find(edgeSelMatch)?.to.y) / 2 - 20} width="40" height="18" rx="4" fill={`${NEON.red}20`} stroke={NEON.red} strokeWidth="1" />
+                <text x={(positionedEdges.find(edgeSelMatch)?.from.x + positionedEdges.find(edgeSelMatch)?.to.x) / 2} y={(positionedEdges.find(edgeSelMatch)?.from.y + positionedEdges.find(edgeSelMatch)?.to.y) / 2 - 10} fontSize="9" fill={NEON.red} textAnchor="middle" fontWeight="700">DELETE</text>
               </g>
             )}
 

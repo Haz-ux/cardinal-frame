@@ -48,7 +48,8 @@ export function normalizeEdges(edges) {
     const source = e.source ?? e.from;
     const target = e.target ?? e.to;
     if (typeof source !== 'string' || typeof target !== 'string') continue;
-    out.push({ source, target });
+    // label/sourcePort are persisted by DAGEditor.jsx (T/F, A/B/C port tags).
+    out.push({ source, target, label: e.label ?? '', sourcePort: e.sourcePort ?? null });
   }
   return out;
 }
@@ -299,9 +300,10 @@ export async function runDag({ nodes, edges, sanitizeCommand, broadcast, dagId, 
     incoming.set(n.id, []);
     outgoing.set(n.id, []);
   }
+  let seq = 0; // creation order — stable fallback for legacy edges without sourcePort
   for (const e of normEdges) {
     if (!byId.has(e.source) || !byId.has(e.target)) continue;
-    outgoing.get(e.source).push(e.target);
+    outgoing.get(e.source).push({ target: e.target, label: e.label, sourcePort: e.sourcePort, i: seq++ });
     incoming.get(e.target).push(e.source);
   }
 
@@ -360,20 +362,21 @@ export async function runDag({ nodes, edges, sanitizeCommand, broadcast, dagId, 
     for (const r of settled) {
       const outs = outgoing.get(r.nodeId) || [];
       if (!outs.length) continue;
+      // Port order: persisted sourcePort first, creation order as fallback (legacy edges).
+      const byPort = [...outs].sort((a, b) => (a.sourcePort ?? 1e9) - (b.sourcePort ?? 1e9) || a.i - b.i);
       let takenTargets;
       if ((r.type === 'condition' || r.type === 'branch') && r.status === 'success' && r.taken) {
         const labels = r.type === 'condition' ? ['T', 'F'] : ['A', 'B', 'C'];
         const idx = labels.indexOf(r.taken);
-        // Outgoing edges are in connection order: port 0 = first label.
-        takenTargets = idx >= 0 ? outs.slice(idx, idx + 1) : outs.slice(0, 1);
+        takenTargets = idx >= 0 && byPort[idx] ? [byPort[idx].target] : [byPort[0].target];
       } else if (r.status === 'failed') {
         // A failed node halts its downstream path (standard DAG semantics).
-        for (const t of outs) {
-          if (!active.has(t) && !inactiveReason.has(t)) inactiveReason.set(t, 'upstream failed');
+        for (const o of outs) {
+          if (!active.has(o.target) && !inactiveReason.has(o.target)) inactiveReason.set(o.target, 'upstream failed');
         }
         continue;
       } else {
-        takenTargets = outs;
+        takenTargets = outs.map(o => o.target);
       }
       for (const t of takenTargets) active.add(t);
     }
