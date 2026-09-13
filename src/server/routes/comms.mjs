@@ -24,6 +24,16 @@ function webhookSecretsMatch(provided, expected) {
   return timingSafeEqual(a, b);
 }
 
+// Sender allowlist: when config.allowed_user_ids is a non-empty array, only
+// updates from those Telegram user ids are processed. Fail closed at ingress:
+// disallowed senders are acked without storing, replying, or agent-triggering.
+function telegramSenderAllowed(config, msg) {
+  const ids = config.allowed_user_ids;
+  if (!Array.isArray(ids) || ids.length === 0) return true;
+  const sid = String(msg.from?.id ?? '');
+  return sid !== '' && ids.map(String).includes(sid);
+}
+
 export default function commsRoutes(ctx) {
   const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
   const router = express.Router();
@@ -175,7 +185,13 @@ async function pollTelegram(channel) {
       
       const msg = update.message || update.channel_post;
       if (!msg || !msg.text) continue;
-      
+
+      // Sender allowlist: skip anyone not explicitly allowed, before storing.
+      if (!telegramSenderAllowed(config, msg)) {
+        logger.warn(`Skipped Telegram update from non-allowlisted sender ${msg.from?.id} for channel ${channel.name}`);
+        continue;
+      }
+
       // Store inbound message
       const commsMsg = storeCommsMessage(channel.id, 'telegram', 'inbound', {
         remote_id: String(msg.from?.id || msg.chat?.id || ''),
@@ -789,12 +805,22 @@ router.get('/comms/status', authMiddleware, (_req, res) => {
 // Register Telegram webhook (one-click setup)
 router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   try {
-    const { channel_id, webhook_url } = req.body;
+    const { channel_id, webhook_url, allowed_user_ids } = req.body;
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
     const config = JSON.parse(channel.config);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
+
+    // Sender allowlist: lock the bot to specific Telegram user ids. Accepts
+    // an array or a comma-separated string. Only allowlisted senders are
+    // processed by the webhook receiver and the poller.
+    if (allowed_user_ids !== undefined) {
+      const ids = Array.isArray(allowed_user_ids)
+        ? allowed_user_ids
+        : String(allowed_user_ids).split(',').map(s => s.trim()).filter(Boolean);
+      config.allowed_user_ids = ids.map(String);
+    }
 
     const baseUrl = webhook_url || req.body.base_url;
     if (!baseUrl) return res.status(400).json({ error: 'webhook_url or base_url required' });
@@ -817,7 +843,12 @@ router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
 
     logger.info(`Telegram webhook registered for channel ${channel.name}: ${fullUrl}`);
-    res.json({ ok: true, webhook_url: fullUrl, description: result.description || 'Webhook set' });
+    res.json({
+      ok: true,
+      webhook_url: fullUrl,
+      description: result.description || 'Webhook set',
+      allowed_user_ids: config.allowed_user_ids || [],
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -924,6 +955,12 @@ router.post('/comms/telegram/webhook', async (req, res) => {
     const update = req.body;
     const msg = update.message || update.channel_post;
     if (msg && msg.text) {
+      // Sender allowlist: drop updates from anyone not explicitly allowed.
+      // Ack ok so we don't signal the bot's configuration to strangers.
+      if (!telegramSenderAllowed(authConfig, msg)) {
+        logger.warn(`Rejected Telegram update from non-allowlisted sender ${msg.from?.id} for channel ${channel.id}`);
+        return res.json({ ok: true });
+      }
       const commsMsg = storeCommsMessage(channel.id, 'telegram', 'inbound', {
         remote_id: String(msg.from?.id || msg.chat?.id || ''),
         remote_username: msg.from?.username || msg.from?.first_name || '',

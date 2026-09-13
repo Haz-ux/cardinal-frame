@@ -179,13 +179,14 @@ describe('Comms Engine API', () => {
         .send({
           platform: 'telegram',
           name: 'webhook-test',
-          config: { bot_token: 'fake', auto_reply: false },
+          config: { bot_token: 'fake', auto_reply: false, webhook_secret: 'test-secret' },
           enabled: false,
         });
       const channelId = createRes.body.id;
 
       const res = await request(app)
         .post(`/api/comms/telegram/webhook?channel_id=${channelId}`)
+        .set('x-telegram-bot-api-secret-token', 'test-secret')
         .send({
           update_id: 99999,
           message: {
@@ -207,6 +208,90 @@ describe('Comms Engine API', () => {
       expect(msgRes.body[0].content).toBe('Hello from webhook test');
       expect(msgRes.body[0].direction).toBe('inbound');
       expect(msgRes.body[0].remote_username).toBe('testuser');
+    });
+
+    it('should reject webhook with wrong secret', async () => {
+      const createRes = await request(app)
+        .post('/api/comms/channels')
+        .set(adminAuth())
+        .send({
+          platform: 'telegram',
+          name: 'webhook-secret-test',
+          config: { bot_token: 'fake', webhook_secret: 'right-secret' },
+          enabled: false,
+        });
+      const channelId = createRes.body.id;
+
+      const res = await request(app)
+        .post(`/api/comms/telegram/webhook?channel_id=${channelId}`)
+        .set('x-telegram-bot-api-secret-token', 'wrong-secret')
+        .send({ message: { text: 'x', from: { id: 1 }, chat: { id: 1 } } });
+      expect(res.status).toBe(403);
+    });
+
+    describe('sender allowlist', () => {
+      let channelId;
+      beforeAll(async () => {
+        const createRes = await request(app)
+          .post('/api/comms/channels')
+          .set(adminAuth())
+          .send({
+            platform: 'telegram',
+            name: 'webhook-allowlist-test',
+            config: {
+              bot_token: 'fake',
+              auto_reply: false,
+              webhook_secret: 'allow-secret',
+              allowed_user_ids: ['4242'],
+            },
+            enabled: false,
+          });
+        channelId = createRes.body.id;
+      });
+
+      const postUpdate = (fromId, text) =>
+        request(app)
+          .post(`/api/comms/telegram/webhook?channel_id=${channelId}`)
+          .set('x-telegram-bot-api-secret-token', 'allow-secret')
+          .send({
+            update_id: Math.floor(Math.random() * 1e9),
+            message: {
+              message_id: 1,
+              from: { id: fromId, username: 'u' + fromId },
+              chat: { id: fromId, type: 'private' },
+              text,
+            },
+          });
+
+      const messageCount = async () => {
+        const r = await request(app)
+          .get(`/api/comms/messages?channel_id=${channelId}`)
+          .set(adminAuth());
+        return r.body.length;
+      };
+
+      it('acks but drops updates from non-allowlisted senders', async () => {
+        const before = await messageCount();
+        const res = await postUpdate(9999, 'stranger message');
+        expect(res.status).toBe(200);
+        expect(res.body.ok).toBe(true);
+        expect(await messageCount()).toBe(before);
+      });
+
+      it('processes updates from allowlisted senders', async () => {
+        const before = await messageCount();
+        const res = await postUpdate(4242, 'haz message');
+        expect(res.status).toBe(200);
+        expect(res.body.ok).toBe(true);
+        expect(await messageCount()).toBe(before + 1);
+      });
+
+      it('accepts numeric ids as strings', async () => {
+        // allowed_user_ids stored as ['4242']; Telegram sends numeric 4242
+        const res = await postUpdate(4242, 'numeric id ok');
+        expect(res.status).toBe(200);
+        expect(res.body.ok).toBe(true);
+      });
     });
 
     it('should reject webhook without channel_id', async () => {

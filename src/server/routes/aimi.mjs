@@ -241,7 +241,7 @@ export function parseCompressArgs(rest) {
 }
 
 export default function aimiRoutes(ctx) {
-  const { db, stmts, authMiddleware, apiLimiter, broadcast, fireHook, PORT, logger } = ctx;
+  const { db, stmts, authMiddleware, requireRole, apiLimiter, broadcast, fireHook, PORT, logger } = ctx;
   const router = express.Router();
 
   // ─── Slash-Command Preprocessor ──────────────────────────────────
@@ -387,7 +387,7 @@ export default function aimiRoutes(ctx) {
   }
 
   // ─── Aimi Chat Endpoint (smart, tool-calling) ────────────────────
-  router.post('/aimi/chat', authMiddleware, apiLimiter, async (req, res) => {
+  router.post('/aimi/chat', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     const { message, conversation_id, model } = req.body;
     if (!message) return res.status(400).json({ error: 'message required' });
 

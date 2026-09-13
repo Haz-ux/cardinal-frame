@@ -92,6 +92,30 @@ async function port() {
   console.log(`Current port: ${data.port} (fixed — set PORT env var to change)`);
 }
 
+// `cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...`
+// Register the Telegram webhook, optionally locked to specific sender user ids.
+// Only allowlisted senders are processed (webhook receiver + poller).
+async function telegramSetupWebhook(args) {
+  await ensureAuth();
+  const [channelId, webhookUrl, ...flags] = args;
+  const usage = 'Usage: cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <telegram_user_id>]...';
+  if (!channelId || !webhookUrl) { console.error(usage); process.exit(1); }
+  const allowed = [];
+  for (let i = 0; i < flags.length; i++) {
+    if (flags[i] === '--allow-user' && flags[i + 1]) allowed.push(flags[++i]);
+    else { console.error(`Unknown flag: ${flags[i]}\n${usage}`); process.exit(1); }
+  }
+  const body = { channel_id: channelId, webhook_url: webhookUrl };
+  if (allowed.length) body.allowed_user_ids = allowed;
+  const data = await req('POST', '/comms/telegram/setup-webhook', body);
+  console.log(`✓ Webhook registered: ${data.webhook_url || webhookUrl}`);
+  if (data.allowed_user_ids && data.allowed_user_ids.length) {
+    console.log(`✓ Locked to Telegram user id(s): ${data.allowed_user_ids.join(', ')}`);
+  } else {
+    console.log('⚠ No --allow-user given: any Telegram user who finds the bot can message it.');
+  }
+}
+
 // ─── config ──────────────────────────────────────────────────
 // `cardinal config` — manage environment variables + dev settings.
 //   cardinal config list                         show all env vars + dev settings
@@ -415,6 +439,8 @@ Commands:
   token                        Login as admin, print JWT (POST /api/auth/login)
   port                         Show current dev port (fixed to 8080; set PORT env var to change)
   chat <message>               Send a chat message (POST /api/chat)
+  telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...
+                           Register Telegram webhook, optionally locked to sender id(s)
   run [args]                   Start server + dashboard (--no-client, --server-only)
   stop                         Stop server + dashboard
   setup                        First-run wizard: health check + seed skill library & chains
@@ -462,6 +488,10 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         break;
       case 'chat':
         await chat(sub !== undefined ? process.argv.slice(3) : []);
+        break;
+      case 'telegram':
+        if (sub === 'setup-webhook') await telegramSetupWebhook(rest);
+        else { console.error(`Unknown telegram subcommand: ${sub}\nUsage: cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <telegram_user_id>]...`); process.exit(1); }
         break;
       case 'setup':
         await setup(rest);
