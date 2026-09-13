@@ -1,6 +1,6 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { executeSkillChain, executeToolChain, buildChainIntentPrompt } from '../chains.mjs';
+import { executeSkillChain, executeToolChain, buildChainIntentPrompt, validateToolEndpoint } from '../chains.mjs';
 import { SEED_SKILL_CHAINS, SEED_TOOL_CHAINS } from '../chain-seeds.mjs';
 
 /**
@@ -253,12 +253,15 @@ export default function chainsRoutes(ctx) {
     if (!chain) { const e = new Error('Chain not found'); e.status = 404; throw e; }
     chain.steps = JSON.parse(chain.steps || '[]');
 
-    // Build tool call function — makes HTTP requests to internal endpoints
+    // Build tool call function — makes HTTP requests to internal endpoints.
+    // The endpoint is strictly validated: internal relative path only, so a
+    // chain step can never turn this into a request to an external host.
     const callToolFn = async (step, input) => {
       const tool = stmts.tools.getByName.get(step.tool_name);
       if (!tool) throw new Error(`Tool "${step.tool_name}" not found`);
+      if (!tool.enabled) throw new Error(`Tool "${step.tool_name}" is disabled`);
       const method = step.method || tool.method || 'GET';
-      const endpoint = step.endpoint || tool.endpoint;
+      const endpoint = validateToolEndpoint(step.endpoint || tool.endpoint);
       const url = `http://localhost:${PORT}${endpoint}`;
 
       const fetchOpts = {
@@ -272,9 +275,21 @@ export default function chainsRoutes(ctx) {
         fetchOpts.body = JSON.stringify(input || {});
       }
 
-      const resp = await fetch(url, fetchOpts);
-      const data = await resp.json();
-      return data;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000);
+      try {
+        const resp = await fetch(url, { ...fetchOpts, signal: controller.signal });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => '');
+          throw new Error(`Tool endpoint HTTP ${resp.status} (${method} ${endpoint}): ${body.slice(0, 200)}`);
+        }
+        return await resp.json();
+      } catch (err) {
+        if (err.name === 'AbortError') throw new Error(`Tool step timed out after 30s (${method} ${endpoint})`);
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
     };
 
     // Governance: build enforcement object

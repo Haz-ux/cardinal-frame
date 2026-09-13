@@ -38,7 +38,7 @@ export function resolveMapping(ref, stepResults, chainInput) {
     return typeof prev.output === 'object' && prev.output ? prev.output[field] : undefined;
   }
 
-  // $step[N] — specific step by index
+  // $step[N] — specific step by index (field 'output' returns the full output)
   const stepMatch = ref.match(/^\$step\[(\d+)\]\.(.+)$/);
   if (stepMatch) {
     const idx = parseInt(stepMatch[1], 10);
@@ -47,13 +47,6 @@ export function resolveMapping(ref, stepResults, chainInput) {
     if (!step) return undefined;
     if (field === 'output') return step.output;
     return typeof step.output === 'object' && step.output ? step.output[field] : undefined;
-  }
-
-  // $step[N].output (exact)
-  const stepOutputMatch = ref.match(/^\$step\[(\d+)\]\.output$/);
-  if (stepOutputMatch) {
-    const idx = parseInt(stepOutputMatch[1], 10);
-    return stepResults[idx]?.output;
   }
 
   return ref; // literal string that happens to start with $
@@ -95,6 +88,23 @@ export function resolveStepInput(step, stepResults, chainInput) {
   }
 
   return input;
+}
+
+/**
+ * Validate a tool-chain step endpoint: must be an internal relative path.
+ * Rejects absolute URLs, protocol-relative hosts (//evil.com), and non-strings.
+ * Throws on invalid input — the caller records it as a step failure.
+ */
+export function validateToolEndpoint(endpoint) {
+  if (
+    typeof endpoint !== 'string' ||
+    !endpoint.startsWith('/') ||
+    endpoint.startsWith('//') ||
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(endpoint)
+  ) {
+    throw new Error(`Tool step endpoint must be an internal path starting with '/' (got "${String(endpoint).slice(0, 80)}")`);
+  }
+  return endpoint;
 }
 
 /**
@@ -242,6 +252,8 @@ export async function executeToolChain(chain, input, callToolFn, broadcastFn = n
   const startTime = Date.now();
   const { checkPermission, auditLog, persona } = governance || {};
 
+  if (broadcastFn) broadcastFn('chain:tool:start', { chainName: chain.name, stepIndex: 0, totalSteps: steps.length });
+
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const stepStart = Date.now();
@@ -251,7 +263,7 @@ export async function executeToolChain(chain, input, callToolFn, broadcastFn = n
     if (checkPermission && persona) {
       const action = `tool:${step.tool_name || step.name || 'unnamed'}`;
       const perm = checkPermission(persona, action, step);
-      auditLog?.(action, { chain: chain.name, step: stepName, allowed: perm.allowed });
+      auditLog?.(action, { chain: chain.name, step: stepName, allowed: perm.allowed, tool: step.tool_name, method: step.method, endpoint: step.endpoint });
       if (!perm.allowed) {
         stepResults.push({
           stepIndex: i, stepName, ok: false,
