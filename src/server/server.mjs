@@ -58,6 +58,9 @@ import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs'
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
 import nodesRoutes from './routes/nodes.mjs';
 import compressionRoutes from './routes/compression.mjs';
+import companionRoutes from './routes/companion.mjs';
+import identityRoutes from './routes/identity.mjs';
+import defenseRoutes from './routes/defense.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { evaluate as wardenEvaluate } from './warden.mjs';
@@ -1511,6 +1514,9 @@ app.use('/api', tracesRoutes(ctx));
 app.use('/api', governanceRoutes(ctx));
 app.use('/api', nodesRoutes(ctx));
 app.use('/api', compressionRoutes(ctx));
+app.use('/api', companionRoutes(ctx));
+app.use('/api', identityRoutes(ctx));
+app.use('/api', defenseRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
