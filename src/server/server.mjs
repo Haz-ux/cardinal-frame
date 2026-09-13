@@ -1076,6 +1076,8 @@ const stmts = {
         getById: db.prepare('SELECT * FROM memories WHERE id = ?'),
         getByUser: db.prepare('SELECT * FROM memories WHERE user_id = ? ORDER BY updated_at DESC'),
         getByCategory: db.prepare('SELECT * FROM memories WHERE user_id = ? AND category = ? ORDER BY updated_at DESC'),
+        getByUserPaged: db.prepare('SELECT * FROM memories WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?'),
+        getByCategoryPaged: db.prepare('SELECT * FROM memories WHERE user_id = ? AND category = ? ORDER BY updated_at DESC LIMIT ?'),
         update: db.prepare("UPDATE memories SET content = ?, category = ?, updated_at = datetime('now') WHERE id = ?"),
         updateAccess: db.prepare("UPDATE memories SET access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?"),
         delete: db.prepare('DELETE FROM memories WHERE id = ?'),
