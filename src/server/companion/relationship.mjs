@@ -17,7 +17,7 @@
 const SCAFFOLD = 'v2 scaffold — not implemented yet';
 
 function notImplemented(fn) {
-  throw new Error(`[v2-scaffold] ${{fn}}: ${{SCAFFOLD}}`);
+  throw new Error(`[v2-scaffold] ${fn}: ${SCAFFOLD}`);
 }
 
 export async function loadRelationship(userId) {

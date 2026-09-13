@@ -1434,3 +1434,39 @@ useEffect(() => {
   </div>
  );
 }
+
+// ─── v2 promotion scaffold — Neural Map as interface ───────────────
+// Contract (from v2 thesis): the map stops being a decorative
+// visualization and becomes a functional interface. Every node must
+// represent live server state and be traceable/clickable; nothing is
+// decorative. Planned node types: memory + skill nodes with
+// provenance, live worker/fleet dispatch nodes, skill-candidate
+// lifecycle nodes, presence events as pulses.
+// Additive only — none of these are called yet, existing rendering
+// behavior is unchanged. v2 scaffold — contract surface only.
+
+const V2_SCAFFOLD = 'v2 scaffold — not implemented yet';
+
+function v2NotImplemented(fn) {
+  throw new Error(`[v2-scaffold] ${fn}: ${V2_SCAFFOLD}`);
+}
+
+/** Bind a graph node to live server state (polling + websocket). */
+export function bindNodeToLiveState(nodeId) {
+  v2NotImplemented('bindNodeToLiveState');
+}
+
+/** Resolve a node's provenance chain (source + trust tier). */
+export function resolveNodeProvenance(nodeId) {
+  v2NotImplemented('resolveNodeProvenance');
+}
+
+/** Transition a skill-candidate node through its lifecycle. */
+export function transitionSkillCandidate(candidateId, toState) {
+  v2NotImplemented('transitionSkillCandidate');
+}
+
+/** Emit a presence pulse on the map for a proactive event. */
+export function emitPresencePulse(event) {
+  v2NotImplemented('emitPresencePulse');
+}

@@ -14,7 +14,6 @@
 import express from 'express';
 
 export default function companionRoutes(ctx) {
-  const { logger } = ctx;
   const router = express.Router();
 
   // Scaffold status — proves the mount is live without any behavior yet.
