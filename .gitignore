@@ -11,6 +11,12 @@ dist/
 *.db-wal
 *.db-shm
 
+# Generated secrets — never commit
+.admin-credentials
+.encrypt-key
+data/.admin-credentials
+data/.encrypt-key
+
 # Build artifacts
 client/dist/
 
