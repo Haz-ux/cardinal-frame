@@ -346,9 +346,14 @@ export default function aimiRoutes(ctx) {
     }
 
     // /scan <code> — run the skill-scanner skill, return the verdict.
+    // Admin-only: skill execution is admin-gated everywhere else
+    // (POST /api/skills/:id/execute, /api/skills/execute/:name), so the
+    // chat shortcut must not be a side door around that gate.
     if (command === 'scan') {
       const source = rest;
-      if (!source) {
+      if (!req.user || req.user.role !== 'admin') {
+        send({ choices: [{ delta: { content: '⚠️ /scan requires an admin account.' } }] });
+      } else if (!source) {
         send({ choices: [{ delta: { content: '⚠️ Usage: /scan <code>' } }] });
       } else {
         try {
