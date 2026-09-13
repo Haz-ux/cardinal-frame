@@ -26,8 +26,8 @@ import { getModelCost } from './costs.mjs';
 // Autopilot: server-side loop with native function calling
 // File scope: sandbox = /home/haz/ai-workspace/, home = /home/haz/
 
-const SANDBOX_DIR = '/home/haz/ai-workspace';
-const HOME_DIR = '/home/haz';
+const SANDBOX_DIR = process.env.AGENT_SANDBOX_DIR || '/home/haz/ai-workspace';
+const HOME_DIR = process.env.AGENT_HOME_DIR || '/home/haz';
 const CMD_BLOCKLIST = [
   'rm -rf', 'sudo', 'reboot', 'shutdown', 'mkfs', 'dd if=', 'kill -9',
   'systemctl stop', 'systemctl disable', 'chmod 777 /', 'chown root',
@@ -1197,6 +1197,8 @@ router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, asy
     const stepIdx = sessionId ? (stmts.agentActions.getBySession.all(sessionId).length) : 0;
 
     try {
+      const { mkdirSync } = await import('fs');
+      mkdirSync(workDir, { recursive: true });
       const stdout = execSync(command, {
         timeout: 30000,
         maxBuffer: 1024 * 100,
@@ -1207,7 +1209,7 @@ router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, asy
       broadcast('agent:action', { type: 'exec', command, session_id: sessionId, action_id: actionId });
       res.json({ exitCode: 0, stdout: stdout.slice(0, 5000), stderr: '', action_id: actionId });
     } catch (e) {
-      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || '').slice(0, 2000), 'failed', 'failed');
+      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || '').slice(0, 2000), 'failed');
       res.json({ exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || '').toString().slice(0, 2000), action_id: actionId });
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
