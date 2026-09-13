@@ -10,6 +10,8 @@
  * server.mjs and routes/agent.mjs import from this module instead.
  */
 
+import { spawn } from 'child_process';
+
 export const ALLOWED_COMMANDS = [
   'echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname',
   'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort',
@@ -31,4 +33,32 @@ export function sanitizeCommand(cmd) {
   }
   // argv0 + args: executed with shell:false, so no shell ever interprets this.
   return { safe: true, command: parts[0], args: parts.slice(1), display: trimmed };
+}
+
+/**
+ * Shell-free argv executor for tools whose allowlist is NOT the generic
+ * command list (git_op, file_search). The caller is responsible for
+ * validating `cmd`/`args` against its own fixed allowlist; argv elements
+ * are passed as data — no shell ever interprets them, so metacharacters
+ * in arguments (e.g. `;` in a commit message or regex) are harmless.
+ * Resolves with stdout on exit 0; rejects otherwise (grep's "no matches"
+ * exit 1 included — callers should handle it).
+ */
+export function spawnArgv(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      shell: false,
+      timeout: opts.timeout ?? 30000,
+      cwd: opts.cwd,
+      env: { PATH: process.env.PATH },
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (e) => reject(new Error(`Execution failed: ${e.message}`)));
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(((stderr || `exit code ${code}`).toString()).slice(0, 500)));
+    });
+  });
 }

@@ -1,6 +1,6 @@
 import express from 'express';
 import { randomUUID, createHash } from 'crypto';
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
@@ -9,7 +9,7 @@ import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 import { record as recordLearningEvent } from '../learning/events.mjs';
 import { shadowRoute } from '../learning/retrieval.mjs';
-import { sanitizeCommand } from '../command-safety.mjs';
+import { sanitizeCommand, spawnArgv } from '../command-safety.mjs';
 import { safeFetch } from '../safe-fetch.mjs';
 
 /**
@@ -211,11 +211,28 @@ registerAgentTool(
   },
   async (args, ctx) => {
     const base = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    // execSync is injected by the skill runtime
+    const maxResults = Math.min(Math.max(parseInt(args.max_results, 10) || 20, 1), 200);
+    const pattern = String(args.pattern || '');
+    if (!pattern) return { matches: [], count: 0, error: 'Search pattern is required' };
+    // Command-injection fix: shell-free argv execution via the shared
+    // spawnArgv helper. The pattern is an argv element (data), never
+    // interpolated into a shell string. Brace expansion and pipes are
+    // shell features, so --include flags are passed separately and the
+    // head(1) truncation is done in JS instead.
+    const check = sanitizeCommand('grep');
+    if (!check.safe) return { matches: [], count: 0, error: check.error };
+    try { (await import('fs')).mkdirSync(base, { recursive: true }); }
+    catch (e) { return { matches: [], count: 0, error: `Cannot access directory: ${e.message}` }; }
+    const grepArgs = [
+      '-rn',
+      ...['js', 'jsx', 'ts', 'tsx', 'mjs', 'json', 'md', 'txt', 'py', 'sh'].map((e) => `--include=*.${e}`),
+      `--max-count=${maxResults}`,
+      pattern,
+      base,
+    ];
     try {
-      const cmd = `grep -rn --include="*.{js,jsx,ts,tsx,mjs,json,md,txt,py,sh}" --max-count=${args.max_results || 20} "${args.pattern.replace(/"/g, '\\"')}" "${base}" 2>/dev/null | head -${args.max_results || 20}`;
-      const stdout = execSync(cmd, { timeout: 10000, encoding: 'utf-8', maxBuffer: 1024 * 50 });
-      const results = stdout.split('\n').filter(Boolean).map(line => {
+      const stdout = await spawnArgv('grep', grepArgs, { timeout: 10000, cwd: base });
+      const results = stdout.split('\n').filter(Boolean).slice(0, maxResults).map(line => {
         const [file, ...rest] = line.split(':');
         const lineNum = rest[0];
         const content = rest.slice(1).join(':');
@@ -223,6 +240,8 @@ registerAgentTool(
       });
       return { matches: results, count: results.length };
     } catch (e) {
+      // grep exits 1 when nothing matches — not an error.
+      if (/exit code 1/.test(e.message)) return { matches: [], count: 0 };
       return { matches: [], count: 0, error: e.message };
     }
   }
@@ -329,22 +348,33 @@ registerAgentTool(
   },
   async (args, ctx) => {
     const workDir = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    // execSync is injected by the skill runtime
+    // Command-injection fix: fixed operation→argv allowlist + shell-free
+    // argv execution via the shared spawnArgv helper. The commit message is
+    // an argv element (data) — never interpolated into a shell string, so
+    // quotes/semicolons/substitutions in it are harmless. 'git' is
+    // deliberately NOT added to the generic sanitizeCommand allowlist
+    // (that would widen shell_exec); this tool's allowlist is the map below.
     const ops = {
-      status: 'git status --short',
-      diff: 'git diff',
-      log: 'git log --oneline -10',
-      branch: 'git branch -a',
-      add: 'git add -A',
-      commit: `git commit -m "${(args.args || '').replace(/"/g, '\\"')}"`,
+      status: ['status', '--short'],
+      diff: ['diff'],
+      log: ['log', '--oneline', '-10'],
+      branch: ['branch', '-a'],
+      add: ['add', '-A'],
     };
-    const cmd = ops[args.operation];
-    if (!cmd) return { error: `Unknown git operation: ${args.operation}` };
+    let gitArgs = ops[args.operation];
+    if (args.operation === 'commit') {
+      const message = String(args.args || '').trim();
+      if (!message) return { error: 'Commit operation requires a message in args' };
+      gitArgs = ['commit', '-m', message];
+    }
+    if (!gitArgs) return { error: `Unknown git operation: ${args.operation}` };
+    try { (await import('fs')).mkdirSync(workDir, { recursive: true }); }
+    catch (e) { return { error: `Cannot create working directory: ${e.message}` }; }
     try {
-      const stdout = execSync(cmd, { timeout: 10000, cwd: workDir, encoding: 'utf-8', maxBuffer: 1024 * 50 });
+      const stdout = await spawnArgv('git', gitArgs, { timeout: 10000, cwd: workDir });
       return { output: stdout.slice(0, 5000) };
     } catch (e) {
-      return { error: (e.stderr || e.message).toString().slice(0, 500) };
+      return { error: e.message.toString().slice(0, 500) };
     }
   }
 );

@@ -2,6 +2,7 @@ import express from 'express';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import { sanitizeCommand } from '../command-safety.mjs';
 
 /**
  * Meta routes: MCP, Groups, Schedules, Plugins, Audit Log

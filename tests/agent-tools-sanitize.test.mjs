@@ -28,6 +28,8 @@ const { agentTools } = await import('../src/server/routes/agent.mjs');
 
 const shellExec = agentTools.find(t => t.name === 'shell_exec');
 const webFetch = agentTools.find(t => t.name === 'web_fetch');
+const gitOp = agentTools.find(t => t.name === 'git_op');
+const fileSearch = agentTools.find(t => t.name === 'file_search');
 
 afterAll(() => {
   rmSync(TEST_DIR, { recursive: true, force: true });
@@ -183,5 +185,84 @@ describe('web_fetch agent tool (H1)', () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe('git_op agent tool (audit follow-up: execSync interpolation)', () => {
+  // The tool always runs in AGENT_SANDBOX_DIR (== TEST_SANDBOX here), so the
+  // git repo used by these tests lives there.
+  async function ensureRepo() {
+    const fs = await import('fs');
+    const { execFileSync } = await import('child_process');
+    if (!fs.existsSync(join(TEST_SANDBOX, '.git'))) {
+      execFileSync('git', ['init', '-q'], { cwd: TEST_SANDBOX });
+      execFileSync('git', ['config', 'user.email', 't@t'], { cwd: TEST_SANDBOX });
+      execFileSync('git', ['config', 'user.name', 't'], { cwd: TEST_SANDBOX });
+    }
+  }
+
+  it('is registered', () => {
+    expect(gitOp).toBeDefined();
+  });
+
+  it('rejects unknown operations', async () => {
+    const r = await gitOp.execute({ operation: 'push' }, { scope: 'sandbox' });
+    expect(r.error).toMatch(/unknown git operation/i);
+  });
+
+  it('requires a message for commit', async () => {
+    const r = await gitOp.execute({ operation: 'commit', args: '   ' }, { scope: 'sandbox' });
+    expect(r.error).toMatch(/requires a message/i);
+  });
+
+  it('commits with a literal message; injected shell never runs', async () => {
+    await ensureRepo();
+    const fs = await import('fs');
+    const { execFileSync } = await import('child_process');
+    fs.writeFileSync(join(TEST_SANDBOX, 'gitop-victim.txt'), 'change\n');
+    execFileSync('git', ['add', '-A'], { cwd: TEST_SANDBOX });
+    const pwn = join(TEST_DIR, 'pwned-gitop');
+    const evil = `x"; touch ${pwn}; echo "`;
+    const r = await gitOp.execute({ operation: 'commit', args: evil }, { scope: 'sandbox' });
+    expect(r.error, JSON.stringify(r)).toBeUndefined();
+    expect(fs.existsSync(pwn)).toBe(false);
+    // The message was stored literally — prove it is data, not code.
+    const log = execFileSync('git', ['log', '-1', '--format=%s'], { cwd: TEST_SANDBOX }).toString();
+    expect(log).toContain('x"; touch');
+  });
+
+  it('runs status via argv without a shell', async () => {
+    await ensureRepo();
+    const r = await gitOp.execute({ operation: 'status' }, { scope: 'sandbox' });
+    expect(r.error).toBeUndefined();
+    expect(r.output).toBeDefined();
+  });
+});
+
+describe('file_search agent tool (audit follow-up: execSync interpolation)', () => {
+  it('is registered', () => {
+    expect(fileSearch).toBeDefined();
+  });
+
+  it('finds a known string without a shell', async () => {
+    const { writeFileSync: wfs } = await import('fs');
+    wfs(join(TEST_SANDBOX, 'needle.js'), 'const needle_haystack_123 = 1;\n');
+    const r = await fileSearch.execute({ pattern: 'needle_haystack_123' }, { scope: 'sandbox' });
+    expect(r.error).toBeUndefined();
+    expect(r.count).toBeGreaterThan(0);
+    expect(r.matches[0].file).toMatch(/needle\.js$/);
+  });
+
+  it('does not execute metacharacters in the pattern', async () => {
+    const pwn = join(TEST_DIR, 'pwned-filesearch');
+    const r = await fileSearch.execute({ pattern: `x"; touch ${pwn}; echo "` }, { scope: 'sandbox' });
+    expect((await import('fs')).existsSync(pwn)).toBe(false);
+    expect(r.error).toBeUndefined(); // no matches → empty result, not a crash
+    expect(r.count).toBe(0);
+  });
+
+  it('requires a pattern', async () => {
+    const r = await fileSearch.execute({ pattern: '' }, { scope: 'sandbox' });
+    expect(r.error).toMatch(/pattern is required/i);
   });
 });
