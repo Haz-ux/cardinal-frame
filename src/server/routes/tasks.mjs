@@ -168,7 +168,7 @@ router.get('/agents/:id/tasks', optionalAuth, (req, res) => {
 });
 
 // ─── Task CRUD + Execution ─────────────────────────────────────────
-router.post('/tasks', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
 const { name, command, dependsOn } = req.body;
 if (!name || !command) return res.status(400).json({ error: 'Name and command are required' });
 const check = sanitizeCommand(command);
@@ -252,7 +252,7 @@ router.get('/tasks/:id/logs', optionalAuth, (req, res) => {
   res.json(stmts.logs.getByTask.all(req.params.id));
 });
 
-router.patch('/tasks/:id/execute', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/execute', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status === 'running') return res.status(409).json({ error: 'Task already running' });
@@ -275,7 +275,7 @@ router.patch('/tasks/:id/execute', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Cancel a running task
-router.patch('/tasks/:id/cancel', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/cancel', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status !== 'running') return res.status(409).json({ error: 'Only running tasks can be cancelled' });
@@ -287,7 +287,7 @@ router.patch('/tasks/:id/cancel', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Retry a failed/cancelled/done task — resets to pending and re-executes
-router.post('/tasks/:id/retry', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks/:id/retry', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status === 'running') return res.status(409).json({ error: 'Cannot retry a running task' });
@@ -303,7 +303,7 @@ router.post('/tasks/:id/retry', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Assign task to agent
-router.patch('/tasks/:id/assign', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/assign', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const { agentId } = req.body;
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
@@ -486,7 +486,7 @@ router.delete('/files/:id', authMiddleware, requireRole('admin'), (req, res) => 
 });
 
 // Add dependencies to a task (POST endpoint — GET already defined above)
-router.post('/tasks/:id/dependencies', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks/:id/dependencies', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
  const { dependsOn } = req.body;
  if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
   return res.status(400).json({ error: 'dependsOn must be a non-empty array of task IDs' });
@@ -513,14 +513,14 @@ router.post('/tasks/:id/dependencies', authMiddleware, apiLimiter, (req, res) =>
 });
 
 // Remove a dependency
-router.delete('/tasks/:id/dependencies/:depId', authMiddleware, (req, res) => {
+router.delete('/tasks/:id/dependencies/:depId', authMiddleware, requireRole('admin'), (req, res) => {
  db.prepare('DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?').run(req.params.id, req.params.depId);
  broadcast('task:deps', { taskId: req.params.id, removed: req.params.depId });
  res.json({ removed: true });
 });
 
 // Execute a task chain (task + all its dependencies in topological order)
-router.post('/tasks/:id/execute-chain', authMiddleware, apiLimiter, async (req, res) => {
+router.post('/tasks/:id/execute-chain', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
  const rootTask = stmts.tasks.getById.get(req.params.id);
  if (!rootTask) return res.status(404).json({ error: 'Task not found' });
 

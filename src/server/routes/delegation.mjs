@@ -283,7 +283,7 @@ export default function delegationRoutes(ctx) {
 
   // ─── Routes ────────────────────────────────────────────────────────
 
-  router.post('/delegate', authMiddleware, apiLimiter, async (req, res) => {
+  router.post('/delegate', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     const { name, command, capability, agentId, parentTaskId, parentSessionId, synchronous = false, priority = 'medium', wait = false, waitTimeout = 30000, node: requestedNode } = req.body;
 
     if (!name || !command) return res.status(400).json({ error: 'Name and command are required' });

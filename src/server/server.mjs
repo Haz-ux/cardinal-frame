@@ -6,7 +6,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import winston from 'winston';
 import dotenv from 'dotenv';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import path from 'path';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
@@ -39,7 +39,7 @@ import costsRoutes, { getModelCost } from './routes/costs.mjs';
 import memoryRoutes from './routes/memory.mjs';
 import systemRoutes from './routes/system.mjs';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './routes/llm-helpers.mjs';
-import settingsRoutes, { getDevSetting, getDevSettings, decryptValue, encryptSecret } from './routes/settings.mjs';
+import settingsRoutes, { getDevSetting, getDevSettings, decryptValue, encryptSecret, initSecretStore } from './routes/settings.mjs';
 import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
@@ -86,6 +86,10 @@ if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'cardinal-frame-dev-
 }
 const JWT_EXPIRES = process.env.JWT_EXPIRES || '15m';
 const JWT_REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES || '7d';
+
+// Persistent per-instance encryption key for stored secrets (provider API
+// keys, env vars). Must run before any encrypt/decrypt use below.
+initSecretStore(DATA_DIR);
 
 // ─── Logger ────────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -164,7 +168,7 @@ const apiLimiter = writeLimiter;
 app.set('trust proxy', 1);
 
 // ─── SQLite Database ───────────────────────────────────────────────
-import { mkdirSync } from 'fs';
+import { mkdirSync, writeFileSync } from 'fs';
 mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'cardinal.db'));
@@ -178,8 +182,31 @@ runMigrations(db);
 // override was removed — use the PORT env var to change it.
 
 // Schema with task_logs, task_assignments, and RBAC
-const adminHash = bcrypt.hashSync('admin123', 10);
-const hazHash = bcrypt.hashSync('cardinal', 10);
+// Default credentials: there are none. On first boot (or when a default
+// password is detected) a strong random password is generated, stored as a
+// bcrypt hash, printed once, and saved to DATA_DIR/.admin-credentials
+// (mode 600). The CLI reads that file automatically.
+function randomPassword(bytes = 24) {
+  return randomBytes(bytes).toString('base64url');
+}
+const rotatedCreds = [];
+function ensureAdminAccount(id, username, defaultPassword) {
+  const row = db.prepare('SELECT id, password_hash FROM users WHERE username = ?').get(username);
+  if (!row) {
+    const pw = randomPassword();
+    db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, 'admin')")
+      .run(id, username, bcrypt.hashSync(pw, 10));
+    rotatedCreds.push({ username, password: pw, fresh: true });
+    return;
+  }
+  let isDefault = false;
+  try { isDefault = bcrypt.compareSync(defaultPassword, row.password_hash); } catch {}
+  if (isDefault) {
+    const pw = randomPassword();
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(pw, 10), row.id);
+    rotatedCreds.push({ username, password: pw, fresh: false });
+  }
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -716,17 +743,36 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_chain_exec_chain_id ON chain_executions(chain_id);
 
-  INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('admin-000', 'admin', '${adminHash}', 'admin');
-
-  INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('haz-001', 'Haz', '${hazHash}', 'admin');
+  -- Default admin accounts are provisioned/rotated by ensureAdminAccount()
+  -- below; never seed password hashes here.
 
   INSERT OR IGNORE INTO personas (id, agent_id, name, description, soul, permissions, constraints, enabled)
   VALUES ('persona-default', NULL, 'Default', 'Baseline governance — allows all actions with audit logging',
     '{"identity":"Cardinal Frame agent","principles":["Be helpful","Be safe","Be transparent"],"boundaries":["Never expose secrets","Never modify system files"],"escalation":{"require_approval_for":["rm","sudo","chmod","chown","mkfs"],"auto_approve":["echo","ls","cat","pwd","date","grep","wc"]}}',
     '[]', '[]', 1);
   `);
+
+  // ─── Default admin credentials: provision or rotate ────────────
+  // Runs after the users table exists. If an account is missing or still
+  // uses a publicly-known default password, it gets a fresh random one.
+  ensureAdminAccount('admin-000', 'admin', 'admin123');
+  ensureAdminAccount('haz-001', 'Haz', 'cardinal');
+  if (rotatedCreds.length > 0) {
+    const credFile = path.join(DATA_DIR, '.admin-credentials');
+    try {
+      const lines = rotatedCreds.map(c => `${c.username}:${c.password}`).join('\n') + '\n';
+      writeFileSync(credFile, `# Cardinal Frame admin credentials — generated ${new Date().toISOString()}\n# Keep this file private (mode 600). Change passwords via PUT /users/:id or the CLI.\n${lines}`, { mode: 0o600 });
+    } catch (e) {
+      logger.warn(`Could not write ${credFile}: ${e.message}`);
+    }
+    const banner = rotatedCreds.map(c => `    ${c.username} / ${c.password}`).join('\n');
+    console.log('\n================================================================');
+    console.log('  CARDINAL FRAME — admin credentials were (re)generated');
+    console.log('  The old defaults (admin123 / cardinal) no longer work.');
+    console.log(banner);
+    console.log(`  Saved to ${credFile} (mode 600). The CLI reads it automatically.`);
+    console.log('================================================================\n');
+  }
 
   // ─── Schema Migrations (add columns to existing DBs) ──────────
   const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
@@ -1315,12 +1361,18 @@ db.exec(`
 // ─── WebSocket Setup ───────────────────────────────────────────────
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info) => {
-  const origin = info.req.headers.origin;
-  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://[::1]') && !origin.startsWith('http://192.168.1.')) {
-    logger.warn(`WS rejected origin: ${origin}`);
+  // JWT required: ?token=<access token>. The old Origin allowlist was
+  // spoofable by any non-browser client, so it is not a security boundary.
+  try {
+    const url = new URL(info.req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+    if (!token) { logger.warn('WS rejected: no token'); return false; }
+    jwt.verify(token, JWT_SECRET);
+    return true;
+  } catch (err) {
+    logger.warn(`WS rejected: ${err.message}`);
     return false;
   }
-  return true;
 } });
 
 function broadcast(type, payload) {
@@ -1402,13 +1454,20 @@ function requireRole(...roles) {
 const ALLOWED_COMMANDS = ['echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort', 'uniq', 'curl', 'wget', 'python3', 'node', 'bash'];
 
 function sanitizeCommand(cmd) {
-  const trimmed = cmd.trim();
-  const base = trimmed.split(/\s+/)[0];
-  const baseName = base.split('/').pop();
+  const trimmed = String(cmd || '').trim();
+  if (!trimmed) return { safe: false, error: 'Empty command' };
+  // Shell metacharacters are never allowed: execution is shell-free, so
+  // `;`, `|`, `$()`, backticks, etc. can only be injection attempts.
+  if (/[;&|><$`\\!{}()\[\]*?~#\n\r]/.test(trimmed)) {
+    return { safe: false, error: 'Shell metacharacters are not allowed; use a single simple command' };
+  }
+  const parts = trimmed.split(/\s+/);
+  const baseName = parts[0].split('/').pop();
   if (!ALLOWED_COMMANDS.includes(baseName)) {
     return { safe: false, error: `Command '${baseName}' not allowed. Allowed: ${ALLOWED_COMMANDS.join(', ')}` };
   }
-  return { safe: true, command: trimmed };
+  // argv0 + args: executed with shell:false, so no shell ever interprets this.
+  return { safe: true, command: parts[0], args: parts.slice(1), display: trimmed };
 }
 
 // ─── Task Execution with Log Streaming ─────────────────────────────
@@ -1422,11 +1481,13 @@ function executeTask(taskId, command) {
 
   stmts.tasks.updateStatus.run('running', new Date().toISOString(), null, null, null, taskId);
   broadcast('task:status', { id: taskId, status: 'running' });
-  logger.info(`Task executing: ${taskId} -> ${check.command}`);
+  logger.info(`Task executing: ${taskId} -> ${check.display}`);
 
-  const child = spawn(check.command, [], {
+  // shell:false — the sanitizer guarantees argv0 is allowlisted and no
+  // metacharacters are present, so no shell ever interprets this string.
+  const child = spawn(check.command, check.args, {
     timeout: 30000,
-    shell: '/bin/sh',
+    shell: false,
     env: { PATH: process.env.PATH },
     cwd: '/tmp',
   });

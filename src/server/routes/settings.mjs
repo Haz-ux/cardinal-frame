@@ -1,19 +1,51 @@
 import express from 'express';
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 
 /**
  * Settings routes: env vars (CRUD + test), dev settings (CRUD + restart).
  * Dependencies: db, wss, server, logger, fireHook, authMiddleware, requireRole, apiLimiter, broadcast, PORT
- * Exports: encryptSecret, decryptSecret, decryptValue, xorDecipher, getDevSetting, getDevSettings
+ * Exports: encryptSecret, decryptSecret, decryptValue, xorDecipher, getDevSetting, getDevSettings, initSecretStore
  */
 
 // ─── AES-256-GCM encryption for stored secrets ─────────────────────────
-// Key derivation: SHA-256 of ENCRYPT_SECRET env var → 32-byte key.
-// If ENCRYPT_SECRET is unset, generate a random key (secrets won't survive restart).
-const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET || null;
-const KEY_HEX = ENCRYPT_SECRET
-  ? createHash('sha256').update(ENCRYPT_SECRET).digest('hex')
-  : randomBytes(32).toString('hex');
+// Key resolution (in order):
+//   1. ENCRYPT_SECRET env var → SHA-256 → 32-byte key (operator-managed).
+//   2. <DATA_DIR>/.encrypt-key → persisted per-instance key (mode 600).
+//   3. Generate a random key and persist it to .encrypt-key.
+// Previously the key was random per process, so every restart silently
+// orphaned all encrypted provider keys. Call initSecretStore(DATA_DIR)
+// once at server boot, before any encrypt/decrypt use.
+const ENV_SECRET = process.env.ENCRYPT_SECRET || null;
+let KEY_HEX = randomBytes(32).toString('hex'); // pre-init: matches old behavior
+const keyHexFrom = (s) => createHash('sha256').update(s).digest('hex');
+
+// Call once at server boot with the resolved DATA_DIR. Safe to repeat.
+export function initSecretStore(dataDir) {
+  if (ENV_SECRET) {
+    KEY_HEX = keyHexFrom(ENV_SECRET);
+    return { mode: 'env' };
+  }
+  const keyFile = path.join(dataDir, '.encrypt-key');
+  try {
+    const saved = readFileSync(keyFile, 'utf8').trim();
+    if (/^[0-9a-f]{64}$/.test(saved)) {
+      KEY_HEX = saved;
+      return { mode: 'file' };
+    }
+  } catch { /* missing/unreadable → generate */ }
+  try { mkdirSync(dataDir, { recursive: true }); } catch {}
+  KEY_HEX = randomBytes(32).toString('hex');
+  try {
+    writeFileSync(keyFile, KEY_HEX + '\n', { mode: 0o600 });
+    console.log(`[security] generated instance encryption key at ${keyFile} (mode 600). Set ENCRYPT_SECRET to manage it explicitly.`);
+    return { mode: 'generated' };
+  } catch (e) {
+    console.error(`[security] WARNING: cannot persist encryption key (${e.message}); encrypted secrets will not survive restart. Set ENCRYPT_SECRET.`);
+    return { mode: 'ephemeral' };
+  }
+}
 
 export function encryptSecret(plaintext) {
   const value = String(plaintext ?? '');
@@ -55,7 +87,7 @@ export function xorDecipher(b64) {
   try {
     if (typeof b64 !== 'string' || !b64 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return null;
     const buf = Buffer.from(b64, 'base64');
-    const key = Buffer.from(ENCRYPT_SECRET || LEGACY_XOR_KEY, 'utf8');
+    const key = Buffer.from(ENV_SECRET || LEGACY_XOR_KEY, 'utf8');
     for (let i = 0; i < buf.length; i++) buf[i] ^= key[i % key.length];
     return buf.toString('utf8');
   } catch { return null; }

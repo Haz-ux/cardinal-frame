@@ -145,13 +145,30 @@ async function telegramSetupWebhook(args) {
 //   cardinal config unset <key>                  delete an env var
 //   cardinal config dev                         show dev settings
 //   cardinal config dev <key> <value>           set a dev setting (logLevel, debugMode, sandboxTimeout, maxConcurrentAgents, wsHeartbeatMs, embeddingModel)
+// Server no longer seeds default passwords: on boot it generates strong
+// random ones and saves them to <data>/.admin-credentials (mode 600).
+// Priority: CF_TOKEN (already handled) > CF_ADMIN_PASSWORD env > generated
+// file > legacy admin/admin123 (kept only for very old servers).
+function readAdminCreds() {
+  if (process.env.CF_ADMIN_PASSWORD) {
+    return { username: process.env.CF_ADMIN_USER || 'admin', password: process.env.CF_ADMIN_PASSWORD };
+  }
+  const dataDir = process.env.DATA_DIR || resolve(REPO_ROOT, 'data');
+  try {
+    const text = fs.readFileSync(resolve(dataDir, '.admin-credentials'), 'utf8');
+    const line = text.split('\n').map(l => l.trim()).find(l => l && !l.startsWith('#') && l.startsWith('admin:'));
+    if (line) return { username: 'admin', password: line.slice('admin:'.length) };
+  } catch {}
+  return { username: 'admin', password: 'admin123' };
+}
 async function ensureAuth() {
   if (TOKEN) return;
+  const creds = readAdminCreds();
   try {
-    const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+    const data = await req('POST', '/auth/login', { username: creds.username, password: creds.password });
     if (data.token) TOKEN = data.token;
   } catch (e) {
-    console.error(`✗ Could not log in as admin: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
+    console.error(`✗ Could not log in as ${creds.username}: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
     process.exit(1);
   }
 }

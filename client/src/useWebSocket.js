@@ -8,8 +8,17 @@ let connectedState = false;
 function getWS() {
   if (wsInstance && wsInstance.readyState <= 1) return wsInstance;
 
+  // WS now requires a JWT (server verifies ?token=). Without a login there
+  // is nothing to listen to — don't open (or retry) an unauthenticated socket.
+  const token = localStorage.getItem('cf_token');
+  if (!token) {
+    connectedState = false;
+    listeners.forEach(l => l.setConnected(false));
+    return null;
+  }
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.host}/ws`;
+  const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
   const ws = new WebSocket(url);
   wsInstance = ws;
 
