@@ -13,14 +13,11 @@
  * Falls back gracefully if Docker is not available.
  */
 
-import { execSync, exec } from 'node:child_process';
-import { promisify } from 'node:util';
-import { writeFileSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { execSync, spawn } from 'node:child_process';
+import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-
-const execAsync = promisify(exec);
 
 const DEFAULT_IMAGE = 'node:22-slim';
 const DEFAULT_TIMEOUT = 30_000;
@@ -37,6 +34,67 @@ export function isDockerAvailable() {
     dockerAvailable = false;
   }
   return dockerAvailable;
+}
+
+/**
+ * Build the `docker run` argv for a skill execution. Exported for tests.
+ *
+ * L2: the command is an argv ARRAY — never a shell string. With
+ * shell:false every element (env values, image name, volume path) is
+ * passed to docker as inert data, so a value like `$(touch /tmp/pwned)`
+ * cannot be interpreted by any shell. Container hardening is unchanged:
+ * --network none, --read-only, --pids-limit, mem/cpu caps.
+ */
+export function buildDockerArgs({ image, timeoutMs, env, hostDir, containerName }) {
+  const stopTimeout = Math.max(1, Math.ceil(
+    (Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT) / 1000));
+  const args = [
+    'run', '--rm',
+    '--name', containerName,
+    '--memory', '512m',
+    '--cpus', '1',
+    '--network', 'none',
+    '--pids-limit', '64',
+    '--read-only',
+    '--tmpfs', '/tmp:size=64m',
+    '--stop-timeout', String(stopTimeout),
+    '-v', `${hostDir}:/app:ro`,
+  ];
+  // -e k=v as two argv elements: the value is data, never shell-parsed.
+  for (const [k, v] of Object.entries(env || {})) {
+    args.push('-e', `${k}=${v}`);
+  }
+  args.push(image, 'node', '/app/runner.js');
+  return args;
+}
+
+/**
+ * Run docker with shell:false, capturing stdout/stderr. Resolves with
+ * stdout on exit 0; rejects with an Error carrying .stdout (for the
+ * best-effort result parse on timeout) and .timedOut (true when the
+ * timeout killed the process).
+ */
+function spawnDocker(args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args, { shell: false, timeout: timeoutMs });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (e) => {
+      const err = new Error(`Docker spawn failed: ${e.message}`);
+      err.stdout = stdout;
+      err.timedOut = false;
+      reject(err);
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) return resolve(stdout);
+      const timedOut = signal === 'SIGTERM' || signal === 'SIGKILL';
+      const err = new Error((stderr || `docker exited with code ${code}`).slice(0, 500));
+      err.stdout = stdout;
+      err.timedOut = timedOut;
+      reject(err);
+    });
+  });
 }
 
 /**
@@ -99,37 +157,20 @@ try {
 `;
   writeFileSync(join(hostDir, 'runner.js'), runner);
 
-  const envFlags = Object.entries(env).map(([k, v]) => `-e ${k}=${v}`).join(' ');
   const containerName = `cf-skill-${jobId.slice(0, 8)}`;
-
-  const dockerCmd = [
-    'docker run --rm',
-    `--name ${containerName}`,
-    `--memory 512m --cpus 1`,
-    `--network none`,
-    `--pids-limit 64`,
-    `--read-only`,
-    `--tmpfs /tmp:size=64m`,
-    `--stop-timeout ${Math.ceil(timeoutMs / 1000)}`,
-    `-v ${hostDir}:/app:ro`,
-    envFlags,
-    image,
-    'node /app/runner.js',
-  ].filter(Boolean).join(' ');
+  const args = buildDockerArgs({ image, timeoutMs, env, hostDir, containerName });
 
   const startTime = Date.now();
 
   try {
-    const { stdout } = await execAsync(dockerCmd, {
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024, // 1MB
-    });
+    // L2: spawn('docker', argv, { shell:false }) — no shell string is
+    // ever built, so env values and the image name cannot inject.
+    const stdout = await spawnDocker(args, timeoutMs);
 
     // stdout contains the JSON result
     const result = JSON.parse(stdout.trim() || '{"ok":false,"error":"empty output"}');
     return { ...result, durationMs: Date.now() - startTime };
   } catch (err) {
-    const isTimeout = err.killed || err.signal === 'SIGTERM';
     // Try to parse stdout from error (docker may have written before timeout)
     const stdout = err.stdout?.trim();
     if (stdout) {
@@ -140,7 +181,7 @@ try {
     }
     return {
       ok: false,
-      error: isTimeout ? `Docker execution timed out after ${timeoutMs}ms` : (err.stderr || err.message).slice(0, 500),
+      error: err.timedOut ? `Docker execution timed out after ${timeoutMs}ms` : String(err.message || err).slice(0, 500),
       durationMs: Date.now() - startTime,
     };
   } finally {

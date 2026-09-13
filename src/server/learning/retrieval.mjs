@@ -29,7 +29,9 @@
  *     on the stats row). The two ledgers must NEVER mix.
  */
 
-import { createHash, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 import { redactText } from './redact.mjs';
 import { embedBatch, cosineSimilarity, unloadEmbeddingModel } from '../embeddings.mjs';
 import { lexicalSimilarity } from './cluster.mjs';
@@ -91,6 +93,58 @@ export function getRetrievalFlags() {
     // 'false' disables them (see requireCuratorEnabled in routes/learning.mjs).
     curator: envBool('LEARNING_CURATOR_ENABLED', true),
   };
+}
+
+// ─── Request-hash pepper (L11) ──────────────────────────────────────
+//
+// learning_routing_decisions.request_hash is stored for every shadow
+// routing decision. An unsalted sha256 of the raw request is a
+// confirmation oracle: anyone with DB read access can dictionary-attack
+// short, predictable requests. The stored hash is therefore
+// sha256(pepper + '|' + request), with a per-deployment pepper
+// persisted at DATA_DIR/.retrieval-pepper (mode 0600) — the same
+// pattern as .jwt-secret / .encrypt-key. Migration-free: the pepper is
+// loaded at hash time, so writes and any future comparisons go through
+// the same loader.
+const RETRIEVAL_PEPPER_FILE = '.retrieval-pepper';
+const pepperCache = new Map(); // resolved DATA_DIR -> pepper hex
+
+function resolveRetrievalDataDir() {
+  return path.resolve(process.env.DATA_DIR ||
+    path.join(import.meta.dirname, '..', '..', '..', 'data'));
+}
+
+/** Load (or generate and persist) the per-deployment request-hash pepper. */
+export function getRetrievalPepper() {
+  const dir = resolveRetrievalDataDir();
+  if (pepperCache.has(dir)) return pepperCache.get(dir);
+  const pepperFile = path.join(dir, RETRIEVAL_PEPPER_FILE);
+  let pepper = null;
+  try {
+    const saved = readFileSync(pepperFile, 'utf8').trim();
+    if (/^[0-9a-f]{64}$/.test(saved)) pepper = saved;
+  } catch { /* missing/unreadable → generate below */ }
+  if (!pepper) {
+    try { mkdirSync(dir, { recursive: true }); } catch {}
+    pepper = randomBytes(32).toString('hex');
+    try {
+      writeFileSync(pepperFile, pepper + '\n', { mode: 0o600 });
+    } catch (e) {
+      // Fail safe: keep the pepper in memory for this process so hashes
+      // stay consistent within the process. Cross-restart correlation is
+      // lost, which is the safe direction for a confirmation oracle.
+      console.warn(`[learning] WARNING: cannot persist retrieval pepper (${e.message}); request hashes will not be stable across restarts.`);
+    }
+  }
+  pepperCache.set(dir, pepper);
+  return pepper;
+}
+
+/** Peppered request hash for learning_routing_decisions.request_hash. */
+export function hashRequest(requestText) {
+  return createHash('sha256')
+    .update(getRetrievalPepper() + '|' + String(requestText))
+    .digest('hex');
 }
 
 // ─── Checksum (must match compiler.mjs EXACTLY) ──────────────────────
@@ -398,7 +452,9 @@ export async function shadowRoute({ db, userId, requestText, context = {} }) {
     const now = new Date().toISOString();
     const decisionId = randomUUID();
     const excerpt = redactText(requestText).text.slice(0, 200);
-    const requestHash = createHash('sha256').update(requestText).digest('hex');
+    // L11: peppered hash (sha256 of pepper + '|' + request), not the raw
+    // request — defeats dictionary/confirmation attacks on the stored hash.
+    const requestHash = hashRequest(requestText);
 
     const winnerRow = selection.winner;
     const topScore = ranked.length > 0 ? ranked[0].score : null;

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
-import { getTestServer, cleanupTestServer } from './helpers.mjs';
+import { getTestServer, cleanupTestServer, adminAuth } from './helpers.mjs';
 
 let app;
 
@@ -36,5 +36,14 @@ describe('live telemetry device classification', () => {
       expect(t[key] === null || typeof t[key] === 'number').toBe(true);
       if (typeof t[key] === 'number') expect(t[key]).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  // L7: device telemetry requires auth — anonymous callers get 401.
+  it('requires auth on /api/device-state', async () => {
+    const anon = await request(app).get('/api/device-state');
+    expect(anon.status).toBe(401);
+    const authed = await request(app).get('/api/device-state').set(adminAuth());
+    expect(authed.status).toBe(200);
+    expect(authed.body).toHaveProperty('network_type');
   });
 });

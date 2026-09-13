@@ -316,14 +316,18 @@ export async function runClustering({ db, userId, logger = console, threshold, s
     stats.clusters_formed = clusterPlan.length;
 
     const now = new Date().toISOString();
+    // L9: counts of the rows the fresh re-cluster deletes, for the audit
+    // row written after the transaction (one row per re-cluster run).
+    let deletedClusters = 0;
+    let deletedProposals = 0;
     const tx = db.transaction(() => {
       // Fresh re-cluster: drop this user's non-legacy clusters, their
       // member rows (cascade), and their open proposals. Legacy
       // read-only clusters are left alone, always.
-      db.prepare(`DELETE FROM learning_clusters
-        WHERE user_id = ? AND is_legacy_readonly = 0`).run(userId);
-      db.prepare(`DELETE FROM learning_merge_proposals
-        WHERE user_id = ? AND state = 'proposed'`).run(userId);
+      deletedClusters = db.prepare(`DELETE FROM learning_clusters
+        WHERE user_id = ? AND is_legacy_readonly = 0`).run(userId).changes ?? 0;
+      deletedProposals = db.prepare(`DELETE FROM learning_merge_proposals
+        WHERE user_id = ? AND state = 'proposed'`).run(userId).changes ?? 0;
 
       const insCluster = db.prepare(`INSERT INTO learning_clusters
         (id, user_id, label, centroid_signature, member_count, state, created_at, updated_at)
@@ -365,6 +369,27 @@ export async function runClustering({ db, userId, logger = console, threshold, s
       }
     });
     tx();
+
+    // L9: the fresh re-cluster above is destructive (deletes this user's
+    // non-legacy clusters and open merge proposals). The route-level
+    // 'learning.cluster.run' audit only records stats, so write one
+    // audit row per run with the deleted counts. Row shape matches the
+    // governance audit_log insert (actor, action, target, details,
+    // trace_id). Best-effort: a missing audit_log table (minimal test
+    // schemas) must not fail the run.
+    try {
+      db.prepare(`INSERT INTO audit_log (actor, action, target, details, trace_id)
+        VALUES (?, ?, ?, ?, NULL)`)
+        .run(userId, 'learning.clusters.reclustered', `learning_cluster:${userId}`,
+          JSON.stringify({
+            deletedClusters, deletedProposals,
+            threshold: t, method: stats.method, clusters_formed: stats.clusters_formed,
+          }));
+    } catch (err) {
+      logger.warn(`Learning cluster run: recluster audit row not written (${err?.message || err})`);
+    }
+    stats.deleted_clusters = deletedClusters;
+    stats.deleted_proposals = deletedProposals;
 
     // Read back the persisted clusters for proposals + stats.
     const rows = db.prepare(`SELECT c.id, c.is_legacy_readonly, c.member_count

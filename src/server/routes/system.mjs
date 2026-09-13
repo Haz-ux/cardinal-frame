@@ -80,7 +80,9 @@ export default function systemRoutes(ctx) {
   });
 
   // ─── Device State ────────────────────────────────────────────
-  router.get('/device-state', (_req, res) => {
+  // L7: device telemetry was unauthenticated — fingerprinting value only,
+  // but there's no reason to hand it to anonymous callers.
+  router.get('/device-state', authMiddleware, (_req, res) => {
     res.json(ctx.deviceStateCache);
   });
 

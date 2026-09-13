@@ -98,9 +98,9 @@ beforeEach(() => {
 
 // ─── M3: registration validation ────────────────────────────────────
 describe('MCP registration validation (M3)', () => {
-  it('rejects absolute paths that are not allowlisted', async () => {
+  it('rejects ALL absolute paths — even bindir binaries (Haz tightening)', async () => {
     const app = makeApp();
-    for (const command of ['/bin/bash', '/tmp/evil.sh', '/usr/bin/curl', '/home/haz/x']) {
+    for (const command of ['/bin/bash', '/tmp/evil.sh', '/usr/bin/curl', '/home/haz/x', '/usr/bin/python3', '/usr/local/bin/node']) {
       const r = await request(app).post('/api/mcp/servers').set(admin)
         .send({ name: 'n', transport: 'stdio', command, args: [] });
       expect(r.status).toBe(400);
@@ -146,12 +146,15 @@ describe('MCP registration validation (M3)', () => {
   });
 
   it('validateMcpServerConfig unit checks', () => {
-    expect(validateMcpServerConfig({ transport: 'stdio', command: '/bin/bash', args: [] })).toMatch(/allowlist|bin directory/);
+    expect(validateMcpServerConfig({ transport: 'stdio', command: '/bin/bash', args: [] })).toMatch(/allowlist|separators/);
+    expect(validateMcpServerConfig({ transport: 'stdio', command: '/usr/bin/python3', args: [] })).toMatch(/allowlist|separators/);
+    expect(validateMcpServerConfig({ transport: 'stdio', command: '..\\node', args: [] })).toMatch(/separators/);
     expect(validateMcpServerConfig({ transport: 'stdio', command: 'node', args: 'x' })).toMatch(/array of strings/);
     expect(validateMcpServerConfig({ transport: 'http', command: 'node', args: [] })).toMatch(/stdio/);
     expect(validateMcpServerConfig({ transport: 'stdio', command: 'node', args: ['a'] })).toBeNull();
     expect(validateMcpServerConfig({ transport: 'stdio', command: 'npx', args: [] })).toBeNull();
-    expect(validateMcpServerConfig({ transport: 'stdio', command: '/usr/local/bin/node', args: [] })).toBeNull();
+    expect(validateMcpServerConfig({ transport: 'stdio', command: 'python3', args: [] })).toBeNull();
+    expect(validateMcpServerConfig({ transport: 'stdio', command: '/usr/local/bin/node', args: [] })).toMatch(/separators/);
   });
 });
 

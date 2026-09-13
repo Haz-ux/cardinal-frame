@@ -180,4 +180,21 @@ describe('Sandbox API — POST /api/sandbox/execute', () => {
         .rejects.toThrow(/not in the allowlist/);
     });
   });
+
+  describe('Skill fetch SSRF defense-in-depth (L3)', () => {
+    it('refuses metadata/link-local hosts even with network_access granted', async () => {
+      await expect(runSandboxed({
+        code: `(input) => fetch('http://169.254.169.254/')`,
+        input: null,
+        allowNetwork: true,
+      })).rejects.toThrow(/blocked hostname|private\/internal/i);
+    });
+
+    it('still throws when network_access is not granted', async () => {
+      await expect(runSandboxed({
+        code: `(input) => fetch('http://169.254.169.254/')`,
+        input: null,
+      })).rejects.toThrow(/network access denied/);
+    });
+  });
 });

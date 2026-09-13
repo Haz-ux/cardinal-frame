@@ -35,7 +35,9 @@ const QUIET = { info() {}, warn() {}, error() {}, debug() {} };
 
 function freshDb() {
   const d = new Database(':memory:');
-  for (const f of ['026_learning_candidates.sql', '027_learning_clusters.sql']) {
+  // 014/022 first: 026 ALTERs learning_events, so the table must exist.
+  for (const f of ['014_learning_events.sql', '022_learning_events.sql',
+                   '026_learning_candidates.sql', '027_learning_clusters.sql']) {
     d.exec(readFileSync(join(MIGRATIONS, f), 'utf8'));
   }
   return d;
@@ -196,6 +198,41 @@ describe('runClustering + proposeMerges', () => {
     const openProps = db.prepare(`SELECT COUNT(*) c FROM learning_merge_proposals
       WHERE user_id = ? AND state = 'proposed'`).get(USER).c;
     expect(openProps).toBe(1); // no duplicates accumulate
+  });
+
+  it('L9: writes one audit row per re-cluster run with deleted counts', async () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      details TEXT DEFAULT '{}',
+      trace_id TEXT,
+      ts TEXT DEFAULT (datetime('now')))`);
+    const sim = stubSimFactory(['c1', 'c2', 'c3', 'c4']);
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    const rows = db.prepare(`SELECT * FROM audit_log
+      WHERE action = 'learning.clusters.reclustered' ORDER BY id`).all();
+    expect(rows.length).toBe(2); // one row per run
+    // First run deleted nothing; the re-cluster deleted the first run's
+    // clusters and its open merge proposal.
+    expect(JSON.parse(rows[0].details).deletedClusters).toBe(0);
+    expect(JSON.parse(rows[0].details).deletedProposals).toBe(0);
+    const second = JSON.parse(rows[1].details);
+    expect(second.deletedClusters).toBeGreaterThan(0);
+    expect(second.deletedProposals).toBe(1);
+    expect(rows[1].actor).toBe(USER);
+    expect(rows[1].target).toBe(`learning_cluster:${USER}`);
+    expect(rows[1].trace_id).toBeNull();
+  });
+
+  it('L9: a missing audit_log table does not fail the run (best-effort)', async () => {
+    const sim = stubSimFactory(['c1', 'c2', 'c3', 'c4']);
+    const r = await runClustering({ db, userId: USER, logger: QUIET, similarity: sim });
+    expect(r.ok).toBe(true);
+    expect(r.stats.deleted_clusters).toBe(0);
+    expect(r.stats.deleted_proposals).toBe(0);
   });
 
   it('returns ok:false instead of throwing on a broken db', async () => {

@@ -664,8 +664,13 @@ export function markRunReviewed(db, runId, actor) {
 
 export function reviewedDryRunCount(db, userId) {
   try {
+    // L10: only dry runs that completed WITHOUT error and actually
+    // produced findings count toward prune eligibility — an errored or
+    // empty dry run proves nothing about the policy snapshot, so it
+    // must not unlock prune mode.
     return db.prepare(`SELECT COUNT(*) AS n FROM learning_curator_runs
-      WHERE user_id = ? AND mode = 'dry_run' AND reviewed = 1`).get(userId).n ?? 0;
+      WHERE user_id = ? AND mode = 'dry_run' AND reviewed = 1
+        AND error IS NULL AND findings_count > 0`).get(userId).n ?? 0;
   } catch {
     return 0;
   }

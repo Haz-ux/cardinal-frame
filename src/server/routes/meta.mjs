@@ -9,21 +9,20 @@ import { sanitizeCommand } from '../command-safety.mjs';
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID
  */
 
-// ─── MCP stdio config validation (M3) ─────────────────────────────
+// ─── MCP stdio config validation (M3, tightened per Haz) ─────────────
 // Registration is equivalent to code execution: the manager spawns
 // `command` as a child process on connect (and on boot for auto_connect
 // servers). Configs are therefore validated at write time, BEFORE
 // persistence, in the registration route below:
-//  - `command` must be a PATH basename in the allowlist below, or an
-//    absolute path inside a known bin dir whose basename is allowlisted.
-//    Absolute paths elsewhere (and anything like /bin/bash) are rejected.
+//  - `command` must be a bare binary basename in the allowlist below.
+//    ALL absolute paths and path separators are rejected outright — Haz's
+//    explicit request: no more /usr/bin/python3, even in known bin dirs.
 //  - `args` must be an array of strings.
 //  - `http` transport is rejected outright: the manager only speaks stdio,
 //    so accepting it would create dead config surface.
 const MCP_COMMAND_ALLOWLIST = new Set([
   'node', 'nodejs', 'python3', 'python', 'npx', 'uvx', 'deno', 'bun',
 ]);
-const MCP_BINDIRS = new Set(['/bin', '/usr/bin', '/usr/local/bin']);
 
 export function validateMcpServerConfig({ transport, command, args }) {
   if (transport === 'http') {
@@ -36,20 +35,12 @@ export function validateMcpServerConfig({ transport, command, args }) {
     return 'Command is required for stdio transport';
   }
   const cmd = command.trim();
-  if (cmd.includes('\\')) return 'Command must not contain backslashes';
-  if (cmd.includes('/')) {
-    // Absolute path: must live in a known bin dir AND be an allowlisted binary.
-    if (!cmd.startsWith('/')) return 'Command must be a PATH basename or an absolute path inside a known bin directory';
-    const slash = cmd.lastIndexOf('/');
-    const dir = cmd.slice(0, slash) || '/';
-    const base = cmd.slice(slash + 1);
-    if (!MCP_BINDIRS.has(dir)) {
-      return `Command path must be inside a known bin directory (${[...MCP_BINDIRS].join(', ')})`;
-    }
-    if (!MCP_COMMAND_ALLOWLIST.has(base)) {
-      return `Command "${base}" is not in the MCP command allowlist`;
-    }
-  } else if (!MCP_COMMAND_ALLOWLIST.has(cmd)) {
+  // Haz: reject ALL absolute paths — basenames only. Any '/' or '\\' is a
+  // path separator (or traversal attempt like '..'), so reject outright.
+  if (cmd.includes('/') || cmd.includes('\\')) {
+    return 'Command must be an allowlisted binary name with no path separators — absolute paths are not accepted';
+  }
+  if (!MCP_COMMAND_ALLOWLIST.has(cmd)) {
     return `Command "${cmd}" is not in the MCP command allowlist`;
   }
   if (!Array.isArray(args)) return 'args must be an array of strings';

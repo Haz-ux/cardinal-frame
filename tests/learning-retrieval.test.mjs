@@ -2,10 +2,11 @@
 // Similarity is stubbed via __setSimilarityOverride (deterministic, no
 // MiniLM model download). CI runs these; they can't run on the dev box
 // (Node 24 bus-errors on vitest, pre-existing).
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
-import { readFileSync } from 'fs';
+import { readFileSync, mkdtempSync, rmSync, statSync } from 'fs';
 import { join, dirname } from 'path';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { createHash, randomUUID } from 'crypto';
 import {
@@ -13,6 +14,7 @@ import {
   hardFilter, routeScore, selectWinner,
   triggerMatchScore, recencyScore, affinityScore, successRate,
   recomputeContentHash, shadowRoute, recordFeedback,
+  hashRequest, getRetrievalPepper,
   __setSimilarityOverride,
 } from '../src/server/learning/retrieval.mjs';
 
@@ -59,6 +61,7 @@ function seedVersion(id, userId, candId, overrides = {}) {
 
 beforeEach(() => {
   db = freshDb();
+  process.env.DATA_DIR = PEPPER_DIR; // L11: isolate the pepper file per test file
   delete process.env.LEARNING_RETRIEVAL_ENABLED;
   __setSimilarityOverride(null);
 });
@@ -66,6 +69,15 @@ beforeEach(() => {
 afterEach(() => {
   __setSimilarityOverride(null);
   delete process.env.LEARNING_RETRIEVAL_ENABLED;
+  delete process.env.DATA_DIR;
+});
+
+let PEPPER_DIR;
+beforeAll(() => {
+  PEPPER_DIR = mkdtempSync(join(tmpdir(), 'cf-pepper-test-'));
+});
+afterAll(() => {
+  try { rmSync(PEPPER_DIR, { recursive: true, force: true }); } catch {}
 });
 
 describe('config', () => {
@@ -231,7 +243,24 @@ describe('shadowRoute', () => {
     expect(row.request_excerpt).not.toContain('haz@example.com');
     expect(row.request_excerpt).not.toContain('sk-abc1234567890');
     expect(row.request_excerpt.length).toBeLessThanOrEqual(200);
-    expect(row.request_hash).toBe(createHash('sha256').update('deploy gate for haz@example.com with key sk-abc1234567890').digest('hex'));
+    // L11: the stored hash is peppered — sha256(pepper + '|' + request),
+    // never the raw request's sha256.
+    expect(row.request_hash).toBe(hashRequest('deploy gate for haz@example.com with key sk-abc1234567890'));
+    expect(row.request_hash).not.toBe(createHash('sha256').update('deploy gate for haz@example.com with key sk-abc1234567890').digest('hex'));
+  });
+
+  it('L11: peppered hash is stable across calls and differs per input', () => {
+    expect(hashRequest('hello world')).toBe(hashRequest('hello world'));
+    expect(hashRequest('hello world')).not.toBe(hashRequest('hello mars'));
+    expect(hashRequest('hello world')).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('L11: pepper persists to DATA_DIR/.retrieval-pepper with mode 0600', () => {
+    const p = getRetrievalPepper();
+    expect(p).toMatch(/^[0-9a-f]{64}$/);
+    const pepperFile = join(PEPPER_DIR, '.retrieval-pepper');
+    expect(readFileSync(pepperFile, 'utf8').trim()).toBe(p);
+    expect(statSync(pepperFile).mode & 0o777).toBe(0o600);
   });
 
   it('never throws on garbage input', async () => {

@@ -74,8 +74,9 @@ const DOCKER_CAPS = [
 ];
 
 /**
- * Record a version lifecycle event. Never throws (logs swallowed —
- * callers treat event writes as best-effort audit trail).
+ * Record a version lifecycle event. Never throws (best-effort audit
+ * trail), but a failed write is logged via console.warn — silently
+ * dropping lifecycle events would hide audit gaps (L12).
  */
 export function recordVersionEvent(db, versionId, action, actor, detail = {}) {
   try {
@@ -84,7 +85,9 @@ export function recordVersionEvent(db, versionId, action, actor, detail = {}) {
       VALUES (?, ?, ?, ?, ?, ?)`)
       .run(randomUUID(), versionId, action, actor || null,
         JSON.stringify(detail || {}), new Date().toISOString());
-  } catch { /* best-effort */ }
+  } catch (err) {
+    console.warn(`[learning] recordVersionEvent failed for ${versionId} (${action}): ${err?.message || err}`);
+  }
 }
 
 /**
@@ -97,7 +100,9 @@ export function recordVersionEvent(db, versionId, action, actor, detail = {}) {
  *   4. Otherwise -> prompt_template (read-only checks / guidance).
  */
 export function decideKind(spec, riskTier, requestedCaps, candidateKind = null) {
-  const tier = String(riskTier || 'low').toLowerCase();
+  // L12: trim before the HIGH comparison — a trailing space ('high ')
+  // must not slip past the docker-only branch.
+  const tier = String(riskTier || 'low').trim().toLowerCase();
   const caps = (Array.isArray(requestedCaps) ? requestedCaps : []).map(c => String(c).toLowerCase());
   const dangerous = caps.filter(c => DOCKER_CAPS.some(k => c.includes(k)));
   const uniqueCaps = [...new Set(caps)];

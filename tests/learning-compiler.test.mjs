@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -73,6 +73,16 @@ describe('decideKind', () => {
     expect(d.kind).toBe('script');
     expect(d.requires_docker).toBe(true);
     expect(d.rationale).toBeTruthy();
+  });
+  it("L12: 'high ' with trailing space still hits the HIGH branch", () => {
+    const d = decideKind(spec, 'high ', []);
+    expect(d.kind).toBe('script');
+    expect(d.requires_docker).toBe(true);
+  });
+  it('L12: risk tier comparison is case-insensitive after trim', () => {
+    const d = decideKind(spec, '  HIGH\n', []);
+    expect(d.kind).toBe('script');
+    expect(d.requires_docker).toBe(true);
   });
   it('dangerous caps -> script + docker even at low risk', () => {
     const d = decideKind(spec, 'low', ['exec', 'file_read']);
@@ -323,6 +333,18 @@ describe('recordVersionEvent', () => {
       .all(version.id).map(e => e.action);
     expect(actions).toEqual(['compiled', 'approved']);
     expect(VERSION_STATES).toContain('rolled_back');
+  });
+
+  it('L12: logs via console.warn instead of throwing when the write fails', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const badDb = { prepare() { throw new Error('db is gone'); } };
+      expect(() => recordVersionEvent(badDb, 'v1', 'approved', 'admin', {})).not.toThrow();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain('recordVersionEvent');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

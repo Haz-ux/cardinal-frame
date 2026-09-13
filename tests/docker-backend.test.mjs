@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isDockerAvailable, executeInDocker } from '../src/server/routes/docker-backend.mjs';
+import { isDockerAvailable, executeInDocker, buildDockerArgs } from '../src/server/routes/docker-backend.mjs';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,38 +39,55 @@ describe('Docker Execution Backend', () => {
   });
 });
 
-describe('Docker Backend — Security Flags (Task 5 audit)', () => {
-  it('should include --pids-limit in the docker run command (fork-bomb protection)', () => {
-    expect(dockerBackendSrc).toContain('--pids-limit 64');
+describe('Docker Backend — argv execution (L2 audit)', () => {
+  it('invokes docker via spawn with shell:false — no shell string is built', () => {
+    expect(dockerBackendSrc).toMatch(/spawn\(\s*['"]docker['"]/);
+    expect(dockerBackendSrc).toContain('shell: false');
+    expect(dockerBackendSrc).not.toContain('execAsync');
+    expect(dockerBackendSrc).not.toMatch(/`-e \$/);
   });
 
-  it('should include --read-only in the docker run command (filesystem write protection)', () => {
-    expect(dockerBackendSrc).toContain('--read-only');
+  it('buildDockerArgs keeps env values as single inert argv elements', () => {
+    const args = buildDockerArgs({
+      image: 'node:22-slim',
+      timeoutMs: 30000,
+      env: { EVIL: '$(touch /tmp/pwned)', SEMI: 'a;b', BT: '`id`' },
+      hostDir: '/tmp/cf-docker-x',
+      containerName: 'cf-skill-1',
+    });
+    // Every element is a plain string (no shell joining).
+    expect(args.every(a => typeof a === 'string')).toBe(true);
+    // The hostile value stays ONE argv element after its -e flag —
+    // with shell:false no shell ever interprets the $(), ; or backticks.
+    const pairs = { EVIL: '$(touch /tmp/pwned)', SEMI: 'a;b', BT: '`id`' };
+    for (const [k, v] of Object.entries(pairs)) {
+      const idx = args.indexOf(`${k}=${v}`);
+      expect(idx).toBeGreaterThan(-1);
+      expect(args[idx - 1]).toBe('-e');
+    }
+    // Image is an argv element too, not interpolated into a command line.
+    expect(args).toContain('node:22-slim');
   });
 
-  it('should include --tmpfs /tmp for writable temp inside read-only container', () => {
-    expect(dockerBackendSrc).toContain('--tmpfs /tmp:size=64m');
+  it('buildDockerArgs keeps the container hardening flags', () => {
+    const args = buildDockerArgs({
+      image: 'node:22-slim', timeoutMs: 30000, env: {},
+      hostDir: '/tmp/x', containerName: 'c',
+    });
+    for (const flag of ['--network', 'none', '--read-only', '--pids-limit', '64',
+      '--memory', '512m', '--cpus', '1', '--tmpfs', '/tmp:size=64m']) {
+      expect(args).toContain(flag);
+    }
+    // --stop-timeout derives from timeoutMs (30s -> 30).
+    const stIdx = args.indexOf('--stop-timeout');
+    expect(args[stIdx + 1]).toBe('30');
   });
 
-  it('should still have the original security flags (--memory, --cpus, --network none)', () => {
-    expect(dockerBackendSrc).toContain('--memory 512m');
-    expect(dockerBackendSrc).toContain('--cpus 1');
-    expect(dockerBackendSrc).toContain('--network none');
-  });
-
-  it('should have --pids-limit set to a reasonable value (<=128)', () => {
-    const match = dockerBackendSrc.match(/--pids-limit\s+(\d+)/);
-    expect(match).not.toBeNull();
-    const limit = parseInt(match[1]);
-    expect(limit).toBeGreaterThan(0);
-    expect(limit).toBeLessThanOrEqual(128);
-  });
-
-  it('should have --tmpfs with a size limit', () => {
-    const match = dockerBackendSrc.match(/--tmpfs\s+\/tmp:size=(\d+)m/);
-    expect(match).not.toBeNull();
-    const size = parseInt(match[1]);
-    expect(size).toBeGreaterThan(0);
-    expect(size).toBeLessThanOrEqual(128);
+  it('still has the original security flags in source (--pids-limit, --read-only, --tmpfs, --memory, --cpus, --network none)', () => {
+    for (const flag of ["'--pids-limit'", "'64'", "'--read-only'",
+      "'--tmpfs'", "'/tmp:size=64m'", "'--memory'", "'512m'",
+      "'--cpus'", "'1'", "'--network'", "'none'"]) {
+      expect(dockerBackendSrc).toContain(flag);
+    }
   });
 });

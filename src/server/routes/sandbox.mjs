@@ -18,7 +18,7 @@
  *
  * Provides:
  *   - `execSync`: restricted shell exec with an allowlist
- *   - `fetch`: passthrough to global fetch (full HTTP client — can POST;
+ *   - `fetch`: routed through safeFetch (SSRF-guarded HTTP client — can POST;
  *     skill code is trusted as its author, see above)
  *   - `llmCall`: async callback for hybrid skills (only when explicitly provided)
  *   - JSON.stringify / JSON.parse for data manipulation
@@ -41,6 +41,7 @@
 import vm from 'node:vm';
 import { execSync as _execSync } from 'node:child_process';
 import { hasShellMetachars } from '../command-safety.mjs';
+import { safeFetch } from '../safe-fetch.mjs';
 
 // ─── execSync allowlist ────────────────────────────────────────────────────
 // Read-only inspection tools only. Deliberately EXCLUDED:
@@ -165,10 +166,12 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
     // Restricted execSync
     execSync: createRestrictedExecSync({ allowNetwork }),
 
-    // fetch: full HTTP client when the network gate is open, otherwise a
-    // stub that throws. Skill code is trusted as its author either way.
+    // fetch: L3 — routed through safeFetch as defense-in-depth (blocks
+    // link-local/metadata hosts like 169.254.169.254 and re-validates
+    // redirects). The network_access gate is unchanged: when closed, fetch
+    // throws; when open, skill code is trusted as its author anyway.
     fetch: allowNetwork
-      ? (...args) => globalThis.fetch(...args)
+      ? (...args) => safeFetch(args[0], args[1])
       : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
 
     // Secrets — only keys explicitly passed by the caller (never process.env directly)
@@ -249,8 +252,9 @@ export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_
     encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
     Promise,
     execSync: createRestrictedExecSync({ allowNetwork }),
+    // L3: same safeFetch routing as runSandboxed above.
     fetch: allowNetwork
-      ? (...args) => globalThis.fetch(...args)
+      ? (...args) => safeFetch(args[0], args[1])
       : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
     secrets,
     input,

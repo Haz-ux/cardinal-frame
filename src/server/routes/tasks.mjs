@@ -9,6 +9,16 @@ import { topoSortLayers, runDag } from '../dag-run.mjs';
  * Task + DAG + File routes
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand
  */
+/**
+ * L4: sanitize a reflected download filename for Content-Disposition —
+ * basename plus stripping quotes, backslashes and line breaks so it
+ * cannot break out of the header value. Same treatment as
+ * chat-conversations.mjs.
+ */
+export function sanitizeDownloadFilename(name) {
+  return path.basename(String(name || 'download')).replace(/["\\\r\n]/g, '');
+}
+
 export default function taskRoutes(ctx) {
   const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand, fireHook } = ctx;
   const router = express.Router();
@@ -465,7 +475,7 @@ router.get('/files/:id/download', optionalAuth, (req, res) => {
  if (!existsSync(filePath)) return res.status(404).json({ error: 'File data missing on disk' });
 
  res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
- res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`);
+ res.setHeader('Content-Disposition', `attachment; filename="${sanitizeDownloadFilename(file.original_name)}"`);
  createReadStream(filePath).pipe(res);
 });
 

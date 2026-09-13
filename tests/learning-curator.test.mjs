@@ -382,17 +382,47 @@ describe('lifecycle primitives', () => {
 });
 
 describe('prune gating', () => {
-  it('requires two reviewed dry runs', async () => {
+  it('requires two reviewed, successful, non-empty dry runs', async () => {
     expect(pruneEligible(db, U1)).toBe(false);
     expect(reviewedDryRunCount(db, U1)).toBe(0);
+    // L10: seed a stale-eligible version before each dry run so every
+    // counted run has findings_count > 0 (a fresh version per run —
+    // dedup would suppress the same version's finding twice).
+    seedCandidate('c1'); seedVersion('v1', U1, 'c1');
+    seedStats('v1', { last: dISO(45) });
     const r1 = await runCurator({ db, userId: U1 });
+    expect(r1.run.error).toBeNull();
+    expect(r1.run.findings_count).toBeGreaterThan(0);
+    seedCandidate('c2'); seedVersion('v2', U1, 'c2');
+    seedStats('v2', { last: dISO(45) });
     const r2 = await runCurator({ db, userId: U1 });
+    expect(r2.run.error).toBeNull();
+    expect(r2.run.findings_count).toBeGreaterThan(0);
     markRunReviewed(db, r1.run.id, U1);
     expect(pruneEligible(db, U1)).toBe(false);
     markRunReviewed(db, r2.run.id, U1);
     expect(reviewedDryRunCount(db, U1)).toBe(2);
     expect(pruneEligible(db, U1)).toBe(true);
     expect(markRunReviewed(db, 'missing', U1)).toBeNull();
+  });
+
+  it('L10: errored dry runs do not count toward prune eligibility', async () => {
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO learning_curator_runs
+      (id, user_id, mode, reviewed, findings_count, applied_count, error, created_at)
+      VALUES ('run-err', ?, 'dry_run', 1, 3, 0, 'finding phase exploded', ?)`)
+      .run(U1, now);
+    expect(reviewedDryRunCount(db, U1)).toBe(0);
+    expect(pruneEligible(db, U1)).toBe(false);
+  });
+
+  it('L10: empty dry runs (no findings) do not count toward prune eligibility', async () => {
+    const r = await runCurator({ db, userId: U1 }); // no versions -> 0 findings
+    expect(r.run.error).toBeNull();
+    expect(r.run.findings_count).toBe(0);
+    markRunReviewed(db, r.run.id, U1);
+    expect(reviewedDryRunCount(db, U1)).toBe(0);
+    expect(pruneEligible(db, U1)).toBe(false);
   });
 
   it('prune mode auto-applies ONLY stale transitions', async () => {

@@ -64,3 +64,5 @@ metadata.json
 # Dead artifacts
 *.bak
 test-results/
+.password-reset-tokens
+data/.password-reset-tokens

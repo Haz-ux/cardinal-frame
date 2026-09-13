@@ -226,4 +226,36 @@ describe('Auth API', () => {
       expect(res.body.success).toBe(true);
     });
   });
+
+  // L6: DISABLE_REGISTRATION deployment toggle.
+  describe('DISABLE_REGISTRATION', () => {
+    it('returns 403 on /register when set to a truthy value', async () => {
+      for (const v of ['true', '1', 'yes']) {
+        process.env.DISABLE_REGISTRATION = v;
+        const res = await request(app)
+          .post('/api/auth/register')
+          .send({ username: `blocked-${v}`, password: 'testpass123' });
+        expect(res.status).toBe(403);
+        expect(res.body.error).toMatch(/disabled/i);
+      }
+      delete process.env.DISABLE_REGISTRATION;
+    });
+
+    it('treats explicit falsy values as registration-open', async () => {
+      process.env.DISABLE_REGISTRATION = 'false';
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ username: 'falsyflaguser', password: 'testpass123' });
+      delete process.env.DISABLE_REGISTRATION;
+      expect(res.status).toBe(201);
+    });
+
+    it('registers normally when unset (default unchanged)', async () => {
+      delete process.env.DISABLE_REGISTRATION;
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ username: 'openreguser', password: 'testpass123' });
+      expect(res.status).toBe(201);
+    });
+  });
 });

@@ -791,12 +791,13 @@ db.exec(`
     } catch (e) {
       logger.warn(`Could not write ${credFile}: ${e.message}`);
     }
-    const banner = rotatedCreds.map(c => `    ${c.username} / ${c.password}`).join('\n');
+    // L5: never print live credentials to stdout — anyone with log access
+    // would see them. They live only in the 0600 credential file; the
+    // pointer below is enough for the operator to find them on first boot.
     console.log('\n================================================================');
     console.log('  CARDINAL FRAME — admin credentials were (re)generated');
     console.log('  The old defaults (admin123 / cardinal) no longer work.');
-    console.log(banner);
-    console.log(`  Saved to ${credFile} (mode 600). The CLI reads it automatically.`);
+    console.log(`  Credentials are saved in ${credFile} (mode 600). The CLI reads it automatically.`);
     console.log('================================================================\n');
   }
 
