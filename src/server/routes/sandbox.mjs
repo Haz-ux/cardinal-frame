@@ -2,37 +2,51 @@
  * sandbox.mjs — Restricted VM sandbox for executing user-supplied skill handlers.
  *
  * Replaces `new Function()` and `eval()` with `vm.runInNewContext()` so that
- * untrusted skill code cannot access `process`, `require`, `module`,
- * `__dirname`, `globalThis`, or other Node primitives.
+ * skill code doesn't get Node primitives by default.
+ *
+ * HONEST SCOPE: Node's own docs state the `vm` module is NOT a security
+ * mechanism. This sandbox is defense-in-depth against accidents, not a
+ * containment boundary for hostile code. The real trust boundary is
+ * authorship: creating or installing a skill requires admin, and skill code
+ * runs with the trust of whoever authored it. Secrets are only exposed to
+ * skill code on that basis — never grant secrets to skills you wouldn't
+ * hand your API keys to directly.
  *
  * Provides:
  *   - `execSync`: restricted shell exec with an allowlist
- *   - `fetch`: passthrough to global fetch (no mutation capability)
+ *   - `fetch`: passthrough to global fetch (full HTTP client — can POST;
+ *     skill code is trusted as its author, see above)
  *   - `llmCall`: async callback for hybrid skills (only when explicitly provided)
  *   - JSON.stringify / JSON.parse for data manipulation
  *   - console.log for debugging (writes to a captured array)
  *
  * Security:
  *   - No `process`, `require`, `module`, `exports`, `__dirname`, `__filename`
+ *     in the VM context by default
  *   - No access to the outer lexical scope (code runs in an isolated V8 context)
  *   - Timeout: 30s default (configurable)
- *   - execSync allowlist: only known-safe binaries; blocks rm, kill, pkill,
- *     shutdown, reboot, dd, mkfs, fdisk, chmod 777, curl to file, etc.
+ *   - execSync allowlist: read-only inspection tools only. Interpreters
+ *     (node/python/npm) are deliberately excluded — spawning one would hand
+ *     skill code an unsandboxed process with full `require`/`process`.
+ *   - Blocks rm -rf /, disk writes, kill -9, reverse shells, etc.
  */
 
 import vm from 'node:vm';
 import { execSync as _execSync } from 'node:child_process';
 
 // ─── execSync allowlist ────────────────────────────────────────────────────
-// Read-only inspection tools only. No mutating/privilege-escalating binaries.
+// Read-only inspection tools only. Deliberately EXCLUDED:
+//   - interpreters (node, python3, npm, npx, uv): spawning one escapes the VM
+//     with a full unsandboxed process (process/require/fs)
+//   - mutating binaries (mkdir, cp, mv): the sandbox policy is read-only
+//   - privilege/destructive tools: covered by the blocklist below
 const EXEC_ALLOWLIST = new Set([
   'echo', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'uptime', 'who', 'last',
   'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'sort', 'uniq',
   'jq', 'xq', 'yq', 'tree', 'file', 'stat', 'du', 'df', 'find', 'ps', 'pgrep',
   'ss', 'netstat', 'arp', 'ip', 'ifconfig', 'ping',
-  'git', 'node', 'npm', 'npx', 'uv', 'python3', 'python',
+  'git',
   'curl', 'wget',
-  'mkdir', 'cp', 'mv',
 ]);
 
 // Commands that are always blocked even if the binary is in the allowlist
@@ -120,7 +134,7 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
     // Restricted execSync
     execSync: createRestrictedExecSync(),
 
-    // Read-only fetch passthrough (bound to global, no response mutation)
+    // fetch: full HTTP client (can POST). Skill code is trusted as its author.
     fetch: (...args) => globalThis.fetch(...args),
 
     // Secrets — only keys explicitly passed by the caller (never process.env directly)
