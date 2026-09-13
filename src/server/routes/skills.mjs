@@ -85,6 +85,10 @@ export async function executeSkill(skill, input = {}, traceId = null) {
   const startTime = Date.now();
   let result;
 
+  // Network egress gate: skill code only gets fetch/curl/wget when the admin
+  // explicitly granted network_access on the skill row.
+  const allowNetwork = skill.network_access === 1;
+
   try {
     // Template skill — LLM prompt template
     if (handlerStr.startsWith('template:')) {
@@ -106,7 +110,7 @@ export async function executeSkill(skill, input = {}, traceId = null) {
       const llmCall = (messages, model) => callAgentLLM(messages, model || skill.model || undefined);
       const secrets = collectSkillSecrets(skill);
       const sandboxTimeoutMs = parseInt(getDevSetting(db, 'sandboxTimeout', '30'), 10) * 1000;
-      const { result: sandboxResult } = await sbHybrid({ code, input, llmCall, secrets, timeoutMs: sandboxTimeoutMs });
+      const { result: sandboxResult } = await sbHybrid({ code, input, llmCall, secrets, timeoutMs: sandboxTimeoutMs, allowNetwork });
       result = { ok: true, type: 'hybrid', output: sandboxResult, duration_ms: Date.now() - startTime };
     } else {
       // Script skill — pure JS function (sandboxed via vm.runInNewContext)
@@ -129,7 +133,7 @@ export async function executeSkill(skill, input = {}, traceId = null) {
           } else if (dockerResult.error === 'Docker is not available on this host') {
             // Docker went away between check and exec — graceful fallback
             log.warn(`Docker unavailable for "${skill.name}" — falling back to local sandbox`);
-            const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+            const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs, allowNetwork });
             result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local (docker fallback)' };
           } else {
             // Docker execution failed with a real error (timeout, crash, etc.)
@@ -138,12 +142,12 @@ export async function executeSkill(skill, input = {}, traceId = null) {
         } else {
           // Docker not available on this host — graceful fallback to local sandbox
           log.warn(`Docker backend requested for "${skill.name}" but Docker unavailable — falling back to local sandbox`);
-          const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+          const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs, allowNetwork });
           result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local (docker fallback)' };
         }
       } else {
         // Default: local VM sandbox
-        const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs });
+        const { result: sandboxResult } = await sb({ code: handlerStr, input, secrets, timeoutMs: sandboxTimeoutMs, allowNetwork });
         result = { ok: true, type: 'script', output: sandboxResult, duration_ms: Date.now() - startTime, execution_backend: 'local' };
       }
     }
@@ -288,17 +292,22 @@ export default function skillsRoutes(ctx) {
     const executionBackend = req.body.execution_backend || 'local';
     stmts.skills.insertWithTrigger.run(id, name, description || '', category || 'general', handler, JSON.stringify(parameters || {}), enabled !== false ? 1 : 0, trigger || '');
     db.prepare('UPDATE skills SET execution_backend = ? WHERE id = ?').run(executionBackend, id);
-    audit('create', 'skill', id, req.user.id, { name, category, execution_backend: executionBackend });
+    if (req.body.network_access) stmts.skills.setNetworkAccess.run(1, id);
+    audit('create', 'skill', id, req.user.id, { name, category, execution_backend: executionBackend, network_access: req.body.network_access ? 1 : 0 });
     res.status(201).json({ id, name });
   });
 
   router.put('/skills/:id', authMiddleware, requireRole('admin'), (req, res) => {
     const skill = stmts.skills.getById.get(req.params.id);
     if (!skill) return res.status(404).json({ error: 'Skill not found' });
-    const { description, category, parameters, enabled, execution_backend } = req.body;
+    const { description, category, parameters, enabled, execution_backend, network_access } = req.body;
     stmts.skills.update.run(description ?? skill.description, category ?? skill.category, JSON.stringify(parameters ?? JSON.parse(skill.parameters)), enabled !== undefined ? (enabled ? 1 : 0) : skill.enabled, req.params.id);
     if (execution_backend) {
       db.prepare('UPDATE skills SET execution_backend = ? WHERE id = ?').run(execution_backend, req.params.id);
+    }
+    if (network_access !== undefined) {
+      stmts.skills.setNetworkAccess.run(network_access ? 1 : 0, req.params.id);
+      audit('network_access', 'skill', req.params.id, req.user.id, { name: skill.name, network_access: network_access ? 1 : 0 });
     }
     res.json({ ok: true });
   });

@@ -359,6 +359,7 @@ registerAgentTool(
       const { result: handlerResult } = await runSandboxed({
         code: skill.handler,
         input: args.input || '',
+        allowNetwork: skill.network_access === 1,
       });
       return { result: handlerResult };
     } catch (e) {

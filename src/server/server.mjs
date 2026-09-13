@@ -975,6 +975,7 @@ const stmts = {
       getAllWithTrigger: db.prepare("SELECT * FROM skills WHERE enabled = 1 AND trigger != '' ORDER BY confidence DESC"),
       updateInvoke: db.prepare("UPDATE skills SET invoke_count = invoke_count + 1, last_invoked = datetime('now') WHERE id = ?"),
       insertFull: db.prepare('INSERT INTO skills (id, name, description, category, handler, parameters, enabled, confidence, auto_proposed, trigger, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+      setNetworkAccess: db.prepare('UPDATE skills SET network_access = ? WHERE id = ?'),
       },
       skillInvocations: {
         insert: db.prepare('INSERT INTO skill_invocations (skill_id, skill_name, trace_id, success, duration_ms, skill_type, error) VALUES (?, ?, ?, ?, ?, ?, ?)'),

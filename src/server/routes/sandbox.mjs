@@ -12,6 +12,10 @@
  * skill code on that basis — never grant secrets to skills you wouldn't
  * hand your API keys to directly.
  *
+ * Network egress gate: `fetch` and the curl/wget exec binaries are denied
+ * unless the skill row has `network_access = 1` (granted by an admin).
+ * Pass `allowNetwork: true` to runSandboxed/runSandboxedHybrid to open it.
+ *
  * Provides:
  *   - `execSync`: restricted shell exec with an allowlist
  *   - `fetch`: passthrough to global fetch (full HTTP client — can POST;
@@ -66,7 +70,12 @@ const EXEC_BLOCKLIST = [
 
 const EXEC_TIMEOUT_MS = 10_000;
 
-function createRestrictedExecSync() {
+// Binaries that can move data off-host. They are only usable when the skill
+// was granted network access via the network egress gate (network_access = 1
+// on the skill row). Everything else in the allowlist is read-only.
+const NETWORK_BINARIES = new Set(['curl', 'wget']);
+
+function createRestrictedExecSync({ allowNetwork = false } = {}) {
   return (cmd, opts = {}) => {
     if (typeof cmd !== 'string') throw new Error('execSync: command must be a string');
 
@@ -79,6 +88,11 @@ function createRestrictedExecSync() {
 
     // Extract binary name (first token, handle simple quoting)
     const binary = cmd.trim().split(/[\s|&;]+/)[0].replace(/^['"]|['"]$/g, '');
+
+    // Network egress gate: curl/wget need the skill's network_access grant
+    if (!allowNetwork && NETWORK_BINARIES.has(binary)) {
+      throw new Error(`execSync: "${binary}" requires network access — grant it on the skill to enable`);
+    }
 
     // Git subcommands: validate the git subcommand too
     if (binary === 'git') {
@@ -113,9 +127,13 @@ function createRestrictedExecSync() {
  * @param {*}      opts.input        — input argument for the skill
  * @param {Function} [opts.llmCall]  — optional async LLM call for hybrid skills
  * @param {number} [opts.timeoutMs]   — timeout in ms (default 30000)
+ * @param {Object} [opts.secrets]     — secrets exposed as `secrets` in the sandbox
+ * @param {boolean} [opts.allowNetwork] — network egress gate: when false (default),
+ *   `fetch` throws and curl/wget are blocked in execSync. Grant per skill via
+ *   the skill's `network_access` flag.
  * @returns {Promise<*>}               — the result of the executed code
  */
-export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000, secrets = {} }) {
+export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000, secrets = {}, allowNetwork = false }) {
   const logs = [];
 
   const sandbox = {
@@ -132,10 +150,13 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
     Promise,
 
     // Restricted execSync
-    execSync: createRestrictedExecSync(),
+    execSync: createRestrictedExecSync({ allowNetwork }),
 
-    // fetch: full HTTP client (can POST). Skill code is trusted as its author.
-    fetch: (...args) => globalThis.fetch(...args),
+    // fetch: full HTTP client when the network gate is open, otherwise a
+    // stub that throws. Skill code is trusted as its author either way.
+    fetch: allowNetwork
+      ? (...args) => globalThis.fetch(...args)
+      : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
 
     // Secrets — only keys explicitly passed by the caller (never process.env directly)
     secrets,
@@ -204,7 +225,7 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
  * Hybrid handlers are raw JS code (not a function expression) so we wrap
  * them in an async IIFE before running.
  */
-export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000, secrets = {} }) {
+export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000, secrets = {}, allowNetwork = false }) {
   const logs = [];
 
   const sandbox = {
@@ -214,8 +235,10 @@ export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_
     RegExp,
     encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
     Promise,
-    execSync: createRestrictedExecSync(),
-    fetch: (...args) => globalThis.fetch(...args),
+    execSync: createRestrictedExecSync({ allowNetwork }),
+    fetch: allowNetwork
+      ? (...args) => globalThis.fetch(...args)
+      : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
     secrets,
     input,
     llmCall,
