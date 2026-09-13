@@ -19,6 +19,7 @@
  * pass ?user_id= on the review job endpoints to run/list for another user.
  */
 import express from 'express';
+import { randomUUID } from 'crypto';
 import { runReviewJob } from '../learning/reviewer.mjs';
 import {
   getCandidate,
@@ -28,6 +29,11 @@ import {
   updateCandidateFields,
   getCandidateEvidence,
 } from '../learning/candidates.mjs';
+import {
+  runClustering,
+  backfillLegacyClusters,
+  MERGEABLE_STATES,
+} from '../learning/cluster.mjs';
 
 // API state filter → DB state. `review` is the visible untrusted queue
 // (DB state 'candidate').
@@ -213,6 +219,229 @@ export default function learningRoutes(ctx) {
     const targetUser = resolveTargetUser(req);
     const jobs = stmts.learningReviewJobs.getByUser.all(targetUser);
     res.json({ jobs: jobs.map(toJob) });
+  });
+
+  // ─── Clusters (Phase 3, shadow mode) ──────────────────────────────
+
+  function clusterMemberRows(db, clusterId, userId) {
+    return db.prepare(`SELECT m.candidate_id, m.similarity, m.is_centroid,
+        lc.title, lc.kind, lc.state
+      FROM candidate_cluster_members m
+      JOIN learning_candidates lc ON lc.id = m.candidate_id
+      WHERE m.cluster_id = ? AND lc.user_id = ?
+      ORDER BY m.is_centroid DESC, m.similarity DESC`)
+      .all(clusterId, userId);
+  }
+
+  // List clusters with members, biggest first. avg_similarity is the mean
+  // similarity of non-centroid members (the centroid stores 1.0).
+  router.get('/learning/clusters', authMiddleware, (req, res) => {
+    const clusters = db.prepare(`SELECT * FROM learning_clusters
+      WHERE user_id = ? ORDER BY member_count DESC, created_at DESC`)
+      .all(req.user.id);
+    res.json({
+      clusters: clusters.map(c => {
+        const members = clusterMemberRows(db, c.id, req.user.id);
+        const nonCentroid = members.filter(m => !m.is_centroid);
+        const avg = nonCentroid.length
+          ? nonCentroid.reduce((a, m) => a + m.similarity, 0) / nonCentroid.length
+          : 0;
+        return {
+          id: c.id,
+          label: c.label,
+          member_count: c.member_count,
+          avg_similarity: avg,
+          is_legacy_readonly: c.is_legacy_readonly === 1,
+          state: c.state,
+          created_at: c.created_at,
+          members: members.map(m => ({
+            candidate_id: m.candidate_id,
+            title: m.title,
+            kind: m.kind,
+            state: m.state,
+            similarity: m.similarity,
+            is_centroid: m.is_centroid === 1,
+          })),
+        };
+      }),
+    });
+  });
+
+  // List merge proposals, defaulting to the open ('proposed') queue.
+  router.get('/learning/merge-proposals', authMiddleware, (req, res) => {
+    const valid = ['proposed', 'approved', 'dismissed'];
+    const state = req.query.state || 'proposed';
+    if (!valid.includes(state)) {
+      return res.status(400).json({ error: 'state must be one of proposed|approved|dismissed' });
+    }
+    const rows = db.prepare(`SELECT p.*, c.label AS cluster_label
+      FROM learning_merge_proposals p
+      JOIN learning_clusters c ON c.id = p.cluster_id
+      WHERE p.user_id = ? AND p.state = ?
+      ORDER BY p.created_at DESC`)
+      .all(req.user.id, state);
+    res.json({
+      proposals: rows.map(p => {
+        let fromIds = [];
+        try { fromIds = JSON.parse(p.from_candidate_ids); } catch { fromIds = []; }
+        const memberTitles = fromIds.map(id => {
+          const c = getCandidate(db, id, req.user.id);
+          return c ? { id: c.id, title: c.title } : { id, title: '(deleted)' };
+        });
+        let combined = {};
+        try { combined = JSON.parse(p.combined_support); } catch { combined = {}; }
+        return {
+          id: p.id,
+          cluster_id: p.cluster_id,
+          cluster_label: p.cluster_label,
+          from_candidate_ids: fromIds,
+          member_titles: memberTitles,
+          combined_support: combined,
+          state: p.state,
+          created_at: p.created_at,
+          decided_at: p.decided_at,
+        };
+      }),
+    });
+  });
+
+  // Dismiss a merge proposal — nothing changes but the proposal state.
+  router.post('/learning/merge-proposals/:id/dismiss', authMiddleware, apiLimiter, (req, res) => {
+    const p = db.prepare('SELECT * FROM learning_merge_proposals WHERE id = ? AND user_id = ?')
+      .get(req.params.id, req.user.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    if (p.state !== 'proposed') {
+      return res.status(400).json({ error: 'only proposed merges can be dismissed' });
+    }
+    const decidedAt = new Date().toISOString();
+    db.prepare(`UPDATE learning_merge_proposals SET state = 'dismissed', decided_at = ?
+      WHERE id = ? AND user_id = ?`).run(decidedAt, p.id, req.user.id);
+    audit('learning.merge.dismiss', 'learning_merge_proposal', p.id, req.user.id, {
+      cluster_id: p.cluster_id,
+    });
+    logger.info(`Learning merge proposal dismissed: ${p.id} (cluster ${p.cluster_id})`);
+    const updated = db.prepare('SELECT * FROM learning_merge_proposals WHERE id = ?').get(p.id);
+    res.json({ proposal: { ...updated, from_candidate_ids: JSON.parse(updated.from_candidate_ids || '[]') } });
+  });
+
+  // Approve a merge proposal. Survivor = the mergeable member with the
+  // highest promotion_score (re-fetched at approve time). Losers are
+  // ARCHIVED (rows stay, state='archived'); their evidence rows are
+  // re-pointed at the survivor. One transaction — all or nothing.
+  router.post('/learning/merge-proposals/:id/approve', authMiddleware, apiLimiter, (req, res) => {
+    const p = db.prepare('SELECT * FROM learning_merge_proposals WHERE id = ? AND user_id = ?')
+      .get(req.params.id, req.user.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    if (p.state !== 'proposed') {
+      return res.status(400).json({ error: 'only proposed merges can be approved' });
+    }
+    let fromIds = [];
+    try { fromIds = JSON.parse(p.from_candidate_ids); } catch { fromIds = []; }
+    if (fromIds.length < 2) {
+      return res.status(400).json({ error: 'proposal has fewer than two members' });
+    }
+
+    const now = new Date().toISOString();
+    const mergeableMembers = [];
+    for (const id of fromIds) {
+      const c = getCandidate(db, id, req.user.id);
+      if (!c) {
+        return res.status(400).json({ error: `member candidate ${id} no longer exists` });
+      }
+      if (!MERGEABLE_STATES.has(c.state)) {
+        return res.status(400).json({ error: `member candidate ${id} is no longer mergeable (state=${c.state})` });
+      }
+      if (c.cooldown_until && c.cooldown_until > now) {
+        return res.status(400).json({ error: `member candidate ${id} is in cooldown` });
+      }
+      mergeableMembers.push(c);
+    }
+    mergeableMembers.sort((a, b) => (b.promotion_score ?? 0) - (a.promotion_score ?? 0));
+    const survivor = mergeableMembers[0];
+    const losers = mergeableMembers.slice(1);
+
+    const addVerified = losers.reduce((a, c) => a + (c.support_verified ?? 0), 0);
+    const addRecovered = losers.reduce((a, c) => a + (c.support_recovered ?? 0), 0);
+    const addCorrections = losers.reduce((a, c) => a + (c.support_corrections ?? 0), 0);
+
+    const tx = db.transaction(() => {
+      const insEvidence = db.prepare(`INSERT OR IGNORE INTO candidate_evidence
+        (id, candidate_id, event_id, role, weight, excerpt_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      for (const loser of losers) {
+        const rows = db.prepare(`SELECT event_id, role, weight, excerpt_hash
+          FROM candidate_evidence WHERE candidate_id = ?`).all(loser.id);
+        for (const r of rows) {
+          // INSERT OR IGNORE: skip events the survivor already links —
+          // UNIQUE(candidate_id, event_id) stays intact.
+          insEvidence.run(randomUUID(), survivor.id, r.event_id, r.role, r.weight, r.excerpt_hash, now);
+        }
+        db.prepare('DELETE FROM candidate_evidence WHERE candidate_id = ?').run(loser.id);
+        db.prepare(`UPDATE learning_candidates SET state = 'archived', updated_at = ?
+          WHERE id = ? AND user_id = ?`).run(now, loser.id, req.user.id);
+      }
+      db.prepare(`UPDATE learning_candidates
+        SET support_verified = support_verified + ?, support_recovered = support_recovered + ?,
+            support_corrections = support_corrections + ?, updated_at = ?
+        WHERE id = ? AND user_id = ?`)
+        .run(addVerified, addRecovered, addCorrections, now, survivor.id, req.user.id);
+      db.prepare(`UPDATE learning_merge_proposals
+        SET state = 'approved', into_candidate_id = ?, decided_at = ?
+        WHERE id = ? AND user_id = ?`).run(survivor.id, now, p.id, req.user.id);
+    });
+    tx();
+
+    audit('learning.merge.approve', 'learning_merge_proposal', p.id, req.user.id, {
+      cluster_id: p.cluster_id, into_candidate_id: survivor.id,
+      merged_count: losers.length, members: mergeableMembers.length,
+    });
+    logger.info(`Learning merge approved: ${p.id} — ${losers.length} archived into ${survivor.id}`);
+
+    const survivorRow = getCandidate(db, survivor.id, req.user.id);
+    res.json({ proposal: { ...p, state: 'approved', into_candidate_id: survivor.id, decided_at: now }, survivor: toListItem(survivorRow) });
+  });
+
+  // Run the clustering pipeline for the user (admin: ?user_id=).
+  router.post('/learning/cluster/run', authMiddleware, apiLimiter, async (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    let threshold;
+    const raw = req.body?.threshold;
+    if (raw !== undefined && raw !== null) {
+      const f = parseFloat(raw);
+      if (Number.isFinite(f) && f > 0 && f < 1) threshold = f;
+    }
+    try {
+      const result = await runClustering({ db, userId: targetUser, logger, threshold });
+      audit('learning.cluster.run', 'learning_cluster', targetUser, req.user.id, {
+        target_user: targetUser, ok: result.ok, stats: result.ok ? result.stats : undefined,
+        error: result.ok ? undefined : result.error,
+      });
+      if (!result.ok) {
+        logger.error(`Learning cluster run failed for ${targetUser}: ${result.error}`);
+        return res.status(500).json({ error: 'Cluster run failed', detail: result.error });
+      }
+      res.json({ stats: result.stats });
+    } catch (err) {
+      // runClustering never throws by contract; belt and suspenders.
+      logger.error(`Learning cluster run threw: ${err.message}`);
+      res.status(500).json({ error: 'Cluster run failed' });
+    }
+  });
+
+  // Backfill read-only legacy clusters from the old learn_patterns table.
+  router.post('/learning/cluster/backfill-legacy', authMiddleware, apiLimiter, async (req, res) => {
+    const targetUser = resolveTargetUser(req);
+    try {
+      const result = backfillLegacyClusters({ db, userId: targetUser, logger });
+      audit('learning.cluster.backfill-legacy', 'learning_cluster', targetUser, req.user.id, {
+        target_user: targetUser, imported: result.imported, skipped: result.skipped,
+      });
+      logger.info(`Learning legacy backfill for ${targetUser}: imported=${result.imported}, skipped=${result.skipped}`);
+      res.json({ result });
+    } catch (err) {
+      logger.error(`Learning legacy backfill threw: ${err.message}`);
+      res.status(500).json({ error: 'Backfill failed' });
+    }
   });
 
   return router;
