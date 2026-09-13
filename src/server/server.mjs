@@ -53,7 +53,7 @@ import toolsRoutes from './routes/tools.mjs';
 import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './routes/aimi.mjs';
 import llmRoutes, { initOllama } from './routes/llm.mjs';
 import agentRoutes, { callAgentLLM, agentTools, runAgentLoop } from './routes/agent.mjs';
-import commsRoutes from './routes/comms.mjs';
+import commsRoutes, { createTelegramNotifier } from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
 import nodesRoutes from './routes/nodes.mjs';
@@ -2219,6 +2219,9 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
        pulseUserId,
        personaPrompt: () => buildAimiSystemPrompt(stmts, pulseUserId, db),
        invokeAgent: async (messages) => (await callAgentLLM(messages)).content,
+       // Pulse alerts go to Haz's Telegram (best-effort; no-op until a
+       // Telegram channel is configured).
+       notify: createTelegramNotifier({ stmts, logger }),
      }
    );
    heartbeat.start(parseInt(process.env.HEARTBEAT_INTERVAL || '60') * 1000);

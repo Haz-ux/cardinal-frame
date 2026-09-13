@@ -90,7 +90,7 @@ Reply with exactly one JSON object and no other text:
 or
 {"attention_needed": true, "summary": "<1-2 sentences for Haz>", "actions": [...]}
 Allowed actions (max 5, each one object):
-- {"type": "alert", "message": "<tell Haz what's wrong and what you recommend>"}
+- {"type": "alert", "message": "<tell Haz what's wrong and what you recommend>"}  (pushed to Haz's Telegram + dashboard)
 - {"type": "skill", "name": "<skill name>", "input": {}}
 - {"type": "chain", "id": "<chain id>", "input": {}}
 Only request skill/chain actions for routine, low-risk remediation you have evidence for in the state above.
@@ -119,6 +119,7 @@ export class HeartbeatDaemon {
     // daemon never imports route modules directly.
     this.invokeAgent = opts.invokeAgent || null;   // async (messages) => assistant text
     this.personaPrompt = opts.personaPrompt || null; // () => system prompt string
+    this.notify = opts.notify || null;               // async (text) => void — e.g. Telegram; best-effort
     this.pulseUserId = opts.pulseUserId || 'system';
     this.pulseHandle = null;
     this._pulseTimer = null;
@@ -270,6 +271,11 @@ export class HeartbeatDaemon {
       if (!message) return;
       this.broadcast('heartbeat:pulse-alert', { message, at: new Date().toISOString() });
       this.logger.info(`[pulse] Alert: ${message}`);
+      // "Calls me" half of the on-call loop — Telegram push, best-effort.
+      if (this.notify) {
+        try { await this.notify(message); }
+        catch (e) { this.logger.error('[pulse] Notify failed:', e.message); }
+      }
     } else if (type === 'skill') {
       if (!this.executeSkill || !action.name) return;
       const result = await withTimeout(this.executeSkill(String(action.name), action.input || {}), 30000);

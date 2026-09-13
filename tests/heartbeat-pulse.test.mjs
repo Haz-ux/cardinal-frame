@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { HeartbeatDaemon, PULSE_DIRECTIVE } from '../src/server/heartbeat.mjs';
+import { createTelegramNotifier } from '../src/server/routes/comms.mjs';
 
 // Unit tests for the agent pulse — the periodic LLM check-in where Aimi
 // reviews system state and decides whether anything needs attention.
@@ -189,5 +190,127 @@ describe('buildPulseMessages', () => {
     expect(messages[0].content).toContain('attention_needed');
     expect(messages[1].role).toBe('user');
     expect(messages[1].content).toContain('Agent pulse');
+  });
+});
+
+describe('pulse alert → Telegram notify', () => {
+  it('calls notify with the alert message', async () => {
+    const notified = [];
+    const daemon = makeDaemon({
+      invokeAgent: async () => JSON.stringify({
+        attention_needed: true,
+        summary: 'disk filling',
+        actions: [{ type: 'alert', message: 'Disk at 91%' }],
+      }),
+    });
+    daemon.notify = async (text) => { notified.push(text); };
+    await daemon.pulse();
+    expect(notified).toEqual(['Disk at 91%']);
+  });
+
+  it('survives notify failures', async () => {
+    const daemon = makeDaemon({
+      invokeAgent: async () => JSON.stringify({
+        attention_needed: true,
+        summary: 'x',
+        actions: [{ type: 'alert', message: 'hi' }],
+      }),
+    });
+    daemon.notify = async () => { throw new Error('telegram down'); };
+    await daemon.pulse(); // must not throw
+    expect(daemon.pulseStats.lastAttention).toBe(true);
+    expect(daemon.pulseRunning).toBe(false);
+  });
+
+  it('skips notify when not configured', async () => {
+    const daemon = makeDaemon({
+      invokeAgent: async () => JSON.stringify({
+        attention_needed: true,
+        summary: 'x',
+        actions: [{ type: 'alert', message: 'hi' }],
+      }),
+    });
+    expect(daemon.notify).toBeNull();
+    await daemon.pulse(); // must not throw
+    expect(daemon._broadcastCalls.some(c => c.event === 'heartbeat:pulse-alert')).toBe(true);
+  });
+});
+
+describe('createTelegramNotifier', () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  function stubStmts(channels) {
+    return { commsChannels: { getByPlatform: { all: () => channels } } };
+  }
+  const quietLogger = { info: () => {}, warn: () => {}, error: () => {} };
+
+  it('resolves unsent when no telegram channel is configured', async () => {
+    const notify = createTelegramNotifier({ stmts: stubStmts([]), logger: quietLogger });
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy;
+    const result = await notify('hello');
+    expect(result.sent).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends to chat_id via the Bot API', async () => {
+    const fetchSpy = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ ok: true, result: {} }),
+    }));
+    globalThis.fetch = fetchSpy;
+    const notify = createTelegramNotifier({
+      stmts: stubStmts([{
+        id: 'ch1', name: 'haz-bot',
+        config: JSON.stringify({ bot_token: 'TOKEN123', chat_id: '999' }),
+      }]),
+      logger: quietLogger,
+    });
+    const result = await notify('pulse: check this');
+    expect(result).toEqual({ sent: true, channels: ['ch1'] });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchSpy.mock.calls[0];
+    expect(url).toBe('https://api.telegram.org/botTOKEN123/sendMessage');
+    const body = JSON.parse(opts.body);
+    expect(body.chat_id).toBe('999');
+    expect(body.text).toBe('pulse: check this');
+  });
+
+  it('falls back to the first allowlisted user id', async () => {
+    const fetchSpy = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ ok: true, result: {} }),
+    }));
+    globalThis.fetch = fetchSpy;
+    const notify = createTelegramNotifier({
+      stmts: stubStmts([{
+        id: 'ch1', name: 'haz-bot',
+        config: JSON.stringify({ bot_token: 'TOKEN123', allowed_user_ids: ['424242'] }),
+      }]),
+      logger: quietLogger,
+    });
+    await notify('hi');
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.chat_id).toBe('424242');
+  });
+
+  it('skips channels without a bot token and never throws on send failure', async () => {
+    const fetchSpy = vi.fn(async () => { throw new Error('network down'); });
+    globalThis.fetch = fetchSpy;
+    const notify = createTelegramNotifier({
+      stmts: stubStmts([
+        { id: 'ch0', name: 'no-token', config: JSON.stringify({}) },
+        { id: 'ch1', name: 'bad-net', config: JSON.stringify({ bot_token: 'T', chat_id: '1' }) },
+      ]),
+      logger: quietLogger,
+    });
+    const result = await notify('hi');
+    expect(result.sent).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(1); // only the token-bearing channel attempted
   });
 });

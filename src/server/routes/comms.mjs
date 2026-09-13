@@ -34,17 +34,9 @@ function telegramSenderAllowed(config, msg) {
   return sid !== '' && ids.map(String).includes(sid);
 }
 
-export default function commsRoutes(ctx) {
-  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
-  const router = express.Router();
-
-
-// In-memory state
-const telegramPollers = new Map(); // channelId -> { offset, timer, stopFlag }
-const discordPollers = new Map();
-
-// ── Helpers ──
-
+// ── Module-level Telegram helpers ───────────────────────────
+// telegramApiCall is self-contained (token passed per call) so it lives at
+// module level, shared by the route closure and the notifier below.
 async function telegramApiCall(token, method, params = {}) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
   const resp = await fetch(url, {
@@ -60,6 +52,60 @@ async function telegramApiCall(token, method, params = {}) {
   if (!data.ok) throw new Error(`Telegram API returned !ok: ${JSON.stringify(data)}`);
   return data.result;
 }
+
+// ── Proactive Telegram notifier ───────────────────────────────
+// Used by the heartbeat agent pulse ("calls me" half of the on-call loop).
+// Sends `text` to every enabled Telegram channel's configured chat —
+// config.chat_id first, falling back to the first allowlisted user id
+// (sending to a user id works once they've started the bot).
+// Never throws: per-channel failures are logged, and with no Telegram
+// channel configured it resolves { sent: false }.
+export function createTelegramNotifier({ stmts, logger }) {
+  const log = logger || console;
+  return async function notifyTelegram(text) {
+    let channels = [];
+    try {
+      channels = stmts.commsChannels.getByPlatform.all('telegram');
+    } catch (e) {
+      log.warn(`[telegram-notify] Channel lookup failed: ${e.message}`);
+      return { sent: false, reason: 'lookup-failed' };
+    }
+    const sent = [];
+    for (const ch of channels) {
+      let config;
+      try { config = JSON.parse(ch.config); } catch { continue; }
+      if (!config.bot_token) continue;
+      const chatId = config.chat_id
+        || (Array.isArray(config.allowed_user_ids) && config.allowed_user_ids[0]);
+      if (!chatId) {
+        log.warn(`[telegram-notify] Channel "${ch.name}" has no chat_id or allowed_user_ids — skipped`);
+        continue;
+      }
+      try {
+        await telegramApiCall(config.bot_token, 'sendMessage', {
+          chat_id: chatId,
+          text: String(text).slice(0, 4000),
+        });
+        sent.push(ch.id);
+        log.info(`[telegram-notify] Sent to channel "${ch.name}"`);
+      } catch (e) {
+        log.warn(`[telegram-notify] Channel "${ch.name}" failed: ${e.message}`);
+      }
+    }
+    return { sent: sent.length > 0, channels: sent };
+  };
+}
+
+export default function commsRoutes(ctx) {
+  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
+  const router = express.Router();
+
+
+// In-memory state
+const telegramPollers = new Map(); // channelId -> { offset, timer, stopFlag }
+const discordPollers = new Map();
+
+// ── Helpers ──
 
 async function discordWebhookSend(webhookUrl, content, opts = {}) {
   const body = { content, username: opts.username || 'Cardinal Frame', ...opts.embeds ? { embeds: opts.embeds } : {} };
