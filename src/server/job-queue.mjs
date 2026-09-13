@@ -23,9 +23,10 @@
  * revision executed raw command strings with an explicit shell; it was
  * deleted rather than sanitized because only 'dag' jobs are ever enqueued
  * (see routes/tasks.mjs). Enqueueing 'task' without registering a handler
- * fails the job with "No handler for job type: task". If you need a raw
- * command job, register an explicit handler that routes through
- * sanitizeCommand + spawnArgv (shell:false) from command-safety.mjs.
+ * dead-letters the job immediately with dead_reason='no_handler' (no retry
+ * burn — see processJob). If you need a raw command job, register an explicit
+ * handler that routes through sanitizeCommand + spawnArgv (shell:false) from
+ * command-safety.mjs.
  */
 
 import { randomUUID } from 'crypto';
@@ -62,6 +63,9 @@ export function createJobQueue(db, opts = {}) {
       started_at TEXT,
       completed_at TEXT,
       last_error TEXT,
+      dead_reason TEXT,                -- set when status -> 'dead': 'no_handler'
+                                       -- (no handler registered for the job type)
+                                       -- | 'max_retries_exceeded'
       result TEXT,                     -- JSON result on success
       trace_id TEXT,                   -- for observability (Phase 2.3)
       created_at TEXT DEFAULT (datetime('now')),
@@ -87,6 +91,19 @@ export function createJobQueue(db, opts = {}) {
 
     CREATE INDEX IF NOT EXISTS idx_job_steps_job ON job_steps(job_id, step_index);
   `);
+
+  // Schema patch for databases created before the dead_reason column existed
+  // (fix-up 2, 2026-09-13). Fresh installs get the column from the CREATE
+  // TABLE above; this covers pre-existing DBs. Done here instead of as a
+  // numbered migration because the migrator runs BEFORE this module creates
+  // the jobs table — on a fresh install there is no jobs table for a
+  // migration to ALTER yet, and ALTER ... ADD COLUMN cannot be conditional.
+  // Idempotent: only runs when the column is absent.
+  const hasDeadReason = db.prepare(`PRAGMA table_info(jobs)`).all()
+    .some((c) => c.name === 'dead_reason');
+  if (!hasDeadReason) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN dead_reason TEXT`);
+  }
 
   // ─── Prepared statements ─────────────────────────────────────────
 
@@ -114,6 +131,20 @@ export function createJobQueue(db, opts = {}) {
       SELECT * FROM jobs WHERE status = 'pending'
         AND (scheduled_at IS NULL OR scheduled_at <= datetime('now'))
       ORDER BY priority DESC, scheduled_at ASC LIMIT 1
+    `),
+    // Dead-letter for unknown job types: immediate 'dead', no retry burn.
+    // (See processJob: the fail() retry path never fires here because
+    // attempts is not incremented on this path, which used to leave the job
+    // sitting in 'pending' forever.)
+    noHandlerDead: db.prepare(`
+      UPDATE jobs SET status = 'dead', dead_reason = 'no_handler',
+        last_error = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `),
+    // Records WHY a known-type job went dead (always 'max_retries_exceeded').
+    setDeadReason: db.prepare(`
+      UPDATE jobs SET dead_reason = ?, updated_at = datetime('now')
+      WHERE id = ?
     `),
     getRunning: db.prepare(`SELECT * FROM jobs WHERE status = 'running'`),
     getById: db.prepare(`SELECT * FROM jobs WHERE id = ?`),
@@ -243,7 +274,14 @@ export function createJobQueue(db, opts = {}) {
   async function processJob(job) {
     const handler = handlers.get(job.type);
     if (!handler) {
-      stmts.fail.run(`No handler for job type: ${job.type}`, computeBackoff(job.attempts || 1), job.id);
+      // Dead-letter IMMEDIATELY on first pass — unknown types have no handler
+      // now and never will, so burning max_retries attempts on exponential
+      // backoff is just queue churn. Deterministic: every unhandled job lands
+      // in 'dead' with dead_reason='no_handler' on its first pickup.
+      const err = `No handler for job type: ${job.type}`;
+      stmts.noHandlerDead.run(err, job.id);
+      broadcast?.('job:dead', { id: job.id, type: job.type, deadReason: 'no_handler', error: err });
+      logger?.warn?.(`Job ${job.id} (${job.type}) dead-lettered: no handler registered`);
       return;
     }
 
@@ -269,6 +307,8 @@ export function createJobQueue(db, opts = {}) {
       stmts.fail.run(err.message.slice(0, 500), backoff, job.id);
 
       if (job.attempts >= job.max_retries) {
+        // Terminal: record WHY it died so dead-letter inspection is one query.
+        stmts.setDeadReason.run('max_retries_exceeded', job.id);
         broadcast?.('job:dead', { id: job.id, type: job.type, error: err.message, attempts: job.attempts });
         logger?.error?.(`Job ${job.id} (${job.type}) permanently failed after ${job.attempts} attempts: ${err.message}`);
       } else {

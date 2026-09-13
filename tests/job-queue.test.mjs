@@ -50,11 +50,15 @@ describe('Job Queue', () => {
     expect(next.id).toBe(id2);
   });
 
-  it('should fail task jobs: no default task handler exists (M2)', async () => {
+  it('should dead-letter jobs with no registered handler (no_handler)', async () => {
     // M2 (audit 2026-09-13 v2): the default 'task' handler was deleted. It
     // executed raw command strings with an explicit /bin/sh and no
     // sanitization. Only 'dag' jobs are enqueued in production, so the
     // handler was removed rather than kept as a loaded footgun.
+    //
+    // Fix-up 2 (2026-09-13): unknown types go straight to 'dead' with
+    // dead_reason='no_handler' on first pickup — they never burn retries,
+    // and they can never sit in 'pending' forever again.
     queue = createJobQueue(db, { concurrency: 1, defaultTimeout: 5000 });
     queue.start();
     const id = queue.enqueue('task', { command: 'echo test123' });
@@ -63,8 +67,16 @@ describe('Job Queue', () => {
     await new Promise(r => setTimeout(r, 3000));
 
     const job = queue.getJob(id);
-    expect(job.status).not.toBe('completed');
+    expect(job.status).toBe('dead');
+    expect(job.dead_reason).toBe('no_handler');
     expect(job.last_error).toContain('No handler for job type: task');
+
+    // It must not have burned any retry attempts on the way there
+    expect(job.attempts).toBe(0);
+
+    // And it must be visible through the dead-letter accessor
+    const deadJobs = queue.getDeadJobs();
+    expect(deadJobs.map(j => j.id)).toContain(id);
 
     await queue.stop();
   });
@@ -98,11 +110,68 @@ describe('Job Queue', () => {
     expect(job.status).toBe('dead');
     expect(job.attempts).toBe(1);
     expect(job.last_error).toBeTruthy();
+    expect(job.dead_reason).toBe('max_retries_exceeded');
 
     const deadJobs = queue.getDeadJobs();
     expect(deadJobs.length).toBeGreaterThanOrEqual(1);
 
     await queue.stop();
+  });
+
+  it('should retry a transiently failing known-type job and complete it', async () => {
+    // Known types keep the EXISTING retry policy untouched: a failure below
+    // max_retries goes back to 'pending' on exponential backoff, and a later
+    // success completes normally with no dead_reason recorded.
+    queue = createJobQueue(db, { concurrency: 1, maxRetries: 3, defaultTimeout: 2000, baseDelay: 100 });
+    let calls = 0;
+    queue.registerHandler('flaky', async () => {
+      calls++;
+      if (calls < 2) throw new Error('transient boom');
+      return { ok: true };
+    });
+
+    const id = queue.enqueue('flaky', {});
+    queue.start();
+    await new Promise(r => setTimeout(r, 4000));
+
+    const job = queue.getJob(id);
+    expect(job.status).toBe('completed');
+    expect(job.attempts).toBe(2);
+    expect(job.dead_reason).toBeNull();
+
+    await queue.stop();
+  });
+
+  it('should add dead_reason to a pre-existing jobs table (no migration)', () => {
+    // The jobs table is created by createJobQueue AFTER the numbered
+    // migrator runs, so dead_reason cannot ship as a numbered migration
+    // (there is nothing to ALTER on a fresh install). The module patches
+    // pre-existing tables itself, idempotently.
+    //
+    // The "old" table below is the FULL pre-dead_reason schema this module
+    // used to create (a real pre-existing DB would have every column) —
+    // a stub table with only a few columns would fail on the index DDL.
+    db.exec(`CREATE TABLE jobs (
+      id TEXT PRIMARY KEY, type TEXT NOT NULL, payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', priority INTEGER DEFAULT 0,
+      attempts INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+      timeout_ms INTEGER DEFAULT 30000,
+      scheduled_at TEXT DEFAULT (datetime('now')), started_at TEXT,
+      completed_at TEXT, last_error TEXT, result TEXT, trace_id TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`);
+    const before = db.prepare(`PRAGMA table_info(jobs)`).all().map(c => c.name);
+    expect(before).not.toContain('dead_reason');
+
+    queue = createJobQueue(db);
+
+    const after = db.prepare(`PRAGMA table_info(jobs)`).all().map(c => c.name);
+    expect(after).toContain('dead_reason');
+
+    // Second construction must be a no-op (no duplicate-column error).
+    const queue2 = createJobQueue(db);
+    queue2.stop();
   });
 
   it('should recover stale (running) jobs on start', () => {
