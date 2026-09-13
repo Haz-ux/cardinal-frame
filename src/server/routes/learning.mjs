@@ -25,6 +25,7 @@ import {
   listCandidates,
   approveCandidate,
   rejectCandidate,
+  updateCandidateFields,
   getCandidateEvidence,
 } from '../learning/candidates.mjs';
 
@@ -152,6 +153,37 @@ export default function learningRoutes(ctx) {
     });
     logger.info(`Learning candidate rejected: ${c.id} (${c.kind})`);
     res.json({ candidate: toListItem(c) });
+  });
+
+  // Edit: update title/draft/eligibility_note while the candidate is still
+  // in review. Persisted server-side; audit-logged like approve/reject.
+  router.patch('/learning/candidates/:id', authMiddleware, apiLimiter, (req, res) => {
+    const existing = getCandidate(db, req.params.id, req.user.id);
+    if (!existing) return res.status(404).json({ error: 'not found' });
+    if (existing.state !== 'candidate') {
+      return res.status(400).json({ error: 'only candidates in review can be edited' });
+    }
+    const fields = {};
+    if (typeof req.body?.title === 'string' && req.body.title.trim()) {
+      fields.title = req.body.title.trim().slice(0, 200);
+    }
+    if (Array.isArray(req.body?.draft)) {
+      fields.draft = req.body.draft
+        .filter(s => typeof s === 'string')
+        .map(s => s.trim().slice(0, 500))
+        .filter(Boolean)
+        .slice(0, 50);
+    }
+    if (typeof req.body?.eligibility_note === 'string') {
+      fields.eligibilityNote = req.body.eligibility_note.slice(0, 2000);
+    }
+    const c = updateCandidateFields(db, req.params.id, req.user.id, fields);
+    if (!c) return res.status(404).json({ error: 'not found' });
+    audit('learning.candidate.edit', 'learning_candidate', c.id, req.user.id, {
+      fields: Object.keys(fields),
+    });
+    logger.info(`Learning candidate edited: ${c.id} (${Object.keys(fields).join(',') || 'no-op'})`);
+    res.json({ candidate: toDetail(c) });
   });
 
   // ─── Review jobs ───────────────────────────────────────────────

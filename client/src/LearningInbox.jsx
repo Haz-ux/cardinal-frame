@@ -85,7 +85,6 @@ export default function LearningInbox() {
   const [loadError, setLoadError] = useState(null);
   const [detail, setDetail] = useState(null); // { candidate, evidence }
   const [detailLoading, setDetailLoading] = useState(false);
-  const [editedLocally, setEditedLocally] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [running, setRunning] = useState(false);
   const [actioning, setActioning] = useState(false); // approve/reject in flight
@@ -128,7 +127,6 @@ export default function LearningInbox() {
 
   const openDetail = async (id) => {
     setDetailLoading(true);
-    setEditedLocally(false);
     try {
       const data = await cachedFetch(`/api/learning/candidates/${id}`);
       if (data?.candidate) {
@@ -208,16 +206,30 @@ export default function LearningInbox() {
     setShowEdit(true);
   };
 
-  const saveEditLocal = () => {
-    // LOCAL-ONLY: no edit endpoint exists in the API contract yet. Keep the
-    // tweaked draft in view state, flagged as edited locally.
+  const saveEdit = async () => {
+    // Persist the edited draft server-side via PATCH.
     const steps = editText.split('\n').map(s => s.trim()).filter(Boolean);
-    setDetail(prev => prev && ({
-      ...prev,
-      candidate: { ...prev.candidate, draft: steps },
-    }));
-    setEditedLocally(true);
-    setShowEdit(false);
+    try {
+      const token = localStorage.getItem('cf_token');
+      const res = await fetch(`/api/learning/candidates/${detail.candidate.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ draft: steps }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDetail(prev => prev && ({ ...prev, candidate: data.candidate }));
+            setShowEdit(false);
+        refresh();
+      } else {
+        alert('Could not save edit: ' + res.status);
+      }
+    } catch (err) {
+      alert('Could not save edit: ' + err.message);
+    }
   };
 
   // ── Stat card (AimiLearn pattern) ──
@@ -281,7 +293,6 @@ export default function LearningInbox() {
           <Chip color={kind.color}>{kind.label}</Chip>
           <Chip color={risk.color}>{risk.label}</Chip>
           <Chip color="#aab4cc">{stateChipLabel(c.state)}</Chip>
-          {editedLocally && <Chip color={NEON.yellow}>EDITED LOCALLY</Chip>}
         </div>
         <ConfidenceBar confidence={c.promotion_score} />
         <div className="flex gap-3 text-[10px] font-hud" style={{ color: '#555' }}>
@@ -377,7 +388,6 @@ export default function LearningInbox() {
             <Chip color={(KIND_STYLE[c.kind] || {}).color || '#8b94a7'}>{(KIND_STYLE[c.kind] || {}).label || String(c.kind || 'UNKNOWN').toUpperCase()}</Chip>
             <Chip color={(RISK_STYLE[c.risk_tier] || RISK_STYLE.low).color}>{(RISK_STYLE[c.risk_tier] || RISK_STYLE.low).label}</Chip>
             <Chip color="#aab4cc">{stateChipLabel(c.state)}</Chip>
-            {editedLocally && <Chip color={NEON.yellow}>✎ Edited locally</Chip>}
           </div>
 
           {/* Aimi's draft */}
@@ -667,7 +677,7 @@ export default function LearningInbox() {
             <div className="flex items-center gap-2">
               <Pencil size={14} style={{ color: NEON.purple }} />
               <span className="text-[12px] font-bold uppercase tracking-widest font-hud" style={{ color: NEON.purple }}>
-                Edit draft — local preview
+                Edit draft
               </span>
             </div>
             <textarea
@@ -679,15 +689,15 @@ export default function LearningInbox() {
               placeholder="One step per line…"
             />
             <p className="text-[10px] m-0" style={{ color: '#555' }}>
-              Edits apply to this view only and are marked "edited locally" — there is no server edit endpoint in the current API contract yet.
+              Saved to the candidate on the server. Only candidates still in review can be edited.
             </p>
             <div className="flex gap-2">
               <button
-                onClick={saveEditLocal}
+                onClick={saveEdit}
                 className="flex-1 py-2.5 chamfer-sm text-[12px] font-hud uppercase font-bold"
                 style={{ background: `${NEON.purple}15`, border: `1px solid ${NEON.purple}60`, color: NEON.purple, cursor: 'pointer' }}
               >
-                Save locally
+                Save
               </button>
               <button
                 onClick={() => setShowEdit(false)}
