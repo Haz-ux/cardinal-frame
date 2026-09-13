@@ -158,6 +158,88 @@ export function buildAimiSystemPrompt(stmts, userId, db) {
  - The current user ID is: ${userId}`;
 }
 
+// Split an argument string into tokens, honoring single/double quotes so
+// values like --category "my notes" survive as one token.
+export function tokenizeArgs(s) {
+  const tokens = [];
+  let cur = '', quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && quote === '"' && i + 1 < s.length) cur += s[++i];
+      else cur += c;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (/\s/.test(c)) {
+      if (cur) { tokens.push(cur); cur = ''; }
+    } else {
+      cur += c;
+    }
+  }
+  if (cur) tokens.push(cur);
+  return tokens;
+}
+
+const COMPRESS_STRATEGIES = ['auto', 'truncate', 'headtail', 'dedupe', 'summarize'];
+export const COMPRESS_USAGE =
+  '/compress <text> [--strategy auto|truncate|headtail|dedupe|summarize] [--category <name>] [--no-memory] [--continue]';
+
+// Parse /compress arguments. Flags may appear before, after, or interleaved
+// with the payload text, in any order; `--` ends flag parsing so a payload
+// can literally contain tokens starting with `--`. Unknown flags and invalid
+// values are loud errors — never silently swallowed into the payload.
+export function parseCompressArgs(rest) {
+  const out = {
+    ok: true, error: null,
+    strategy: 'auto', category: 'compressed-context',
+    storeInMemory: true, usePrevious: false, payload: '',
+  };
+  const fail = (error) => ({ ...out, ok: false, error });
+  const tokens = tokenizeArgs(rest || '');
+  const textParts = [];
+  let i = 0, literal = false;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (!literal && t === '--') { literal = true; i++; continue; }
+    if (!literal && t.startsWith('--') && t.length > 2) {
+      let name = t.slice(2), value = null, inline = false;
+      const eq = name.indexOf('=');
+      if (eq !== -1) { value = name.slice(eq + 1); name = name.slice(0, eq); inline = true; }
+      if (name === 'strategy' || name === 'category') {
+        if (!inline) {
+          i++;
+          if (i >= tokens.length || tokens[i].startsWith('--')) {
+            return fail(`--${name} needs a value.`);
+          }
+          value = tokens[i];
+        } else if (!value) {
+          return fail(`--${name} needs a value.`);
+        }
+        if (name === 'strategy') {
+          if (!COMPRESS_STRATEGIES.includes(value.toLowerCase())) {
+            return fail(`Unknown strategy "${value}". Pick one: ${COMPRESS_STRATEGIES.join('|')}.`);
+          }
+          out.strategy = value.toLowerCase();
+        } else {
+          out.category = value;
+        }
+      } else if (name === 'no-memory') {
+        out.storeInMemory = false;
+      } else if (name === 'continue') {
+        out.usePrevious = true;
+      } else {
+        return fail(`Unknown flag "--${name}".`);
+      }
+    } else {
+      textParts.push(t);
+    }
+    i++;
+  }
+  out.payload = textParts.join(' ');
+  return out;
+}
+
 export default function aimiRoutes(ctx) {
   const { db, stmts, authMiddleware, apiLimiter, broadcast, fireHook, PORT, logger } = ctx;
   const router = express.Router();
@@ -206,32 +288,16 @@ export default function aimiRoutes(ctx) {
     //         --category <name>    memory category (default: compressed-context)
     //         --no-memory          don't store — just return the compressed blob
     if (command === 'compress') {
-      let strategy = 'auto';
-      let category = 'compressed-context';
-      let storeInMemory = true;
-      let usePrevious = false;
-      let payload = rest;
-      // Strip --strategy <name>
-      let m = rest.match(/^--strategy\s+(\w+)\s+([\s\S]*)$/);
-      if (m) { strategy = m[1]; payload = m[2]; }
-      // Strip --category <name>
-      m = payload.match(/^--category\s+(\S+)\s+([\s\S]*)$/);
-      if (m) { category = m[1]; payload = m[2]; }
-      // Strip --no-memory (may appear alone or before the text payload)
-      if (/^--no-memory(\s+|$)/.test(payload)) {
-        storeInMemory = false;
-        payload = payload.replace(/^--no-memory\s+/, '').replace(/^--no-memory$/, '');
-      }
-      // Strip --continue — pull the latest stored summary and extend it
-      // (iterative update instead of a from-scratch summary).
-      if (/^--continue(\s+|$)/.test(payload)) {
-        usePrevious = true;
-        payload = payload.replace(/^--continue\s+/, '').replace(/^--continue$/, '');
-      }
-
-      if (!payload) {
-        send({ choices: [{ delta: { content: '⚠️ Usage: /compress <text> [--strategy auto|truncate|headtail|dedupe|summarize] [--category <name>] [--no-memory] [--continue]' } }] });
+      // Order-free flag parsing: flags may appear before, after, or
+      // interleaved with the payload text. Unknown flags and invalid values
+      // are loud errors, never silently swallowed into the payload.
+      const parsed = parseCompressArgs(rest);
+      if (!parsed.ok) {
+        send({ choices: [{ delta: { content: `⚠️ ${parsed.error}\nUsage: ${COMPRESS_USAGE}` } }] });
+      } else if (!parsed.payload) {
+        send({ choices: [{ delta: { content: `⚠️ Usage: ${COMPRESS_USAGE}` } }] });
       } else {
+        const { strategy, category, storeInMemory, usePrevious, payload } = parsed;
         try {
           // Iterative update: reuse the most recent stored summary from the
           // requested category as the previous-summary anchor.
