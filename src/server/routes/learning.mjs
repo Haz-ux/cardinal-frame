@@ -694,6 +694,15 @@ export default function learningRoutes(ctx) {
         winner_score: d.winner_score,
         runner_up_score: d.runner_up_score,
         margin: d.margin,
+        // Per-component ranking breakdown for the top-ranked version
+        // (null for rows written before this field existed).
+        score_components: (() => {
+          if (!d.score_components) return null;
+          try {
+            const p = JSON.parse(d.score_components);
+            return (p && typeof p === 'object') ? p : null;
+          } catch { return null; }
+        })(),
         decision: d.decision,
         fallback_reason: d.fallback_reason,
         mode: d.mode,
@@ -734,7 +743,7 @@ export default function learningRoutes(ctx) {
           last_routed_at: v.last_routed_at,
         };
       }),
-      summary: {
+      totals: {
         total_decisions: totalDecisions,
         fallback_rate: totalDecisions > 0 ? fallbacks / totalDecisions : 0,
         avg_margin: avgMargin ?? null,

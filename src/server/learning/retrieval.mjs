@@ -330,17 +330,20 @@ export async function shadowRoute({ db, userId, requestText, context = {} }) {
       const signatures = parsed.map(({ v, spec }) => versionSignature(v, spec));
       const sims = await computeSimilarities(requestText, signatures);
 
-      const ranked = await Promise.all(parsed.map(async ({ v, spec }, i) => {
+      ranked = await Promise.all(parsed.map(async ({ v, spec }, i) => {
         const stats = db.prepare('SELECT * FROM learning_skill_stats WHERE version_id = ?').get(v.id) ?? null;
-        const score = routeScore({
+        // Retain the components alongside the score — they are persisted on
+        // the decision row so the UI can show WHY the router chose (or not).
+        const components = {
           similarity: sims[i] ?? 0,
           triggerMatch: triggerMatchScore(requestText, spec),
           successRate: successRate(stats),
           recency: recencyScore(v.updated_at ?? v.created_at),
           affinity: affinityScore(stats),
           riskPenalty: riskPenaltyFor(v),
-        });
-        return { version: v, score };
+        };
+        const score = routeScore(components);
+        return { version: v, score, components };
       }));
       ranked.sort((a, b) => b.score - a.score);
 
@@ -359,16 +362,20 @@ export async function shadowRoute({ db, userId, requestText, context = {} }) {
     const marginVal = topScore !== null && secondScore !== null
       ? topScore - secondScore
       : null;
+    // Components of the top-ranked version (winner or near-miss) so the
+    // decision log can explain the ranking. NULL when nothing was ranked.
+    const topComponents = ranked.length > 0 ? ranked[0].components : null;
     const insert = db.prepare(`INSERT INTO learning_routing_decisions
       (id, user_id, request_hash, request_excerpt, winner_version_id,
-       winner_score, runner_up_score, margin, decision, fallback_reason, mode, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'shadow', ?)`);
+       winner_score, runner_up_score, margin, score_components, decision, fallback_reason, mode, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'shadow', ?)`);
     insert.run(
       decisionId, userId, requestHash, excerpt,
       winnerRow ? winnerRow.id : null,
       winnerRow ? topScore : null,
       secondScore,
       winnerRow ? marginVal : null,
+      topComponents ? JSON.stringify(topComponents) : null,
       selection.decision,
       selection.reason || null,
       now,

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS learning_routing_decisions (
   winner_score REAL,
   runner_up_score REAL,
   margin REAL,                       -- winner_score - runner_up_score
+  score_components TEXT,             -- JSON: {similarity, triggerMatch, successRate, recency, affinity, riskPenalty} for the top-ranked version
   decision TEXT NOT NULL,            -- shadow_routed|fallback_normal|filtered_all
   fallback_reason TEXT,
   mode TEXT NOT NULL DEFAULT 'shadow',
