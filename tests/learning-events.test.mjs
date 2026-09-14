@@ -107,8 +107,8 @@ describe('redact.mjs', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
     const tokens = [
       `123456789:${'A'.repeat(35)}`, // Telegram bot token
-      'xoxo-FAKE-TOKEN-123456789012-abcdef', // Slack org token
-      'xoxe-1-FAKE-TOKEN-abcdef1234', // Slack external token
+      'xoxo-FAKE-TOKEN-123456789012-abcdef', // Slack org token (test fixture)
+      'xoxe-1-FAKE-TOKEN-abcdef1234', // Slack external token (test fixture)
       'ASIAIOSFODNN7EXAMPLE', // AWS temp credentials
       'ghu_abcDEF1234567890', // GitHub user token
       'ghs_abcDEF1234567890', // GitHub server token
