@@ -283,7 +283,7 @@ export default function delegationRoutes(ctx) {
 
   // ─── Routes ────────────────────────────────────────────────────────
 
-  router.post('/delegate', authMiddleware, apiLimiter, async (req, res) => {
+  router.post('/delegate', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     const { name, command, capability, agentId, parentTaskId, parentSessionId, synchronous = false, priority = 'medium', wait = false, waitTimeout = 30000, node: requestedNode } = req.body;
 
     if (!name || !command) return res.status(400).json({ error: 'Name and command are required' });
@@ -557,7 +557,7 @@ export default function delegationRoutes(ctx) {
     res.status(202).json({ ok: true, delegation_id: payload.delegation_id, status: 'accepted' });
   });
 
-  router.get('/delegations', optionalAuth, (req, res) => {
+  router.get('/delegations', authMiddleware, (req, res) => {
     const { parentId, agentId, status, limit = 50 } = req.query;
     let rows;
     if (parentId) rows = delStmts.getByParent.all(parentId);
@@ -567,7 +567,7 @@ export default function delegationRoutes(ctx) {
     res.json(rows.map(parseDelegation));
   });
 
-  router.get('/delegations/:id', optionalAuth, (req, res) => {
+  router.get('/delegations/:id', authMiddleware, (req, res) => {
     const row = delStmts.getById.get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Delegation not found' });
     const result = parseDelegation(row);
@@ -575,14 +575,16 @@ export default function delegationRoutes(ctx) {
     res.json(result);
   });
 
-  router.post('/delegations/:id/wait', optionalAuth, async (req, res) => {
+  router.post('/delegations/:id/wait', authMiddleware, async (req, res) => {
     const delegation = delStmts.getById.get(req.params.id);
     if (!delegation) return res.status(404).json({ error: 'Delegation not found' });
 
     let updated = syncDelegationStatus(req.params.id);
     if (updated) return res.json(parseDelegation(updated));
 
-    const timeout = parseInt(req.query.timeout) || 30000;
+    // M1: cap the long-poll so anonymous (or any) callers can't hold a
+    // connection open indefinitely — max 30s regardless of ?timeout=.
+    const timeout = Math.min(Math.max(parseInt(req.query.timeout) || 30000, 0), 30000);
     const start = Date.now();
     while (Date.now() - start < timeout) {
       await new Promise(r => setTimeout(r, 500));

@@ -15,7 +15,7 @@ afterAll(() => {
 describe('Graph API', () => {
   describe('GET /api/graph', () => {
     it('should return graph with nodes and links', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('nodes');
       expect(res.body).toHaveProperty('links');
@@ -23,13 +23,13 @@ describe('Graph API', () => {
       expect(Array.isArray(res.body.links)).toBe(true);
     });
 
-    it('should work without auth (optionalAuth)', async () => {
+    it('requires auth (was optionalAuth; tightened in the auth-hardening pass)', async () => {
       const res = await request(app).get('/api/graph');
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(401);
     });
 
     it('should include node grouping (type or group)', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       expect(res.status).toBe(200);
       if (res.body.nodes.length > 0) {
         // Nodes use 'group' for categorization (some may also have 'type')
@@ -39,7 +39,7 @@ describe('Graph API', () => {
     });
 
     it('should have valid link structure (source, target)', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       if (res.body.links.length > 0) {
         const link = res.body.links[0];
         expect(link).toHaveProperty('source');
@@ -51,7 +51,7 @@ describe('Graph API', () => {
       // Regression test: server-side position assignment was removed to fix
       // the neural map pile-up bug. The client is now the single source of
       // truth for layout via its targetXY() function.
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       expect(res.status).toBe(200);
       for (const node of res.body.nodes) {
         expect(node).not.toHaveProperty('x');
@@ -60,7 +60,7 @@ describe('Graph API', () => {
     });
 
     it('should include the central Cardinal system node', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       expect(res.status).toBe(200);
       const system = res.body.nodes.find(n => n.group === 'system');
       expect(system).toBeDefined();
@@ -69,7 +69,7 @@ describe('Graph API', () => {
     });
 
     it('should link Cardinal to every cluster hub', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       const hubs = res.body.nodes.filter(n => n.group === 'cluster');
       for (const hub of hubs) {
         const link = res.body.links.find(l =>
@@ -83,7 +83,7 @@ describe('Graph API', () => {
 
   describe('GET /api/graph/core', () => {
     it('should return core graph view', async () => {
-      const res = await request(app).get('/api/graph/core');
+      const res = await request(app).get('/api/graph/core').set(adminAuth());
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('nodes');
       expect(Array.isArray(res.body.nodes)).toBe(true);
@@ -93,17 +93,17 @@ describe('Graph API', () => {
   describe('GET /api/graph/expand', () => {
     it('should return expanded graph for a node', async () => {
       // First get the full graph to find a typed node id
-      const graphRes = await request(app).get('/api/graph');
+      const graphRes = await request(app).get('/api/graph').set(adminAuth());
       const typedNode = graphRes.body.nodes.find(n => n.type && n.type !== 'cluster');
       if (typedNode) {
-        const res = await request(app).get(`/api/graph/expand?id=${typedNode.id}`);
+        const res = await request(app).get(`/api/graph/expand?id=${typedNode.id}`).set(adminAuth());
         expect([200, 400, 404]).toContain(res.status);
         if (res.status === 200) expect(res.body).toHaveProperty('nodes');
       }
     });
 
     it('should handle non-existent node gracefully', async () => {
-      const res = await request(app).get('/api/graph/expand?id=non-existent-node-99999');
+      const res = await request(app).get('/api/graph/expand?id=non-existent-node-99999').set(adminAuth());
       expect([200, 400, 404]).toContain(res.status);
     });
   });

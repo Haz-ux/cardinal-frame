@@ -6,7 +6,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import winston from 'winston';
 import dotenv from 'dotenv';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import path from 'path';
 import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
@@ -14,6 +14,7 @@ import os from 'os';
 import { createServer } from 'http';
 import { createRequire } from 'module';
 import { validateBody, schemas } from './validate.mjs';
+import { sanitizeCommand } from './command-safety.mjs';
 import * as mcp from './mcp-client.mjs';
 import * as embeddings from './embeddings.mjs';
 import { WebSocketServer } from 'ws';
@@ -39,7 +40,7 @@ import costsRoutes, { getModelCost } from './routes/costs.mjs';
 import memoryRoutes from './routes/memory.mjs';
 import systemRoutes from './routes/system.mjs';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './routes/llm-helpers.mjs';
-import settingsRoutes, { getDevSetting, getDevSettings, decryptValue, encryptSecret } from './routes/settings.mjs';
+import settingsRoutes, { getDevSetting, getDevSettings, decryptValue, encryptSecret, initSecretStore } from './routes/settings.mjs';
 import chatConvRoutes from './routes/chat-conversations.mjs';
 import chatCompRoutes from './routes/chat-completions.mjs';
 import skillsRoutes, { executeSkill, matchSkillTrigger } from './routes/skills.mjs';
@@ -52,12 +53,20 @@ import heartbeatRulesRoutes from './routes/heartbeat-rules.mjs';
 import toolsRoutes from './routes/tools.mjs';
 import aimiRoutes, { buildAimiSystemPrompt, autoRegisterSystemTools } from './routes/aimi.mjs';
 import llmRoutes, { initOllama } from './routes/llm.mjs';
-import agentRoutes, { callAgentLLM, agentTools, runAgentLoop } from './routes/agent.mjs';
-import commsRoutes from './routes/comms.mjs';
+import agentRoutes, { callAgentLLM, agentTools, runAgentLoop, registerAgentTool, unregisterAgentTool } from './routes/agent.mjs';
+import connectorsRoutes from './routes/connectors.mjs';
+import learningSourcesRoutes from './routes/learning-sources.mjs';
+import learningRoutes from './routes/learning.mjs';
+import { startMcpManager } from './mcp-manager.mjs';
+import commsRoutes, { createTelegramNotifier } from './routes/comms.mjs';
 import tracesRoutes, { initTracing, traceMiddleware } from './routes/traces.mjs';
 import governanceRoutes, { initGovernance, checkPermission, auditLog } from './routes/governance.mjs';
 import nodesRoutes from './routes/nodes.mjs';
 import compressionRoutes from './routes/compression.mjs';
+import companionRoutes from './routes/companion.mjs';
+import identityRoutes from './routes/identity.mjs';
+import { resolvePrincipal as resolvePrincipalFromIdentity } from './identity/identity.mjs';
+import defenseRoutes from './routes/defense.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
 import { evaluate as wardenEvaluate } from './warden.mjs';
@@ -76,13 +85,38 @@ const app = express();
 app.set('etag', false); // Disable ETags — prevents 304 stale cache on auth routes
 let PORT = process.env.PORT || 8080; // fixed unless PORT env var is set
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(import.meta.dirname, '..', '..', 'data'));
-const JWT_SECRET = process.env.JWT_SECRET || 'cardinal-frame-dev-secret-change-me';
+// L3: never boot with the public dev default unless it was explicitly set.
+// Without JWT_SECRET we generate a per-instance secret once and persist it
+// to DATA_DIR/.jwt-secret (mode 600) — same pattern as .admin-credentials /
+// .encrypt-key — so sessions survive restarts in any NODE_ENV.
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  const jwtFile = path.join(DATA_DIR, '.jwt-secret');
+  try {
+    const saved = readFileSync(jwtFile, 'utf8').trim();
+    if (saved.length >= 32) JWT_SECRET = saved;
+  } catch { /* missing/unreadable → generate below */ }
+  if (!JWT_SECRET) {
+    try { mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+    JWT_SECRET = randomBytes(48).toString('hex');
+    try {
+      writeFileSync(jwtFile, JWT_SECRET + '\n', { mode: 0o600 });
+      console.log(`[security] generated instance JWT secret at ${jwtFile} (mode 600). Set JWT_SECRET to manage it explicitly.`);
+    } catch (e) {
+      console.error(`[security] WARNING: cannot persist JWT secret (${e.message}); sessions will not survive restart. Set JWT_SECRET.`);
+    }
+  }
+}
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'cardinal-frame-dev-secret-change-me') {
   console.error('FATAL: JWT_SECRET must be set in production. Set the JWT_SECRET env var.');
   process.exit(1);
 }
 const JWT_EXPIRES = process.env.JWT_EXPIRES || '15m';
 const JWT_REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES || '7d';
+
+// Persistent per-instance encryption key for stored secrets (provider API
+// keys, env vars). Must run before any encrypt/decrypt use below.
+initSecretStore(DATA_DIR);
 
 // ─── Logger ────────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -161,7 +195,7 @@ const apiLimiter = writeLimiter;
 app.set('trust proxy', 1);
 
 // ─── SQLite Database ───────────────────────────────────────────────
-import { mkdirSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'fs';
 mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'cardinal.db'));
@@ -175,8 +209,31 @@ runMigrations(db);
 // override was removed — use the PORT env var to change it.
 
 // Schema with task_logs, task_assignments, and RBAC
-const adminHash = bcrypt.hashSync('admin123', 10);
-const hazHash = bcrypt.hashSync('cardinal', 10);
+// Default credentials: there are none. On first boot (or when a default
+// password is detected) a strong random password is generated, stored as a
+// bcrypt hash, printed once, and saved to DATA_DIR/.admin-credentials
+// (mode 600). The CLI reads that file automatically.
+function randomPassword(bytes = 24) {
+  return randomBytes(bytes).toString('base64url');
+}
+const rotatedCreds = [];
+function ensureAdminAccount(id, username, defaultPassword) {
+  const row = db.prepare('SELECT id, password_hash FROM users WHERE username = ?').get(username);
+  if (!row) {
+    const pw = randomPassword();
+    db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, 'admin')")
+      .run(id, username, bcrypt.hashSync(pw, 10));
+    rotatedCreds.push({ username, password: pw, fresh: true });
+    return;
+  }
+  let isDefault = false;
+  try { isDefault = bcrypt.compareSync(defaultPassword, row.password_hash); } catch {}
+  if (isDefault) {
+    const pw = randomPassword();
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(pw, 10), row.id);
+    rotatedCreds.push({ username, password: pw, fresh: false });
+  }
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -713,17 +770,37 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_chain_exec_chain_id ON chain_executions(chain_id);
 
-  INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('admin-000', 'admin', '${adminHash}', 'admin');
-
-  INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('haz-001', 'Haz', '${hazHash}', 'admin');
+  -- Default admin accounts are provisioned/rotated by ensureAdminAccount()
+  -- below; never seed password hashes here.
 
   INSERT OR IGNORE INTO personas (id, agent_id, name, description, soul, permissions, constraints, enabled)
   VALUES ('persona-default', NULL, 'Default', 'Baseline governance — allows all actions with audit logging',
     '{"identity":"Cardinal Frame agent","principles":["Be helpful","Be safe","Be transparent"],"boundaries":["Never expose secrets","Never modify system files"],"escalation":{"require_approval_for":["rm","sudo","chmod","chown","mkfs"],"auto_approve":["echo","ls","cat","pwd","date","grep","wc"]}}',
     '[]', '[]', 1);
   `);
+
+  // ─── Default admin credentials: provision or rotate ────────────
+  // Runs after the users table exists. If an account is missing or still
+  // uses a publicly-known default password, it gets a fresh random one.
+  ensureAdminAccount('admin-000', 'admin', 'admin123');
+  ensureAdminAccount('haz-001', 'Haz', 'cardinal');
+  if (rotatedCreds.length > 0) {
+    const credFile = path.join(DATA_DIR, '.admin-credentials');
+    try {
+      const lines = rotatedCreds.map(c => `${c.username}:${c.password}`).join('\n') + '\n';
+      writeFileSync(credFile, `# Cardinal Frame admin credentials — generated ${new Date().toISOString()}\n# Keep this file private (mode 600). Change passwords via PUT /users/:id or the CLI.\n${lines}`, { mode: 0o600 });
+    } catch (e) {
+      logger.warn(`Could not write ${credFile}: ${e.message}`);
+    }
+    // L5: never print live credentials to stdout — anyone with log access
+    // would see them. They live only in the 0600 credential file; the
+    // pointer below is enough for the operator to find them on first boot.
+    console.log('\n================================================================');
+    console.log('  CARDINAL FRAME — admin credentials were (re)generated');
+    console.log('  The old defaults (admin123 / cardinal) no longer work.');
+    console.log(`  Credentials are saved in ${credFile} (mode 600). The CLI reads it automatically.`);
+    console.log('================================================================\n');
+  }
 
   // ─── Schema Migrations (add columns to existing DBs) ──────────
   const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
@@ -877,6 +954,40 @@ const stmts = {
    updateStatus: db.prepare('UPDATE mcp_servers SET status = ?, connected_at = ?, last_ping = ? WHERE id = ?'),
    delete: db.prepare('DELETE FROM mcp_servers WHERE id = ?'),
    },
+   connectors: {
+   upsert: db.prepare(`INSERT INTO connectors (id, connector_id, name, kind, enabled, config_json, secret_json, status, oauth_state, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'), datetime('now'))
+    ON CONFLICT(connector_id) DO UPDATE SET name=excluded.name, kind=excluded.kind, config_json=excluded.config_json, secret_json=excluded.secret_json, updated_at=datetime('now')`),
+   getByConnectorId: db.prepare('SELECT * FROM connectors WHERE connector_id = ?'),
+   getAll: db.prepare('SELECT * FROM connectors ORDER BY connector_id'),
+   updateStatus: db.prepare("UPDATE connectors SET status = ?, last_test_at = ?, last_error = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   updateEnabled: db.prepare("UPDATE connectors SET enabled = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   setSecrets: db.prepare("UPDATE connectors SET secret_json = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   setOauthState: db.prepare("UPDATE connectors SET oauth_state = ?, updated_at = datetime('now') WHERE connector_id = ?"),
+   getByOauthState: db.prepare('SELECT * FROM connectors WHERE oauth_state = ? AND oauth_state IS NOT NULL'),
+   clearOauthState: db.prepare("UPDATE connectors SET oauth_state = NULL, updated_at = datetime('now') WHERE connector_id = ?"),
+   },
+   learningImports: {
+   insert: db.prepare(`INSERT INTO learning_imports (id, source, user_id, label, status, total, imported, deduplicated, errors, dry_run) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+   getAll: db.prepare('SELECT * FROM learning_imports ORDER BY created_at DESC LIMIT ?'),
+   getByUser: db.prepare('SELECT * FROM learning_imports WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'),
+   },
+   learningCandidates: {
+   insert: db.prepare(`INSERT INTO learning_candidates (id, user_id, kind, title, draft, eligibility_note, risk_tier, requested_caps, state, support_verified, support_recovered, support_corrections, quality_json, promotion_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`),
+   getById: db.prepare('SELECT * FROM learning_candidates WHERE id = ? AND user_id = ?'),
+   listByUserState: db.prepare(`SELECT id, kind, title, risk_tier, state, promotion_score, support_verified, support_recovered, support_corrections, created_at, updated_at FROM learning_candidates WHERE user_id = ? AND state = ? ORDER BY promotion_score DESC, created_at DESC`),
+   listByUser: db.prepare(`SELECT id, kind, title, risk_tier, state, promotion_score, support_verified, support_recovered, support_corrections, created_at, updated_at FROM learning_candidates WHERE user_id = ? ORDER BY promotion_score DESC, created_at DESC`),
+   countToday: db.prepare(`SELECT COUNT(*) AS c FROM learning_candidates WHERE user_id = ? AND date(created_at) = date('now')`),
+   },
+   candidateEvidence: {
+   insert: db.prepare(`INSERT OR IGNORE INTO candidate_evidence (id, candidate_id, event_id, role, weight, excerpt_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`),
+   getByCandidate: db.prepare(`SELECT e.id, e.role, e.weight, e.event_id, e.excerpt_hash, le.type AS event_type, le.outcome, le.trace_id, le.created_at FROM candidate_evidence e JOIN learning_events le ON le.id = e.event_id JOIN learning_candidates c ON c.id = e.candidate_id WHERE e.candidate_id = ? AND c.user_id = ? ORDER BY le.created_at ASC, le.rowid ASC`),
+   },
+   learningReviewJobs: {
+   insert: db.prepare(`INSERT INTO learning_review_jobs (id, user_id, status, started_at) VALUES (?, ?, 'running', ?)`),
+   finish: db.prepare(`UPDATE learning_review_jobs SET status = ?, events_scanned = ?, candidates_assembled = ?, dead_lettered = ?, budget_used = ?, finished_at = ?, error = ? WHERE id = ?`),
+   getByUser: db.prepare(`SELECT id, status, events_scanned, candidates_assembled, dead_lettered, budget_used, started_at, finished_at, error FROM learning_review_jobs WHERE user_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 20`),
+   },
    deps: {
       insert: db.prepare('INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)'),
       getByTask: db.prepare('SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?'),
@@ -972,6 +1083,7 @@ const stmts = {
       getAllWithTrigger: db.prepare("SELECT * FROM skills WHERE enabled = 1 AND trigger != '' ORDER BY confidence DESC"),
       updateInvoke: db.prepare("UPDATE skills SET invoke_count = invoke_count + 1, last_invoked = datetime('now') WHERE id = ?"),
       insertFull: db.prepare('INSERT INTO skills (id, name, description, category, handler, parameters, enabled, confidence, auto_proposed, trigger, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+      setNetworkAccess: db.prepare('UPDATE skills SET network_access = ? WHERE id = ?'),
       },
       skillInvocations: {
         insert: db.prepare('INSERT INTO skill_invocations (skill_id, skill_name, trace_id, success, duration_ms, skill_type, error) VALUES (?, ?, ?, ?, ?, ?, ?)'),
@@ -1073,6 +1185,8 @@ const stmts = {
         getById: db.prepare('SELECT * FROM memories WHERE id = ?'),
         getByUser: db.prepare('SELECT * FROM memories WHERE user_id = ? ORDER BY updated_at DESC'),
         getByCategory: db.prepare('SELECT * FROM memories WHERE user_id = ? AND category = ? ORDER BY updated_at DESC'),
+        getByUserPaged: db.prepare('SELECT * FROM memories WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?'),
+        getByCategoryPaged: db.prepare('SELECT * FROM memories WHERE user_id = ? AND category = ? ORDER BY updated_at DESC LIMIT ?'),
         update: db.prepare("UPDATE memories SET content = ?, category = ?, updated_at = datetime('now') WHERE id = ?"),
         updateAccess: db.prepare("UPDATE memories SET access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?"),
         delete: db.prepare('DELETE FROM memories WHERE id = ?'),
@@ -1175,6 +1289,34 @@ const stmts = {
         delete: db.prepare('DELETE FROM tool_chains WHERE id = ?'),
       },
       // ─── Evolution & Hub Tables ────────────────────────────────
+      // ─── Identity & Avatar Tables ────────────────────────────────
+      identity: {
+        getSingleton: db.prepare("SELECT * FROM companion_identity WHERE id = 'singleton'"),
+        upsert: db.prepare(`INSERT INTO companion_identity (id, name, character, vibe, color_language, style_anchors, avatar_master_ref, updated_at)
+          VALUES ('singleton', ?, ?, ?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(id) DO UPDATE SET name=excluded.name, character=excluded.character, vibe=excluded.vibe,
+            color_language=excluded.color_language, style_anchors=excluded.style_anchors,
+            avatar_master_ref=excluded.avatar_master_ref, updated_at=datetime('now')`),
+        setAvatarMaster: db.prepare("UPDATE companion_identity SET avatar_master_ref = ?, updated_at = datetime('now') WHERE id = 'singleton'"),
+      },
+      avatarCandidates: {
+        insert: db.prepare('INSERT INTO avatar_candidates (id, persona_id, label, prompt, negative_prompt, image_ref, status) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+        getById: db.prepare('SELECT * FROM avatar_candidates WHERE id = ?'),
+        getByPersona: db.prepare('SELECT * FROM avatar_candidates WHERE persona_id = ? ORDER BY created_at DESC'),
+        getActive: db.prepare("SELECT * FROM avatar_candidates WHERE persona_id = ? AND status = 'active' LIMIT 1"),
+        setStatus: db.prepare("UPDATE avatar_candidates SET status = ?, activated_at = CASE WHEN ? = 'active' THEN datetime('now') ELSE activated_at END WHERE id = ?"),
+        archiveActive: db.prepare("UPDATE avatar_candidates SET status = 'archived' WHERE persona_id = ? AND status = 'active'"),
+        delete: db.prepare('DELETE FROM avatar_candidates WHERE id = ?'),
+      },
+      personaVoices: {
+        get: db.prepare('SELECT * FROM persona_voices WHERE persona_id = ?'),
+        getAll: db.prepare('SELECT * FROM persona_voices'),
+        upsert: db.prepare(`INSERT INTO persona_voices (persona_id, provider, voice_id, voice_label, updated_at)
+          VALUES (?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(persona_id) DO UPDATE SET provider=excluded.provider, voice_id=excluded.voice_id,
+            voice_label=excluded.voice_label, updated_at=datetime('now')`),
+        delete: db.prepare('DELETE FROM persona_voices WHERE persona_id = ?'),
+      },
       evolution: {
         insert: db.prepare('INSERT INTO skill_evolution (id, skill_id, chain_id, generation, evolution_type, parent_skill_id, trigger, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
         getBySkill: db.prepare('SELECT * FROM skill_evolution WHERE skill_id = ? ORDER BY generation DESC'),
@@ -1281,12 +1423,18 @@ db.exec(`
 // ─── WebSocket Setup ───────────────────────────────────────────────
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', verifyClient: (info) => {
-  const origin = info.req.headers.origin;
-  if (origin && !origin.startsWith('http://localhost') && !origin.startsWith('http://127.0.0.1') && !origin.startsWith('http://[::1]') && !origin.startsWith('http://192.168.1.')) {
-    logger.warn(`WS rejected origin: ${origin}`);
+  // JWT required: ?token=<access token>. The old Origin allowlist was
+  // spoofable by any non-browser client, so it is not a security boundary.
+  try {
+    const url = new URL(info.req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+    if (!token) { logger.warn('WS rejected: no token'); return false; }
+    jwt.verify(token, JWT_SECRET);
+    return true;
+  } catch (err) {
+    logger.warn(`WS rejected: ${err.message}`);
     return false;
   }
-  return true;
 } });
 
 function broadcast(type, payload) {
@@ -1365,17 +1513,9 @@ function requireRole(...roles) {
 }
 
 // ─── Command Sanitization ─────────────────────────────────────────
-const ALLOWED_COMMANDS = ['echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort', 'uniq', 'curl', 'wget', 'python3', 'node', 'bash'];
-
-function sanitizeCommand(cmd) {
-  const trimmed = cmd.trim();
-  const base = trimmed.split(/\s+/)[0];
-  const baseName = base.split('/').pop();
-  if (!ALLOWED_COMMANDS.includes(baseName)) {
-    return { safe: false, error: `Command '${baseName}' not allowed. Allowed: ${ALLOWED_COMMANDS.join(', ')}` };
-  }
-  return { safe: true, command: trimmed };
-}
+// ALLOWED_COMMANDS + sanitizeCommand live in command-safety.mjs (shared
+// with routes/agent.mjs to avoid a circular import); re-exported through
+// ctx.get sanitizeCommand() below for the existing call sites.
 
 // ─── Task Execution with Log Streaming ─────────────────────────────
 function executeTask(taskId, command) {
@@ -1388,11 +1528,13 @@ function executeTask(taskId, command) {
 
   stmts.tasks.updateStatus.run('running', new Date().toISOString(), null, null, null, taskId);
   broadcast('task:status', { id: taskId, status: 'running' });
-  logger.info(`Task executing: ${taskId} -> ${check.command}`);
+  logger.info(`Task executing: ${taskId} -> ${check.display}`);
 
-  const child = spawn(check.command, [], {
+  // shell:false — the sanitizer guarantees argv0 is allowlisted and no
+  // metacharacters are present, so no shell ever interprets this string.
+  const child = spawn(check.command, check.args, {
     timeout: 30000,
-    shell: '/bin/sh',
+    shell: false,
     env: { PATH: process.env.PATH },
     cwd: '/tmp',
   });
@@ -1438,6 +1580,9 @@ async function fireHook(hookName, data) {
 }
 
 // ─── Shared Context Object ──────────────────────────────────────────────
+// P1.10 — the canonical principal resolver grounds authorization in the DB
+// users table (actual identity), used by the learning policy gate.
+const resolvePrincipal = (tokenUser) => resolvePrincipalFromIdentity(db, tokenUser);
 const ctx = {
   app, db, stmts, wss, logger,
   JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES,
@@ -1447,6 +1592,7 @@ const ctx = {
   mcp, embeddings,
   pluginLoader, fireHook,
   DATA_DIR, PORT,
+  resolvePrincipal,
   matchSkillTrigger,
   executeSkill,
   getDevSetting, getDevSettings,
@@ -1480,6 +1626,9 @@ logger.info('Node registry initialized — heartbeat loop started');
 
 // ─── Modularized Routes ─────────────────────────────────────────
 app.use('/api/auth', authRoutes(ctx));
+// Avatar uploads are served read-only; writes go through the admin-gated
+// identity routes only.
+app.use('/media/avatars', express.static(path.join(DATA_DIR, 'avatars'), { maxAge: '7d', immutable: true }));
 app.use('/api', dashboardRoutes(ctx));
 app.use('/api', graphRoutes(ctx));
 app.use('/api', taskRoutes(ctx));
@@ -1511,6 +1660,12 @@ app.use('/api', tracesRoutes(ctx));
 app.use('/api', governanceRoutes(ctx));
 app.use('/api', nodesRoutes(ctx));
 app.use('/api', compressionRoutes(ctx));
+app.use('/api', companionRoutes(ctx));
+app.use('/api', identityRoutes(ctx));
+app.use('/api', defenseRoutes(ctx));
+app.use('/api', connectorsRoutes(ctx));
+app.use('/api', learningSourcesRoutes(ctx));
+app.use('/api', learningRoutes(ctx));
 
 // ─── Job Queue ───────────────────────────────────────────────────
 const jobQueue = createJobQueue(db, {
@@ -1520,6 +1675,9 @@ const jobQueue = createJobQueue(db, {
 });
 jobQueue.setBroadcast(broadcast);
 jobQueue.setLogger(logger);
+// The queue's `dag` handler shells out for `task` nodes — it must use the
+// same allowlist as the in-process fallback (previously it ran unsanitized).
+jobQueue.setSanitizeCommand(sanitizeCommand);
 
 // Start job queue eagerly (works in both test and production modes).
 // In test mode, server.listen() is skipped but the queue still processes
@@ -1636,6 +1794,8 @@ app.post('/api/chat/compress-context', authMiddleware, apiLimiter, async (req, r
   const chatPayload = buildChatPayload(pType, modelRecord.model_id, compressionMessages, false);
   if (!chatPayload.max_tokens && pType !== 'google') chatPayload.max_tokens = 2000;
   const body = JSON.stringify(chatPayload);
+  // Intentional direct fetch: provider URL is admin-configured; Ollama
+  // (localhost:11434) is an explicitly supported provider type for compression.
   const fetch = globalThis.fetch;
   const resp = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(30000) });
   if (!resp.ok) return res.status(502).json({ error: `Compression LLM error: ${resp.status}` });
@@ -2149,6 +2309,7 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
    fireHook('onServerStart', { port: PORT, version: APP_VERSION });
 
    // Start heartbeat daemon
+   const pulseUserId = stmts.users.getByUsername.get('admin')?.id || 'system';
    const heartbeat = new HeartbeatDaemon(stmts, broadcast,
      async (chainId, input) => {
        const chain = stmts.skillChains.getById.get(chainId);
@@ -2170,9 +2331,19 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
        if (!skill) return { ok: false, error: 'Skill not found' };
        return await executeSkill(skill, input, `heartbeat:${Date.now()}`);
      },
-     logger
+     logger,
+     {
+       pulseUserId,
+       personaPrompt: () => buildAimiSystemPrompt(stmts, pulseUserId, db),
+       invokeAgent: async (messages) => (await callAgentLLM(messages)).content,
+       // Pulse alerts go to Haz's Telegram (best-effort; no-op until a
+       // Telegram channel is configured).
+       notify: createTelegramNotifier({ stmts, logger }),
+     }
    );
    heartbeat.start(parseInt(process.env.HEARTBEAT_INTERVAL || '60') * 1000);
+   const pulseEnabled = (process.env.AGENT_PULSE_ENABLED || 'true').toLowerCase() !== 'false';
+   if (pulseEnabled) heartbeat.startPulse(parseInt(process.env.AGENT_PULSE_INTERVAL || '900') * 1000);
    globalThis._heartbeat = heartbeat;
 
    // Start the Aimi learning loop daemon — promotes recurring patterns into
@@ -2183,6 +2354,16 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
     );
    learnLoop.start();
    globalThis._learnLoop = learnLoop;
+
+   // Start the MCP manager — auto-connects auto_connect servers on boot,
+   // health-pings them, reconnects with backoff, and surfaces each
+   // server's tools as callable agent tools.
+   const mcpManager = startMcpManager({
+     db, stmts, logger, broadcast, mcp,
+     registerAgentTool, unregisterAgentTool,
+     healthIntervalMs: parseInt(process.env.MCP_HEALTH_INTERVAL || '30') * 1000,
+   });
+   globalThis._mcpManager = mcpManager;
   });
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));

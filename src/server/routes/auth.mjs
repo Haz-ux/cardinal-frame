@@ -1,4 +1,6 @@
 import express from 'express';
+import path from 'path';
+import { appendFileSync } from 'fs';
 import { randomUUID, randomBytes, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -9,7 +11,7 @@ import { validateBody, schemas } from '../validate.mjs';
  * Dependencies: db, stmts, JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES, logger, audit, authMiddleware, authLimiter
  */
 export default function authRoutes(ctx) {
-  const { stmts, JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES, logger, audit, authMiddleware, authLimiter } = ctx;
+  const { stmts, JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES, logger, audit, authMiddleware, authLimiter, DATA_DIR } = ctx;
   const router = express.Router();
 
   // Cache-control headers for all auth routes
@@ -20,7 +22,29 @@ export default function authRoutes(ctx) {
     next();
   });
 
+  // L6: deployment-level registration kill-switch. Matches the codebase's
+  // envBool toggle convention (learning/retrieval.mjs) — anything set and
+  // not an explicit falsy string disables registration. Default (unset) is
+  // unchanged: registration stays open.
+  function registrationDisabled() {
+    const raw = process.env.DISABLE_REGISTRATION;
+    if (raw === undefined) return false;
+    const v = String(raw).trim().toLowerCase();
+    return !['0', 'false', 'no', 'off', ''].includes(v);
+  }
+
+  function registrationGate(_req, res, next) {
+    if (registrationDisabled()) {
+      return res.status(403).json({ error: 'Registration is disabled on this server' });
+    }
+    next();
+  }
+
   const resetTokens = new Map();
+
+  // L5: password-reset tokens are secrets. They are appended to a 0600 file
+  // in DATA_DIR (never printed to stdout); the console only gets a pointer.
+  const RESET_TOKEN_FILE = path.join(DATA_DIR || '.', '.password-reset-tokens');
 
   // ─── Refresh token helpers ─────────────────────────────────────────
   // Refresh tokens are opaque random strings. Only their SHA-256 hash is
@@ -60,7 +84,7 @@ export default function authRoutes(ctx) {
     };
   }
 
-  router.post('/register', authLimiter, validateBody(schemas.register), async (req, res) => {
+  router.post('/register', registrationGate, authLimiter, validateBody(schemas.register), async (req, res) => {
     const { username, password } = req.body;
 
     const existing = stmts.users.getByUsername.get(username);
@@ -143,21 +167,26 @@ export default function authRoutes(ctx) {
     if (!username) return res.status(400).json({ error: 'Username required' });
 
     const user = stmts.users.getByUsername.get(username);
-    if (!user) return res.status(200).json({ message: 'If the account exists, a reset token has been printed to the server terminal.' });
+    if (!user) return res.status(200).json({ message: 'If the account exists, a reset token has been written to the server credential file.' });
 
     const token = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
     const expires = Date.now() + 10 * 60 * 1000;
     resetTokens.set(token, { userId: user.id, username: user.username, expires });
 
-    console.log('\n' + '='.repeat(60));
-    console.log(`  PASSWORD RESET REQUEST`);
-    console.log(`  User: ${user.username}`);
-    console.log(`  Token: ${token}`);
-    console.log(`  Expires: 10 minutes`);
-    console.log('='.repeat(60) + '\n');
+    // L5: the token itself never touches stdout — append it to a 0600 file
+    // and print only a pointer so the operator can find it.
+    try {
+      appendFileSync(RESET_TOKEN_FILE,
+        `# Password reset — ${new Date().toISOString()} — user: ${user.username} (expires in 10 minutes)\n${token}\n`,
+        { mode: 0o600 });
+      console.log(`[auth] Password reset token for "${user.username}" written to ${RESET_TOKEN_FILE} (mode 600)`);
+    } catch (e) {
+      logger.warn(`Could not write reset token file ${RESET_TOKEN_FILE}: ${e.message}`);
+      console.log(`[auth] Password reset token for "${user.username}" could NOT be written to disk — check DATA_DIR permissions`);
+    }
 
     logger.info(`Password reset token generated for: ${username}`);
-    res.json({ message: 'Reset token printed to server terminal. Check the server logs.' });
+    res.json({ message: 'Reset token written to the server credential file. Check the server console for its location.' });
   });
 
   router.post('/reset-confirm', authLimiter, validateBody(schemas.resetConfirm), (req, res) => {

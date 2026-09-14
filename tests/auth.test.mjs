@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
-import { getTestServer, cleanupTestServer, makeToken, adminAuth, userAuth } from './helpers.mjs';
+import { getTestServer, cleanupTestServer, makeToken, adminAuth, userAuth, getAdminCredentials } from './helpers.mjs';
 
 let app;
+let adminCreds;
 
 beforeAll(async () => {
   ({ app } = await getTestServer());
+  adminCreds = getAdminCredentials();
 });
 
 afterAll(() => {
@@ -51,7 +53,7 @@ describe('Auth API', () => {
     it('should login with correct credentials (admin)', async () => {
       const res = await request(app)
         .post('/api/auth/login')
-        .send({ username: 'admin', password: 'admin123' });
+        .send({ username: 'admin', password: adminCreds.adminPassword });
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('token');
       expect(res.body.user.username).toBe('admin');
@@ -61,7 +63,7 @@ describe('Auth API', () => {
     it('should login with correct credentials (Haz)', async () => {
       const res = await request(app)
         .post('/api/auth/login')
-        .send({ username: 'Haz', password: 'cardinal' });
+        .send({ username: 'Haz', password: adminCreds.hazPassword });
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('token');
       expect(res.body.user.username).toBe('Haz');
@@ -159,7 +161,7 @@ describe('Auth API', () => {
     it('login returns an access + refresh token pair', async () => {
       const res = await request(app)
         .post('/api/auth/login')
-        .send({ username: 'admin', password: 'admin123' });
+        .send({ username: 'admin', password: adminCreds.adminPassword });
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('token');
       expect(res.body).toHaveProperty('refreshToken');
@@ -168,7 +170,7 @@ describe('Auth API', () => {
     it('refresh rotates the token pair and invalidates the old refresh token', async () => {
       const loginRes = await request(app)
         .post('/api/auth/login')
-        .send({ username: 'admin', password: 'admin123' });
+        .send({ username: 'admin', password: adminCreds.adminPassword });
       const oldRefresh = loginRes.body.refreshToken;
 
       const refreshRes = await request(app)
@@ -203,7 +205,7 @@ describe('Auth API', () => {
     it('logout revokes the refresh token', async () => {
       const loginRes = await request(app)
         .post('/api/auth/login')
-        .send({ username: 'admin', password: 'admin123' });
+        .send({ username: 'admin', password: adminCreds.adminPassword });
       const refreshToken = loginRes.body.refreshToken;
 
       const logoutRes = await request(app)
@@ -224,6 +226,38 @@ describe('Auth API', () => {
         .send({ refreshToken: 'definitely-not-a-token' });
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
+    });
+  });
+
+  // L6: DISABLE_REGISTRATION deployment toggle.
+  describe('DISABLE_REGISTRATION', () => {
+    it('returns 403 on /register when set to a truthy value', async () => {
+      for (const v of ['true', '1', 'yes']) {
+        process.env.DISABLE_REGISTRATION = v;
+        const res = await request(app)
+          .post('/api/auth/register')
+          .send({ username: `blocked-${v}`, password: 'testpass123' });
+        expect(res.status).toBe(403);
+        expect(res.body.error).toMatch(/disabled/i);
+      }
+      delete process.env.DISABLE_REGISTRATION;
+    });
+
+    it('treats explicit falsy values as registration-open', async () => {
+      process.env.DISABLE_REGISTRATION = 'false';
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ username: 'falsyflaguser', password: 'testpass123' });
+      delete process.env.DISABLE_REGISTRATION;
+      expect(res.status).toBe(201);
+    });
+
+    it('registers normally when unset (default unchanged)', async () => {
+      delete process.env.DISABLE_REGISTRATION;
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ username: 'openreguser', password: 'testpass123' });
+      expect(res.status).toBe(201);
     });
   });
 });

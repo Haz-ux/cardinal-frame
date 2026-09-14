@@ -1,11 +1,17 @@
 import express from 'express';
-import { randomUUID } from 'crypto';
-import { execSync, spawn } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { randomUUID, createHash } from 'crypto';
+import { spawn } from 'child_process';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync, mkdirSync } from 'fs';
 import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
+import { sanitizeFtsQuery } from './memory.mjs';
 import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
+import { record as recordLearningEvent } from '../learning/events.mjs';
+import { shadowRoute } from '../learning/retrieval.mjs';
+import { sanitizeCommand, sanitizeAgentCommand, spawnArgv } from '../command-safety.mjs';
+import { safeFetch } from '../safe-fetch.mjs';
+import { decide as policyDecide, CAPABILITIES } from '../defense/policy.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -25,12 +31,8 @@ import { getModelCost } from './costs.mjs';
 // Autopilot: server-side loop with native function calling
 // File scope: sandbox = /home/haz/ai-workspace/, home = /home/haz/
 
-const SANDBOX_DIR = '/home/haz/ai-workspace';
-const HOME_DIR = '/home/haz';
-const CMD_BLOCKLIST = [
-  'rm -rf', 'sudo', 'reboot', 'shutdown', 'mkfs', 'dd if=', 'kill -9',
-  'systemctl stop', 'systemctl disable', 'chmod 777 /', 'chown root',
-];
+const SANDBOX_DIR = process.env.AGENT_SANDBOX_DIR || '/home/haz/ai-workspace';
+const HOME_DIR = process.env.AGENT_HOME_DIR || '/home/haz';
 const ALLOWED_READ_EXT = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.json', '.md', '.txt', '.py', '.sh', '.html', '.css', '.yaml', '.yml', '.env', '.sql', '.xml'];
 const MAX_AGENT_STEPS = 20;
 const AGENT_STEP_DELAY_MS = 100;
@@ -42,22 +44,114 @@ const _deps = new Proxy({}, {
   get(_t, prop) { return _ctxRef?.[prop]; },
 });
 
-function resolveSandboxPath(scope, targetPath) {
-  const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
-  const resolved = path.resolve(base, targetPath || '.');
-  if (!resolved.startsWith(base)) {
-    throw new Error('Path traversal blocked: target outside scope');
-  }
-  return resolved;
+// ─── Filesystem containment (P0: realpath + relative gate) ─────────
+// The old lexical `resolved.startsWith(base)` check is NOT a filesystem
+// boundary: `..` traversal, sibling-prefix collisions (`/x-secret` vs `/x`),
+// and symlink escapes all defeat it. This resolver:
+//   1. rejects `..` / absolute escapes lexically (fast first gate),
+//   2. realpath()s the configured scope root (its true identity),
+//   3. realpath()s the deepest EXISTING ancestor of the target (so a
+//      symlinked parent directory is resolved to what it actually points at),
+//   4. joins the remaining "new" path components to that real ancestor, then
+//   5. requires the result to remain inside the real scope root via
+//      path.relative(). Sibling-prefix attacks fail here because the real
+//      root `/srv/ws` and `/srv/ws-secret` differ by more than a path prefix.
+// Fail closed: any resolution that escapes is rejected with a traversal error.
+
+function ensureBaseExists(base) {
+  try { mkdirSync(base, { recursive: true }); return realpathSync(base); }
+  catch { throw new Error('Path traversal blocked: cannot access scope root'); }
 }
 
-function isCmdSafe(cmd) {
-  const lower = (cmd || '').toLowerCase().trim();
-  if (!lower || lower.length > 2000) return false;
-  for (const blocked of CMD_BLOCKLIST) {
-    if (lower.includes(blocked)) return false;
+function deepestExistingAncestor(candidate) {
+  let cur = candidate;
+  while (true) {
+    if (existsSync(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
   }
-  return true;
+}
+
+export function resolveSandboxPath(scope, targetPath, options = {}) {
+  const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
+  const candidate = path.resolve(base, String(targetPath || '.'));
+
+  // Gate 1 — lexical containment (fast reject of obvious escapes).
+  const relLex = path.relative(base, candidate);
+  if (relLex === '..' || relLex.startsWith(`..${path.sep}`) || path.isAbsolute(relLex)) {
+    throw new Error('Path traversal blocked: target outside scope');
+  }
+
+  const realBase = ensureBaseExists(base);
+
+  // Gate 2 — real containment. Resolve symlinks for every EXISTING part of
+  // the target; only the final "not yet created" components stay unresolved
+  // (they are plain names under an already-contained real ancestor).
+  const existingAncestor = deepestExistingAncestor(candidate);
+  let realTarget;
+  if (existingAncestor) {
+    const realAncestor = realpathSync(existingAncestor);
+    const tail = path.relative(existingAncestor, candidate);
+    if (tail === '..' || tail.startsWith(`..${path.sep}`) || path.isAbsolute(tail)) {
+      throw new Error('Path traversal blocked: target outside scope');
+    }
+    realTarget = tail ? path.join(realAncestor, tail) : realAncestor;
+  } else {
+    realTarget = path.join(realBase, path.relative(base, candidate));
+  }
+
+  const relReal = path.relative(realBase, realTarget);
+  if (relReal === '..' || relReal.startsWith(`..${path.sep}`) || path.isAbsolute(relReal)) {
+    throw new Error('Path traversal blocked: target resolves outside scope (symlink escape)');
+  }
+  return realTarget;
+}
+
+// ─── Shared shell-free command runner (C1 fix + P0.2 agent policy) ──
+// The agent's shell_exec tool and POST /api/agent/exec both run through
+// here: the AGENT-restricted sanitizeAgentCommand allowlist (no code
+// interpreters, no network binaries) + spawn(shell:false) — the same path
+// as executeTask minus the interpreter/egress primitives. No shell ever
+// interprets the command string, so shell metacharacters are rejected,
+// never executed. Path-like arguments are additionally resolved against
+// the agent scope so the shell cannot be used to read or write outside the
+// workspace (e.g. `cat /etc/passwd` or `ls ../..`). Returns a result object
+// (never throws for bad input) so agent loops stay alive.
+
+function isAgentPathToken(tok) {
+  return tok === '.' || tok === '..' || tok.startsWith('./') || tok.startsWith('../') || tok.startsWith('/');
+}
+
+async function runAgentCommand(command, workDir, scope = 'sandbox') {
+  const check = sanitizeAgentCommand(command);
+  if (!check.safe) return { error: `Command blocked by agent safety filter: ${check.error}` };
+  for (const arg of [check.command, ...(check.args || [])]) {
+    if (isAgentPathToken(arg)) {
+      try { resolveSandboxPath(scope, arg); }
+      catch { return { error: `Command blocked by agent safety filter: target path outside sandbox (${arg})` }; }
+    }
+  }
+  try { (await import('fs')).mkdirSync(workDir, { recursive: true }); }
+  catch (e) { return { error: `Cannot create working directory: ${e.message}` }; }
+  return new Promise((resolve) => {
+    const child = spawn(check.command, check.args, {
+      timeout: 30000,
+      shell: false,
+      env: { PATH: process.env.PATH },
+      cwd: workDir,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (e) => resolve({ error: `Execution failed: ${e.message}` }));
+    child.on('close', (code) => resolve({
+      exitCode: code ?? 0,
+      stdout: stdout.slice(0, 10000),
+      stderr: stderr.slice(0, 2000),
+      truncated: stdout.length > 10000,
+    }));
+  });
 }
 
 // ─── Agent Tool Registry ──────────────────────────────────────────
@@ -66,6 +160,16 @@ const agentTools = [];
 
 function registerAgentTool(name, description, parameters, executeFn) {
   agentTools.push({ name, description, parameters, execute: executeFn });
+}
+
+// Remove a tool from the registry by name. Returns true when a tool was
+// removed, false when no tool with that name was registered. Used by the
+// MCP manager (Track C) to un-surface stale MCP tools on disconnect.
+export function unregisterAgentTool(name) {
+  const idx = agentTools.findIndex(t => t.name === name);
+  if (idx === -1) return false;
+  agentTools.splice(idx, 1);
+  return true;
 }
 
 // OpenAI function-calling format for tool definitions
@@ -137,8 +241,9 @@ registerAgentTool(
     },
   },
   async (args, ctx) => {
-    const base = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    const resolved = resolveSandboxPath(args.scope || ctx.scope || 'sandbox', args.dir || '.');
+    const scope = args.scope || ctx.scope || 'sandbox';
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
+    const resolved = resolveSandboxPath(scope, args.dir || '.');
     const maxDepth = args.depth || 3;
     function walk(dir, currentDepth) {
       const items = [];
@@ -147,7 +252,8 @@ registerAgentTool(
         for (const entry of entries) {
           if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue;
           const full = path.join(dir, entry.name);
-          const rel = path.relative(base, full);
+          const rel = path.relative(realBase, full);
+          if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
           if (entry.isDirectory() && currentDepth < maxDepth) {
             items.push({ name: entry.name, path: rel, type: 'dir' });
             if (!['node_modules', '.git', 'dist', 'build', '__pycache__'].includes(entry.name)) {
@@ -177,19 +283,39 @@ registerAgentTool(
     required: ['pattern'],
   },
   async (args, ctx) => {
-    const base = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    // execSync is injected by the skill runtime
+    const scope = args.scope || ctx.scope || 'sandbox';
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
+    const maxResults = Math.min(Math.max(parseInt(args.max_results, 10) || 20, 1), 200);
+    const pattern = String(args.pattern || '');
+    if (!pattern) return { matches: [], count: 0, error: 'Search pattern is required' };
+    // Command-injection fix: shell-free argv execution via the shared
+    // spawnArgv helper. The pattern is an argv element (data), never
+    // interpolated into a shell string. Brace expansion and pipes are
+    // shell features, so --include flags are passed separately and the
+    // head(1) truncation is done in JS instead.
+    const check = sanitizeCommand('grep');
+    if (!check.safe) return { matches: [], count: 0, error: check.error };
+    try { (await import('fs')).mkdirSync(realBase, { recursive: true }); }
+    catch (e) { return { matches: [], count: 0, error: `Cannot access directory: ${e.message}` }; }
+    const grepArgs = [
+      '-rn',
+      ...['js', 'jsx', 'ts', 'tsx', 'mjs', 'json', 'md', 'txt', 'py', 'sh'].map((e) => `--include=*.${e}`),
+      `--max-count=${maxResults}`,
+      pattern,
+      realBase,
+    ];
     try {
-      const cmd = `grep -rn --include="*.{js,jsx,ts,tsx,mjs,json,md,txt,py,sh}" --max-count=${args.max_results || 20} "${args.pattern.replace(/"/g, '\\"')}" "${base}" 2>/dev/null | head -${args.max_results || 20}`;
-      const stdout = execSync(cmd, { timeout: 10000, encoding: 'utf-8', maxBuffer: 1024 * 50 });
-      const results = stdout.split('\n').filter(Boolean).map(line => {
+      const stdout = await spawnArgv('grep', grepArgs, { timeout: 10000, cwd: realBase });
+      const results = stdout.split('\n').filter(Boolean).slice(0, maxResults).map(line => {
         const [file, ...rest] = line.split(':');
         const lineNum = rest[0];
         const content = rest.slice(1).join(':');
-        return { file: path.relative(base, file), line: parseInt(lineNum) || 0, content: content.slice(0, 200) };
+        return { file: path.relative(realBase, file), line: parseInt(lineNum) || 0, content: content.slice(0, 200) };
       });
       return { matches: results, count: results.length };
     } catch (e) {
+      // grep exits 1 when nothing matches — not an error.
+      if (/exit code 1/.test(e.message)) return { matches: [], count: 0 };
       return { matches: [], count: 0, error: e.message };
     }
   }
@@ -197,26 +323,22 @@ registerAgentTool(
 
 registerAgentTool(
   'shell_exec',
-  'Execute a shell command in the workspace. Dangerous commands are blocked.',
+  'Execute a command in the workspace through the restricted agent allowlist with no shell: only read-only inspection commands (echo, ls, cat, pwd, date, whoami, hostname, uname, df, free, uptime, ps, wc, head, tail, grep, sort, uniq) and no shell metacharacters (; | & > < $ ` \\ ! {} () [] * ? ~ #). Code interpreters (node, python3, bash) are disabled — writing a script and invoking it is not possible. Network binaries (curl, wget) are disabled — use the web_fetch/web_search tools for network access. Chained commands, pipes, redirects, and command substitution are rejected.',
   {
     type: 'object',
     properties: {
-      command: { type: 'string', description: 'Shell command to execute' },
+      command: { type: 'string', description: 'Single command to execute (no shell syntax: no pipes, redirects, or command substitution)' },
       scope: { type: 'string', enum: ['sandbox', 'home'] },
       cwd: { type: 'string', description: 'Working directory (relative to scope)' },
     },
     required: ['command'],
   },
   async (args, ctx) => {
-    if (!isCmdSafe(args.command)) return { error: 'Command blocked by safety filter' };
-    // execSync is injected by the skill runtime
+    // C1 fix + P0.2 agent policy: sanitizeAgentCommand (interpreters and
+    // network binaries removed for the agent) + shell:false argv execution
+    // (see runAgentCommand above). No shell ever interprets this string.
     const workDir = (ctx.scope || args.scope || 'sandbox') === 'home' ? HOME_DIR : resolveSandboxPath(ctx.scope || args.scope || 'sandbox', args.cwd || '.');
-    try {
-      const stdout = execSync(args.command, { timeout: 30000, maxBuffer: 1024 * 100, cwd: workDir, encoding: 'utf-8' });
-      return { exitCode: 0, stdout: stdout.slice(0, 5000), stderr: '' };
-    } catch (e) {
-      return { exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || '').toString().slice(0, 2000) };
-    }
+    return runAgentCommand(args.command, workDir, ctx.scope || args.scope || 'sandbox');
   }
 );
 
@@ -260,7 +382,7 @@ registerAgentTool(
 
 registerAgentTool(
   'web_fetch',
-  'Fetch a URL and extract text content.',
+  'Fetch a URL and extract text content. Server-side request (SSRF-safe): private/loopback/metadata addresses are blocked; 15s timeout.',
   {
     type: 'object',
     properties: {
@@ -270,7 +392,9 @@ registerAgentTool(
   },
   async (args) => {
     try {
-      const resp = await fetch(args.url, { timeout: 15000 });
+      // H1 fix: route through safeFetch (blocks private/link-local/169.254.169.254,
+      // re-validates redirects) with a real timeout via AbortSignal.timeout.
+      const resp = await safeFetch(args.url, { signal: AbortSignal.timeout(15000) });
       const text = await resp.text();
       // Strip HTML tags if it's HTML
       const stripped = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
@@ -299,22 +423,33 @@ registerAgentTool(
   },
   async (args, ctx) => {
     const workDir = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    // execSync is injected by the skill runtime
+    // Command-injection fix: fixed operation→argv allowlist + shell-free
+    // argv execution via the shared spawnArgv helper. The commit message is
+    // an argv element (data) — never interpolated into a shell string, so
+    // quotes/semicolons/substitutions in it are harmless. 'git' is
+    // deliberately NOT added to the generic sanitizeCommand allowlist
+    // (that would widen shell_exec); this tool's allowlist is the map below.
     const ops = {
-      status: 'git status --short',
-      diff: 'git diff',
-      log: 'git log --oneline -10',
-      branch: 'git branch -a',
-      add: 'git add -A',
-      commit: `git commit -m "${(args.args || '').replace(/"/g, '\\"')}"`,
+      status: ['status', '--short'],
+      diff: ['diff'],
+      log: ['log', '--oneline', '-10'],
+      branch: ['branch', '-a'],
+      add: ['add', '-A'],
     };
-    const cmd = ops[args.operation];
-    if (!cmd) return { error: `Unknown git operation: ${args.operation}` };
+    let gitArgs = ops[args.operation];
+    if (args.operation === 'commit') {
+      const message = String(args.args || '').trim();
+      if (!message) return { error: 'Commit operation requires a message in args' };
+      gitArgs = ['commit', '-m', message];
+    }
+    if (!gitArgs) return { error: `Unknown git operation: ${args.operation}` };
+    try { (await import('fs')).mkdirSync(workDir, { recursive: true }); }
+    catch (e) { return { error: `Cannot create working directory: ${e.message}` }; }
     try {
-      const stdout = execSync(cmd, { timeout: 10000, cwd: workDir, encoding: 'utf-8', maxBuffer: 1024 * 50 });
+      const stdout = await spawnArgv('git', gitArgs, { timeout: 10000, cwd: workDir });
       return { output: stdout.slice(0, 5000) };
     } catch (e) {
-      return { error: (e.stderr || e.message).toString().slice(0, 500) };
+      return { error: e.message.toString().slice(0, 500) };
     }
   }
 );
@@ -359,6 +494,7 @@ registerAgentTool(
       const { result: handlerResult } = await runSandboxed({
         code: skill.handler,
         input: args.input || '',
+        allowNetwork: skill.network_access === 1,
       });
       return { result: handlerResult };
     } catch (e) {
@@ -415,10 +551,46 @@ registerAgentTool(
 );
 
 // ─── Execute a tool by name ───────────────────────────────────────
+// Policy boundary: every agent tool maps to a capability and is decided
+// fail-closed before execution (P1.6). `actNoPolicy`/`policyProvenance` are
+// internal escape hatches for trusted, already-authorized callers only; the
+// default is enforcement on every agent tool call reaching the funnel.
+const AGENT_TOOL_CAPABILITY = {
+  file_read: CAPABILITIES.FILESYSTEM_READ,
+  file_list: CAPABILITIES.FILESYSTEM_READ,
+  file_search: CAPABILITIES.FILESYSTEM_READ,
+  file_write: CAPABILITIES.FILESYSTEM_WRITE,
+  shell_exec: CAPABILITIES.PROCESS_EXECUTION,
+  git_op: CAPABILITIES.PROCESS_EXECUTION,
+  web_fetch: CAPABILITIES.NETWORK_EXTERNAL,
+  web_search: CAPABILITIES.NETWORK_EXTERNAL,
+  mcp_invoke: CAPABILITIES.MCP_CALL,
+  skill_invoke: CAPABILITIES.CODE_EXECUTION,
+  delegate_task: CAPABILITIES.PROCESS_EXECUTION,
+};
+
 async function executeAgentTool(toolName, args, ctx) {
   const tool = agentTools.find(t => t.name === toolName);
   if (!tool) return { error: `Unknown tool: ${toolName}` };
   try {
+    const capability = AGENT_TOOL_CAPABILITY[toolName];
+    if (capability && !(ctx && ctx.actNoPolicy)) {
+      const decision = await policyDecide({
+        actor: { id: ctx?.userId || null, role: ctx?.role || 'user' },
+        capability,
+        resource: toolName,
+        scope: ctx?.scope || 'sandbox',
+        provenance: (ctx && ctx.policyProvenance) || 'user',
+      });
+      if (!decision.allowed) {
+        _deps.fireHook('onAgentStep', {
+          sessionId: ctx?.sessionId, toolName, args,
+          result: { error: `Policy denied ${toolName}: ${decision.reason}` },
+          success: false, policyDenied: true, auditId: decision.auditId,
+        });
+        return { error: `Policy denied ${toolName}: ${decision.reason}`, policyDenied: true };
+      }
+    }
     const result = await tool.execute(args || {}, ctx || {});
     _deps.fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result, success: !result.error });
     return result;
@@ -432,11 +604,79 @@ async function executeAgentTool(toolName, args, ctx) {
 // Runs autonomously server-side: LLM plans → calls tools → gets results → continues
 // Broadcasts progress over WebSocket. Returns final summary.
 
+// ─── Memory write-back (Muse pattern) ─────────────────────────────
+// The agent recalls memories before acting; it also records what the
+// session taught it. One episodic memory per terminal session, redacted,
+// with the session id as provenance. The learning pipeline can distill
+// these into procedures later — this is the fast write-first layer.
+function redactForMemory(text) {
+  return String(text || '')
+    .replace(/(api[_-]?key|secret|password|passwd|token|bearer)\s*[:=]\s*['"]?[^\s'"]+/gi, '$1=[redacted]')
+    .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[redacted private key]');
+}
+
+function writeSessionMemory(session, outcome, detail) {
+  try {
+    const actions = _deps.stmts.agentActions.getBySession.all(session.id);
+    const keyActions = actions
+      .filter(a => ['write', 'exec', 'response'].includes(a.action_type))
+      .slice(-8)
+      .map(a => `- ${a.action_type} ${a.target || ''}: ${String(a.result || a.content || '').slice(0, 160)}`)
+      .join('\n');
+    const content = redactForMemory(
+      `[agent session ${session.id}] Task: ${session.task}\n` +
+      `Outcome: ${outcome}\n` +
+      (detail ? `Detail: ${String(detail).slice(0, 500)}\n` : '') +
+      (keyActions ? `Key actions:\n${keyActions}` : 'No actions recorded.')
+    ).slice(0, 4000);
+    _deps.stmts.memories.insert.run(randomUUID(), session.user_id, 'episodic', content, `agent:${session.id}`, 0.7);
+    _deps.logger.info(`Agent loop: wrote session memory for ${session.id} (${outcome})`);
+  } catch (e) { _deps.logger.error(`Agent loop memory write-back failed: ${e.message}`); }
+}
+
+// ─── Phase 1: durable learning events (capture-only) ─────────────
+// Writes one redacted, user-scoped, idempotent evidence row per tool
+// outcome and per terminal turn. recordLearningEvent() never throws and
+// never triggers reviews, candidates, or skill changes — the loop's
+// behavior is unchanged when capture is disabled or fails.
+function captureLearningEvent(session, { type, payload, outcome, terminalVersion }) {
+  try {
+    recordLearningEvent(_deps.db, {
+      userId: session.user_id,
+      conversationId: session.conversation_id || session.id,
+      traceId: session.id,
+      type,
+      payload,
+      outcome,
+      terminalVersion,
+    });
+  } catch { /* record() is already never-throw; belt and suspenders */ }
+}
+
+function terminalVersionFor(text, step) {
+  return createHash('sha256').update(`${step}|${String(text || '').slice(0, 2000)}`).digest('hex').slice(0, 16);
+}
+
 async function runAgentLoop(sessionId, options = {}) {
   const session = _deps.stmts.agentSessions.getById.get(sessionId);
   if (!session) throw new Error('Session not found');
 
-  const ctx = { scope: session.scope, sessionId, userId: session.user_id };
+  // ─── Phase 5: shadow retrieval routing (never affects the loop) ────
+  // Fire-and-forget: shadowRoute() never throws internally and this call
+  // is not awaited, returns nothing the loop consumes, and cannot change
+  // agent behavior. It only records what skill version WOULD have been
+  // routed for the review UI.
+  try {
+    shadowRoute({ db: _deps.db, userId: session.user_id, requestText: session.task, context: { sessionId } })
+      .then(r => { try { _deps.logger.debug(`shadow route ${r.decisionId ?? 'n/a'}: ${r.decision}`); } catch { /* never throws */ } })
+      .catch(() => { /* fire-and-forget: swallow */ });
+  } catch { /* the call itself must not disturb the loop */ }
+
+  const ctx = { scope: session.scope, sessionId, userId: session.user_id, role: 'user' };
+  try {
+    const userRec = _deps.stmts?.users?.getById?.get(session.user_id);
+    if (userRec?.role) ctx.role = userRec.role;
+  } catch { /* default to 'user' on lookup failure */ }
   const maxSteps = options.maxSteps || MAX_AGENT_STEPS;
   const model = options.model || session.model || undefined;
   const toolDefs = getToolDefinitions();
@@ -464,8 +704,11 @@ Remember:
   ];
 
   // ─── Memory recall: inject relevant memories into context ──────
+  // Uses the shared FTS sanitizer (same as the memory search API) so task
+  // text with quotes/parens can't break the MATCH query.
   try {
-    const memResults = _deps.stmts.memories.search.all(session.task.slice(0, 50) + '*', session.user_id, 5);
+    const ftsQuery = sanitizeFtsQuery(session.task);
+    const memResults = ftsQuery ? _deps.stmts.memories.search.all(ftsQuery, session.user_id, 5) : [];
     if (memResults && memResults.length > 0) {
       const memText = memResults.map(m => `- [${m.category}] ${m.content.slice(0, 200)}`).join('\n');
       messages.splice(1, 0, {
@@ -520,6 +763,14 @@ Remember:
       _deps.stmts.agentActions.insert.run(errActionId, sessionId, errStepIdx, 'error', 'llm_call', e.message, JSON.stringify({ error: e.message }), 'failed');
       stepCounter++;
 
+      writeSessionMemory(session, 'failed', e.message);
+      // Phase 1 capture: terminal turn (LLM failure)
+      captureLearningEvent(session, {
+        type: 'turn_terminal',
+        outcome: 'failed',
+        terminalVersion: terminalVersionFor(e.message, step + 1),
+        payload: { step: step + 1, errorPreview: String(e.message).slice(0, 500) },
+      });
       return { completed: false, error: e.message, steps: step + 1, tokens: totalTokens };
     }
 
@@ -540,18 +791,18 @@ Remember:
           args: toolArgs,
         });
 
-        // Execute the tool
-        const result = await executeAgentTool(toolName, toolArgs, ctx);
-
-        // Check if suggest mode requires approval
+        // Suggest mode: consequential tools need approval BEFORE they run
+        // (Muse pattern — the approval card gates the action; it never
+        // reviews something that already executed). The gated call is stored
+        // on the pending action and runs only when POST /agent/approve fires.
         if (session.mode === 'suggest' && ['file_write', 'shell_exec', 'git_op'].includes(toolName)) {
           const actionId = randomUUID();
           const stepIdx = stepCounter;
           _deps.stmts.agentActions.insert.run(
             actionId, sessionId, stepIdx, toolName === 'file_write' ? 'write' : 'exec',
             toolArgs.path || toolArgs.command || toolName,
-            toolArgs.content || JSON.stringify(toolArgs),
-            JSON.stringify(result),
+            JSON.stringify({ tool: toolName, args: toolArgs }),
+            'awaiting approval',
             'pending'
           );
 
@@ -561,11 +812,20 @@ Remember:
             action_id: actionId,
             tool: toolName,
             args: toolArgs,
-            result: result.error ? result : { preview: 'Draft created' },
+            preview: toolName === 'file_write'
+              ? { path: toolArgs.path, content: String(toolArgs.content || '').slice(0, 2000) }
+              : { command: toolArgs.command },
           });
 
           _deps.stmts.agentSessions.updateStatus.run('awaiting_approval', sessionId);
           stepCounter++;
+          // Phase 1 capture: terminal turn (paused for approval)
+          captureLearningEvent(session, {
+            type: 'turn_terminal',
+            outcome: 'awaiting_approval',
+            terminalVersion: actionId,
+            payload: { step: step + 1, tool: toolName, actionId },
+          });
           return {
             completed: false,
             paused: true,
@@ -575,6 +835,9 @@ Remember:
             tokens: totalTokens,
           };
         }
+
+        // Execute the tool
+        const result = await executeAgentTool(toolName, toolArgs, ctx);
 
         // Record the action
         const actionId = randomUUID();
@@ -591,6 +854,20 @@ Remember:
           'completed'
         );
         stepCounter++;
+
+        // Phase 1 capture: tool outcome evidence (redacted, idempotent on actionId)
+        captureLearningEvent(session, {
+          type: 'tool_outcome',
+          outcome: result && result.error ? 'failed' : 'completed',
+          terminalVersion: actionId,
+          payload: {
+            tool: toolName,
+            target: toolArgs.path || toolArgs.command || toolArgs.query || toolName,
+            step: step + 1,
+            success: !(result && result.error),
+            resultPreview: JSON.stringify(result).slice(0, 500),
+          },
+        });
 
         _deps.broadcast('agent:step', {
           session_id: sessionId,
@@ -647,6 +924,18 @@ Remember:
       }
     } catch (e) { _deps.logger.error(`Comms reply hook failed: ${e.message}`); }
 
+    writeSessionMemory(session, 'completed', content);
+    // Phase 1 capture: terminal turn (final response)
+    captureLearningEvent(session, {
+      type: 'turn_terminal',
+      outcome: 'completed',
+      terminalVersion: terminalVersionFor(content, step + 1),
+      payload: {
+        step: step + 1,
+        tokens: totalTokens,
+        summaryPreview: content.slice(0, 500),
+      },
+    });
     return {
       completed: true,
       summary: content,
@@ -659,6 +948,14 @@ Remember:
   _deps.stmts.agentSessions.updateStatus.run('max_steps_reached', sessionId);
   _deps.broadcast('agent:loop:complete', { session_id: sessionId, steps: maxSteps, summary: 'Max steps reached', tokens: totalTokens });
 
+  writeSessionMemory(session, 'max_steps_reached', `Stopped after ${maxSteps} steps without a final summary.`);
+  // Phase 1 capture: terminal turn (max steps)
+  captureLearningEvent(session, {
+    type: 'turn_terminal',
+    outcome: 'max_steps_reached',
+    terminalVersion: terminalVersionFor('max_steps', maxSteps),
+    payload: { steps: maxSteps, tokens: totalTokens },
+  });
   return {
     completed: false,
     reason: 'max_steps_reached',
@@ -1020,7 +1317,7 @@ router.post('/agent/read', authMiddleware, apiLimiter, async (req, res) => {
 router.get('/agent/workspace', authMiddleware, (req, res) => {
   try {
     const { scope = 'sandbox', depth = 3 } = req.query;
-    const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
     function walk(dir, currentDepth, maxDepth) {
       const items = [];
       try {
@@ -1028,7 +1325,8 @@ router.get('/agent/workspace', authMiddleware, (req, res) => {
         for (const entry of entries) {
           if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue;
           const full = path.join(dir, entry.name);
-          const rel = path.relative(base, full);
+          const rel = path.relative(realBase, full);
+          if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
           if (entry.isDirectory() && currentDepth < maxDepth) {
             items.push({ name: entry.name, path: rel, type: 'dir' });
             if (!['node_modules', '.git', 'dist', 'build', '__pycache__'].includes(entry.name)) {
@@ -1041,7 +1339,7 @@ router.get('/agent/workspace', authMiddleware, (req, res) => {
       } catch {}
       return items;
     }
-    const tree = walk(base, 0, parseInt(depth));
+    const tree = walk(realBase, 0, parseInt(depth));
     res.json(tree);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1085,22 +1383,53 @@ router.post('/agent/write', authMiddleware, apiLimiter, async (req, res) => {
   }
 });
 
-// POST /api/agent/approve — approve a pending action (suggest mode)
+// POST /api/agent/approve — approve a pending action (suggest mode).
+// The gated tool call executes HERE, after approval — never before.
+// The result is recorded on the action so a resumed loop sees what happened.
 router.post('/agent/approve', authMiddleware, apiLimiter, async (req, res) => {
   try {
-    const { action_id, scope = 'sandbox' } = req.body;
+    const { action_id } = req.body;
     if (!action_id) return res.status(400).json({ error: 'action_id required' });
     const action = db.prepare('SELECT * FROM agent_actions WHERE id = ?').get(action_id);
     if (!action) return res.status(404).json({ error: 'Action not found' });
     if (action.status !== 'pending') return res.status(400).json({ error: 'Action already processed' });
 
-    const resolved = resolveSandboxPath(scope, action.target);
-    const fs = await import('fs');
-    await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
-    await fs.promises.writeFile(resolved, action.content || '', 'utf-8');
-    stmts.agentActions.updateStatus.run('approved', req.user.id, action_id);
-    broadcast('agent:action', { type: 'approved', action_id, path: action.target });
-    res.json({ action: 'approved', path: action.target, action_id });
+    const session = action.session_id ? stmts.agentSessions.getById.get(action.session_id) : null;
+    if (session && session.user_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Recover the gated tool call. New pending actions store { tool, args };
+    // legacy 'write' drafts stored raw file content.
+    const GATED_TOOLS = ['file_write', 'shell_exec', 'git_op', 'gmail_send'];
+    let toolName = null;
+    let toolArgs = {};
+    try {
+      const parsed = JSON.parse(action.content || '');
+      if (parsed && GATED_TOOLS.includes(parsed.tool)) { toolName = parsed.tool; toolArgs = parsed.args || {}; }
+    } catch {}
+    if (!toolName && action.action_type === 'write') {
+      toolName = 'file_write';
+      toolArgs = { path: action.target, content: action.content || '' };
+    }
+    if (!toolName) return res.status(400).json({ error: 'Cannot determine gated tool for this action' });
+
+    const result = await executeAgentTool(toolName, toolArgs, {
+      scope: session?.scope || 'sandbox',
+      sessionId: session?.id,
+      userId: req.user.id,
+      role: req.user.role,
+      // M5: this call was approved by a human via this endpoint — lets
+      // gated tools (e.g. gmail_send) treat the approval as satisfying
+      // their confirmation gate instead of creating another pending action.
+      humanApproved: true,
+    });
+    const status = result.error ? 'failed' : 'approved';
+    stmts.agentActions.updateResult.run(JSON.stringify(result).slice(0, 5000), status, action_id);
+    stmts.agentActions.updateStatus.run(status, req.user.id, action_id);
+    broadcast('agent:action', { type: status, action_id, tool: toolName, session_id: session?.id });
+    logger.info(`Agent action ${action_id} ${status} by ${req.user.id}: ${toolName}`);
+    res.json({ action: status, tool: toolName, action_id, error: result.error || undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1115,31 +1444,34 @@ router.post('/agent/reject', authMiddleware, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/agent/exec — execute a shell command (agent mode only)
+// POST /api/agent/exec — execute a command (admin only). Same restricted
+// agent allowlist (interpreters/network removed) + shell-free execution as
+// the shell_exec tool (see runAgentCommand).
 router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   try {
     const { command, scope = 'sandbox', session_id, cwd } = req.body;
     if (!command) return res.status(400).json({ error: 'command required' });
-    if (!isCmdSafe(command)) return res.status(403).json({ error: 'Command blocked by safety filter' });
-    // execSync is injected by the skill runtime
+    const check = sanitizeAgentCommand(command);
+    if (!check.safe) return res.status(403).json({ error: `Command blocked by agent safety filter: ${check.error}` });
     const workDir = scope === 'home' ? HOME_DIR : resolveSandboxPath(scope, cwd || '.');
     const actionId = randomUUID();
     const sessionId = (session_id && stmts.agentSessions.getById.get(session_id)) ? session_id : null;
     const stepIdx = sessionId ? (stmts.agentActions.getBySession.all(sessionId).length) : 0;
 
     try {
-      const stdout = execSync(command, {
-        timeout: 30000,
-        maxBuffer: 1024 * 100,
-        cwd: workDir,
-        encoding: 'utf-8',
-      });
-      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, stdout.slice(0, 5000), 'completed', 'completed');
+      const { mkdirSync } = await import('fs');
+      mkdirSync(workDir, { recursive: true });
+      const result = await runAgentCommand(command, workDir, scope);
+      if (result.error) {
+        stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', result.error.slice(0, 2000), 'failed');
+        return res.json({ exitCode: 1, stdout: '', stderr: result.error.slice(0, 2000), action_id: actionId });
+      }
+      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, result.stdout.slice(0, 5000), 'completed', 'completed');
       broadcast('agent:action', { type: 'exec', command, session_id: sessionId, action_id: actionId });
-      res.json({ exitCode: 0, stdout: stdout.slice(0, 5000), stderr: '', action_id: actionId });
+      res.json({ exitCode: result.exitCode, stdout: result.stdout.slice(0, 5000), stderr: result.stderr.slice(0, 2000), action_id: actionId });
     } catch (e) {
-      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || '').slice(0, 2000), 'failed', 'failed');
-      res.json({ exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || '').toString().slice(0, 2000), action_id: actionId });
+      stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', (e.stderr || e.message || '').toString().slice(0, 2000), 'failed');
+      res.json({ exitCode: e.status || 1, stdout: (e.stdout || '').toString().slice(0, 5000), stderr: (e.stderr || e.message).toString().slice(0, 2000), action_id: actionId });
     }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1287,4 +1619,4 @@ router.get('/agent/tools', authMiddleware, (_req, res) => {
   return router;
 }
 
-export { callAgentLLM, callAgentLLMWithRetry, agentTools, runAgentLoop };
+export { callAgentLLM, callAgentLLMWithRetry, agentTools, runAgentLoop, registerAgentTool };

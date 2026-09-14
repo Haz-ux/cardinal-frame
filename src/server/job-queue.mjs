@@ -15,16 +15,22 @@
  * Usage:
  *   import { createJobQueue } from './job-queue.mjs';
  *   const queue = createJobQueue(db, { concurrency: 5 });
- *   await queue.enqueue({ type: 'dag', dagId: '...', layers: [...] });
+ *   await queue.enqueue('dag', { dagId: '...', nodes: [...], edges: [...] });
  *   queue.start(); // begins processing + resumes incomplete jobs
  *   await queue.stop(); // waits for current jobs, persists state
+ *
+ * NOTE (M2): there is intentionally NO default `task` handler. A previous
+ * revision executed raw command strings with an explicit shell; it was
+ * deleted rather than sanitized because only 'dag' jobs are ever enqueued
+ * (see routes/tasks.mjs). Enqueueing 'task' without registering a handler
+ * dead-letters the job immediately with dead_reason='no_handler' (no retry
+ * burn — see processJob). If you need a raw command job, register an explicit
+ * handler that routes through sanitizeCommand + spawnArgv (shell:false) from
+ * command-safety.mjs.
  */
 
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { runDag } from './dag-run.mjs';
 
 export function createJobQueue(db, opts = {}) {
   const {
@@ -34,13 +40,19 @@ export function createJobQueue(db, opts = {}) {
     baseDelay = 1000,     // 1s, 2s, 4s, 8s...
     maxDelay = 30000,     // cap at 30s
   } = opts;
+  // Allowlist gate for shell steps; provided via opts or setSanitizeCommand().
+  // `let` (not destructured const) so the setter below can replace it.
+  let sanitizeCommand = opts.sanitizeCommand || null;
 
   // ─── Schema ───────────────────────────────────────────────────────
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,              -- 'dag' | 'chain' | 'task' | 'agent'
+      type TEXT NOT NULL,              -- 'dag' (default handler) | custom types
+                                     -- via registerHandler(). NOTE: there is
+                                     -- NO default 'task' handler (see M2 note
+                                     -- above the handlers registry).
       payload TEXT NOT NULL,           -- JSON: { dagId, layers, sessionId, ... }
       status TEXT NOT NULL DEFAULT 'pending',  -- pending | running | completed | failed | dead
       priority INTEGER DEFAULT 0,      -- higher = first
@@ -51,6 +63,9 @@ export function createJobQueue(db, opts = {}) {
       started_at TEXT,
       completed_at TEXT,
       last_error TEXT,
+      dead_reason TEXT,                -- set when status -> 'dead': 'no_handler'
+                                       -- (no handler registered for the job type)
+                                       -- | 'max_retries_exceeded'
       result TEXT,                     -- JSON result on success
       trace_id TEXT,                   -- for observability (Phase 2.3)
       created_at TEXT DEFAULT (datetime('now')),
@@ -76,6 +91,19 @@ export function createJobQueue(db, opts = {}) {
 
     CREATE INDEX IF NOT EXISTS idx_job_steps_job ON job_steps(job_id, step_index);
   `);
+
+  // Schema patch for databases created before the dead_reason column existed
+  // (fix-up 2, 2026-09-13). Fresh installs get the column from the CREATE
+  // TABLE above; this covers pre-existing DBs. Done here instead of as a
+  // numbered migration because the migrator runs BEFORE this module creates
+  // the jobs table — on a fresh install there is no jobs table for a
+  // migration to ALTER yet, and ALTER ... ADD COLUMN cannot be conditional.
+  // Idempotent: only runs when the column is absent.
+  const hasDeadReason = db.prepare(`PRAGMA table_info(jobs)`).all()
+    .some((c) => c.name === 'dead_reason');
+  if (!hasDeadReason) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN dead_reason TEXT`);
+  }
 
   // ─── Prepared statements ─────────────────────────────────────────
 
@@ -103,6 +131,20 @@ export function createJobQueue(db, opts = {}) {
       SELECT * FROM jobs WHERE status = 'pending'
         AND (scheduled_at IS NULL OR scheduled_at <= datetime('now'))
       ORDER BY priority DESC, scheduled_at ASC LIMIT 1
+    `),
+    // Dead-letter for unknown job types: immediate 'dead', no retry burn.
+    // (See processJob: the fail() retry path never fires here because
+    // attempts is not incremented on this path, which used to leave the job
+    // sitting in 'pending' forever.)
+    noHandlerDead: db.prepare(`
+      UPDATE jobs SET status = 'dead', dead_reason = 'no_handler',
+        last_error = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `),
+    // Records WHY a known-type job went dead (always 'max_retries_exceeded').
+    setDeadReason: db.prepare(`
+      UPDATE jobs SET dead_reason = ?, updated_at = datetime('now')
+      WHERE id = ?
     `),
     getRunning: db.prepare(`SELECT * FROM jobs WHERE status = 'running'`),
     getById: db.prepare(`SELECT * FROM jobs WHERE id = ?`),
@@ -140,12 +182,34 @@ export function createJobQueue(db, opts = {}) {
     handlers.set(type, fn);
   }
 
-  // Default DAG handler
+  // Default DAG handler — runs through the shared executor (src/server/dag-run.mjs)
+  // so node types, data flow, and the sanitizeCommand allowlist apply here too.
   registerHandler('dag', async (job, ctx) => {
     const { payload, id: jobId } = job;
-    const { dagId, layers, nodes } = JSON.parse(payload);
+    const { dagId, nodes, edges, policyActor } = JSON.parse(payload);
     const { db, broadcast } = ctx;
-    const steps = [];
+
+    // P1.8: DAGs cannot bypass the policy layer. The runner's principal is
+    // carried on the job; every node's capability is decided before execution.
+    let policyDecide = null;
+    let CAPABILITIES = null;
+    try {
+      const policyMod = await import('./defense/policy.mjs');
+      policyDecide = policyMod.decide;
+      CAPABILITIES = policyMod.CAPABILITIES;
+    } catch {}
+    const policyGate = async (subject) => {
+      if (!policyDecide) return { allowed: true };
+      const capability = subject.nodeType === 'task' ? CAPABILITIES.PROCESS_EXECUTION : CAPABILITIES.CODE_EXECUTION;
+      const decision = await policyDecide({
+        actor: policyActor || { id: 'dag', role: 'system' },
+        capability,
+        resource: `${subject.nodeType}:${subject.node?.id}`,
+        scope: 'system',
+        provenance: 'user',
+      });
+      return decision;
+    };
 
     // Prepared statement to update DAG status in the dags table
     // (wrapped in try — the dags table may not exist in isolated queue tests)
@@ -154,40 +218,47 @@ export function createJobQueue(db, opts = {}) {
       updateDagStatus = db.prepare('UPDATE dags SET status = ?, last_run_result = ? WHERE id = ?');
     } catch {}
 
+    // Per-step records, keyed so onNodeStart/onNodeDone can pair them.
+    const stepIds = new Map();
+    let stepCounter = 0;
+
     try {
-      for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
-        const layer = layers[layerIdx];
-        const layerResults = await Promise.all(layer.map(async (nodeId, nodeIdx) => {
-          const node = nodes.find(n => n.id === nodeId);
-          if (!node || !node.command) return { nodeId, status: 'skipped' };
+      const { layers, layerResults, finalOutput } = await runDag({
+        nodes,
+        edges: edges || [], // tolerate jobs enqueued before edges were stored
+        sanitizeCommand,
+        broadcast,
+        policyGate,
+        dagId,
+        timeoutMs: job.timeout_ms,
+        events: {
+          onNodeStart(nodeId) {
+            const stepId = randomUUID();
+            stepIds.set(nodeId, stepId);
+            const node = (nodes || []).find((n) => n.id === nodeId);
+            stmts.insertStep.run(stepId, jobId, stepCounter++, 'node',
+              JSON.stringify({ nodeId, type: node ? node.type || 'task' : 'task', command: node ? node.command : undefined }));
+            stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
+          },
+          onNodeDone(nodeId, result) {
+            const stepId = stepIds.get(nodeId);
+            if (!stepId) return;
+            const ok = result.status === 'success';
+            stmts.updateStep.run(
+              ok ? 'completed' : result.status === 'skipped' ? 'completed' : 'failed',
+              new Date().toISOString(), new Date().toISOString(),
+              JSON.stringify(result), result.error || result.reason || null, stepId
+            );
+          },
+          onLayerDone(layerIdx) {
+            broadcast?.('dag:layer', { id: dagId, layer: layerIdx, completed: true });
+          },
+        },
+      });
 
-          const stepId = randomUUID();
-          stmts.insertStep.run(stepId, jobId, layerIdx * 100 + nodeIdx, 'node', JSON.stringify({ nodeId, command: node.command }));
-          stmts.updateStep.run('running', new Date().toISOString(), null, null, null, stepId);
-
-          try {
-            const start = Date.now();
-            const { stdout } = await execAsync(node.command, {
-              timeout: job.timeout_ms,
-              shell: '/bin/sh',
-              env: { PATH: process.env.PATH },
-              cwd: '/tmp',
-            });
-            const durationMs = Date.now() - start;
-            const result = { nodeId, nodeName: node.name, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs };
-            stmts.updateStep.run('completed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), null, stepId);
-            return result;
-          } catch (err) {
-            const result = { nodeId, nodeName: node.name, status: 'failed', exitCode: err.code ?? 1, error: (err.stderr || err.message).slice(0, 500), durationMs: 0 };
-            stmts.updateStep.run('failed', new Date().toISOString(), new Date().toISOString(), JSON.stringify(result), err.message, stepId);
-            return result;
-          }
-        }));
-        steps.push({ layer: layerIdx, results: layerResults });
-      }
-
+      const steps = layerResults;
       // Update dags table + broadcast dag:status so the UI's WS subscription can react
-      const result = { steps, totalLayers: layers.length, completedAt: new Date().toISOString() };
+      const result = { steps, totalLayers: layers.length, completedAt: new Date().toISOString(), finalOutput };
       try { updateDagStatus.run('completed', JSON.stringify(result), dagId); } catch {} // dags table may not exist in isolated queue tests
       broadcast?.('dag:status', { id: dagId, status: 'completed', steps });
 
@@ -199,17 +270,12 @@ export function createJobQueue(db, opts = {}) {
     }
   });
 
-  // Default task handler
-  registerHandler('task', async (job) => {
-    const { command } = JSON.parse(job.payload);
-    const { stdout } = await execAsync(command, {
-      timeout: job.timeout_ms,
-      shell: '/bin/sh',
-      env: { PATH: process.env.PATH },
-      cwd: '/tmp',
-    });
-    return { exitCode: 0, output: stdout.trim().slice(0, 2000) };
-  });
+  // M2: the default `task` handler was deliberately REMOVED (audit 2026-09-13).
+  // It executed raw command strings with an explicit /bin/sh and no
+  // sanitization — a loaded footgun, and unreachable: only 'dag' jobs are
+  // ever enqueued (routes/tasks.mjs is the sole enqueue call site). Do NOT
+  // re-add a raw-string handler; register an explicit handler that routes
+  // through sanitizeCommand + spawnArgv (shell:false) instead.
 
   // ─── Queue logic ──────────────────────────────────────────────────
 
@@ -221,6 +287,7 @@ export function createJobQueue(db, opts = {}) {
 
   function setBroadcast(fn) { broadcast = fn; }
   function setLogger(l) { logger = l; }
+  function setSanitizeCommand(fn) { sanitizeCommand = fn; }
 
   function computeBackoff(attempts) {
     const delay = Math.min(baseDelay * Math.pow(2, attempts - 1), maxDelay);
@@ -230,7 +297,14 @@ export function createJobQueue(db, opts = {}) {
   async function processJob(job) {
     const handler = handlers.get(job.type);
     if (!handler) {
-      stmts.fail.run(`No handler for job type: ${job.type}`, computeBackoff(job.attempts || 1), job.id);
+      // Dead-letter IMMEDIATELY on first pass — unknown types have no handler
+      // now and never will, so burning max_retries attempts on exponential
+      // backoff is just queue churn. Deterministic: every unhandled job lands
+      // in 'dead' with dead_reason='no_handler' on its first pickup.
+      const err = `No handler for job type: ${job.type}`;
+      stmts.noHandlerDead.run(err, job.id);
+      broadcast?.('job:dead', { id: job.id, type: job.type, deadReason: 'no_handler', error: err });
+      logger?.warn?.(`Job ${job.id} (${job.type}) dead-lettered: no handler registered`);
       return;
     }
 
@@ -256,6 +330,8 @@ export function createJobQueue(db, opts = {}) {
       stmts.fail.run(err.message.slice(0, 500), backoff, job.id);
 
       if (job.attempts >= job.max_retries) {
+        // Terminal: record WHY it died so dead-letter inspection is one query.
+        stmts.setDeadReason.run('max_retries_exceeded', job.id);
         broadcast?.('job:dead', { id: job.id, type: job.type, error: err.message, attempts: job.attempts });
         logger?.error?.(`Job ${job.id} (${job.type}) permanently failed after ${job.attempts} attempts: ${err.message}`);
       } else {
@@ -349,6 +425,7 @@ export function createJobQueue(db, opts = {}) {
     registerHandler,
     setBroadcast,
     setLogger,
+    setSanitizeCommand,
     getStatus,
     getJob,
     getDeadJobs,

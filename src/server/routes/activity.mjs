@@ -7,14 +7,14 @@ import { randomUUID } from 'crypto';
  * Maintains an in-memory ring buffer of recent broadcast events
  * plus a DB-backed persistent log for historical queries.
  *
- * Dependencies: db, optionalAuth, apiLimiter
+ * Dependencies: db, authMiddleware, apiLimiter
  *
  * Endpoints:
  *   GET /api/activity      — recent events (query: limit, type, since)
  *   GET /api/activity/stats — event counts by type
  */
 export default function activityRoutes(ctx) {
-  const { db, optionalAuth, apiLimiter } = ctx;
+  const { db, authMiddleware, apiLimiter } = ctx;
   const router = express.Router();
 
   // ─── Schema ───────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ export default function activityRoutes(ctx) {
 
   // ─── Routes ────────────────────────────────────────────────────────
 
-  router.get('/activity', optionalAuth, (req, res) => {
+  router.get('/activity', authMiddleware, (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const type = req.query.type;
     const since = req.query.since;
@@ -99,7 +99,7 @@ export default function activityRoutes(ctx) {
     })));
   });
 
-  router.get('/activity/stats', optionalAuth, (_req, res) => {
+  router.get('/activity/stats', authMiddleware, (_req, res) => {
     res.json(stmts.getStats.all());
   });
 

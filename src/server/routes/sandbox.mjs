@@ -2,37 +2,60 @@
  * sandbox.mjs — Restricted VM sandbox for executing user-supplied skill handlers.
  *
  * Replaces `new Function()` and `eval()` with `vm.runInNewContext()` so that
- * untrusted skill code cannot access `process`, `require`, `module`,
- * `__dirname`, `globalThis`, or other Node primitives.
+ * skill code doesn't get Node primitives by default.
+ *
+ * HONEST SCOPE: Node's own docs state the `vm` module is NOT a security
+ * mechanism. This sandbox is defense-in-depth against accidents, not a
+ * containment boundary for hostile code. The real trust boundary is
+ * authorship: creating or installing a skill requires admin, and skill code
+ * runs with the trust of whoever authored it. Secrets are only exposed to
+ * skill code on that basis — never grant secrets to skills you wouldn't
+ * hand your API keys to directly.
+ *
+ * Network egress gate: `fetch` and the curl/wget exec binaries are denied
+ * unless the skill row has `network_access = 1` (granted by an admin).
+ * Pass `allowNetwork: true` to runSandboxed/runSandboxedHybrid to open it.
  *
  * Provides:
  *   - `execSync`: restricted shell exec with an allowlist
- *   - `fetch`: passthrough to global fetch (no mutation capability)
+ *   - `fetch`: routed through safeFetch (SSRF-guarded HTTP client — can POST;
+ *     skill code is trusted as its author, see above)
  *   - `llmCall`: async callback for hybrid skills (only when explicitly provided)
  *   - JSON.stringify / JSON.parse for data manipulation
  *   - console.log for debugging (writes to a captured array)
  *
  * Security:
  *   - No `process`, `require`, `module`, `exports`, `__dirname`, `__filename`
+ *     in the VM context by default
  *   - No access to the outer lexical scope (code runs in an isolated V8 context)
  *   - Timeout: 30s default (configurable)
- *   - execSync allowlist: only known-safe binaries; blocks rm, kill, pkill,
- *     shutdown, reboot, dd, mkfs, fdisk, chmod 777, curl to file, etc.
+ *   - execSync allowlist: read-only inspection tools only. Interpreters
+ *     (node/python/npm) are deliberately excluded — spawning one would hand
+ *     skill code an unsandboxed process with full `require`/`process`.
+ *   - execSync rejects shell metacharacters (`$`, backticks, `;|&><`, …) on
+ *     the whole command string before execution: the first-token allowlist
+ *     alone does not stop `echo $(touch /tmp/pwned)` from expanding.
+ *   - Blocks rm -rf /, disk writes, kill -9, reverse shells, etc.
  */
 
 import vm from 'node:vm';
 import { execSync as _execSync } from 'node:child_process';
+import { hasShellMetachars } from '../command-safety.mjs';
+import { safeFetch } from '../safe-fetch.mjs';
 
 // ─── execSync allowlist ────────────────────────────────────────────────────
-// Read-only inspection tools only. No mutating/privilege-escalating binaries.
+// Read-only inspection tools only. Deliberately EXCLUDED:
+//   - interpreters (node, python3, npm, npx, uv): spawning one escapes the VM
+//     with a full unsandboxed process (process/require/fs)
+//   - mutating binaries (mkdir, cp, mv): the sandbox policy is read-only
+//   - privilege/destructive tools: covered by the blocklist below
 const EXEC_ALLOWLIST = new Set([
   'echo', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'uptime', 'who', 'last',
   'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'sort', 'uniq',
   'jq', 'xq', 'yq', 'tree', 'file', 'stat', 'du', 'df', 'find', 'ps', 'pgrep',
   'ss', 'netstat', 'arp', 'ip', 'ifconfig', 'ping',
-  'git', 'node', 'npm', 'npx', 'uv', 'python3', 'python',
+  'git',
   'curl', 'wget',
-  'mkdir', 'cp', 'mv',
 ]);
 
 // Commands that are always blocked even if the binary is in the allowlist
@@ -52,11 +75,25 @@ const EXEC_BLOCKLIST = [
 
 const EXEC_TIMEOUT_MS = 10_000;
 
-function createRestrictedExecSync() {
+// Binaries that can move data off-host. They are only usable when the skill
+// was granted network access via the network egress gate (network_access = 1
+// on the skill row). Everything else in the allowlist is read-only.
+const NETWORK_BINARIES = new Set(['curl', 'wget']);
+
+function createRestrictedExecSync({ allowNetwork = false } = {}) {
   return (cmd, opts = {}) => {
     if (typeof cmd !== 'string') throw new Error('execSync: command must be a string');
 
-    // Check blocklist first
+    // M4: reject shell metacharacters BEFORE anything else. The first-token
+    // allowlist is not sufficient on its own: `echo $(touch /tmp/pwned)` and
+    // backticks expand in the shell even when the binary is allowlisted, so
+    // the whole command is rejected (same posture as sanitizeCommand).
+    if (hasShellMetachars(cmd)) {
+      throw new Error('execSync: shell metacharacters are not allowed');
+    }
+
+    // Then check the pattern blocklist (defense-in-depth for patterns the
+    // metachar filter doesn't cover, e.g. plain `rm -rf /`)
     for (const blocked of EXEC_BLOCKLIST) {
       if (blocked.test(cmd)) {
         throw new Error(`execSync: blocked command pattern matched`);
@@ -65,6 +102,11 @@ function createRestrictedExecSync() {
 
     // Extract binary name (first token, handle simple quoting)
     const binary = cmd.trim().split(/[\s|&;]+/)[0].replace(/^['"]|['"]$/g, '');
+
+    // Network egress gate: curl/wget need the skill's network_access grant
+    if (!allowNetwork && NETWORK_BINARIES.has(binary)) {
+      throw new Error(`execSync: "${binary}" requires network access — grant it on the skill to enable`);
+    }
 
     // Git subcommands: validate the git subcommand too
     if (binary === 'git') {
@@ -99,9 +141,13 @@ function createRestrictedExecSync() {
  * @param {*}      opts.input        — input argument for the skill
  * @param {Function} [opts.llmCall]  — optional async LLM call for hybrid skills
  * @param {number} [opts.timeoutMs]   — timeout in ms (default 30000)
+ * @param {Object} [opts.secrets]     — secrets exposed as `secrets` in the sandbox
+ * @param {boolean} [opts.allowNetwork] — network egress gate: when false (default),
+ *   `fetch` throws and curl/wget are blocked in execSync. Grant per skill via
+ *   the skill's `network_access` flag.
  * @returns {Promise<*>}               — the result of the executed code
  */
-export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000, secrets = {} }) {
+export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30_000, secrets = {}, allowNetwork = false }) {
   const logs = [];
 
   const sandbox = {
@@ -118,10 +164,15 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
     Promise,
 
     // Restricted execSync
-    execSync: createRestrictedExecSync(),
+    execSync: createRestrictedExecSync({ allowNetwork }),
 
-    // Read-only fetch passthrough (bound to global, no response mutation)
-    fetch: (...args) => globalThis.fetch(...args),
+    // fetch: L3 — routed through safeFetch as defense-in-depth (blocks
+    // link-local/metadata hosts like 169.254.169.254 and re-validates
+    // redirects). The network_access gate is unchanged: when closed, fetch
+    // throws; when open, skill code is trusted as its author anyway.
+    fetch: allowNetwork
+      ? (...args) => safeFetch(args[0], args[1])
+      : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
 
     // Secrets — only keys explicitly passed by the caller (never process.env directly)
     secrets,
@@ -190,7 +241,7 @@ export async function runSandboxed({ code, input, llmCall = null, timeoutMs = 30
  * Hybrid handlers are raw JS code (not a function expression) so we wrap
  * them in an async IIFE before running.
  */
-export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000, secrets = {} }) {
+export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_000, secrets = {}, allowNetwork = false }) {
   const logs = [];
 
   const sandbox = {
@@ -200,8 +251,11 @@ export async function runSandboxedHybrid({ code, input, llmCall, timeoutMs = 30_
     RegExp,
     encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
     Promise,
-    execSync: createRestrictedExecSync(),
-    fetch: (...args) => globalThis.fetch(...args),
+    execSync: createRestrictedExecSync({ allowNetwork }),
+    // L3: same safeFetch routing as runSandboxed above.
+    fetch: allowNetwork
+      ? (...args) => safeFetch(args[0], args[1])
+      : () => { throw new Error('fetch: network access denied for this skill — grant network access on the skill to enable'); },
     secrets,
     input,
     llmCall,

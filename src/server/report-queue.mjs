@@ -35,6 +35,8 @@ const FLUSH_POLL_MS = 5000;
 export function createReportQueue(db, opts = {}) {
   const {
     getCoordinatorUrl,
+    // Intentional direct fetch: the coordinator is a LAN peer (same reasoning as
+    // node-registry.mjs — safeFetch's private-IP block would break federation delivery).
     fetchFn = globalThis.fetch,
     logger = console,
   } = opts;

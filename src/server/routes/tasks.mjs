@@ -1,14 +1,25 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
 import path from 'path';
 import multer from 'multer';
 import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
+import { topoSortLayers, runDag } from '../dag-run.mjs';
+import { decide as policyDecide, CAPABILITIES } from '../defense/policy.mjs';
 
 /**
  * Task + DAG + File routes
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand
  */
+/**
+ * L4: sanitize a reflected download filename for Content-Disposition —
+ * basename plus stripping quotes, backslashes and line breaks so it
+ * cannot break out of the header value. Same treatment as
+ * chat-conversations.mjs.
+ */
+export function sanitizeDownloadFilename(name) {
+  return path.basename(String(name || 'download')).replace(/["\\\r\n]/g, '');
+}
+
 export default function taskRoutes(ctx) {
   const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand, fireHook } = ctx;
   const router = express.Router();
@@ -168,7 +179,7 @@ router.get('/agents/:id/tasks', optionalAuth, (req, res) => {
 });
 
 // ─── Task CRUD + Execution ─────────────────────────────────────────
-router.post('/tasks', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
 const { name, command, dependsOn } = req.body;
 if (!name || !command) return res.status(400).json({ error: 'Name and command are required' });
 const check = sanitizeCommand(command);
@@ -199,7 +210,7 @@ audit('create', 'task', id, req.user?.id, { name, command });
 res.status(201).json({ ...task, dependsOn: deps });
 });
 
-router.get('/tasks', optionalAuth, (req, res) => {
+router.get('/tasks', authMiddleware, (req, res) => {
  let tasks = stmts.tasks.getAll.all();
  const { status, search } = req.query;
  if (status) tasks = tasks.filter(t => t.status === status);
@@ -214,7 +225,7 @@ router.get('/tasks', optionalAuth, (req, res) => {
  res.json(tasksWithDeps);
 });
 
-router.get('/tasks/:id', optionalAuth, (req, res) => {
+router.get('/tasks/:id', authMiddleware, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   const deps = stmts.deps.getByTask.all(req.params.id).map(d => d.depends_on_task_id);
@@ -222,7 +233,7 @@ router.get('/tasks/:id', optionalAuth, (req, res) => {
 });
 
 // Get full dependency chain for a task (recursively resolves all transitive deps)
-router.get('/tasks/:id/dependencies', optionalAuth, (req, res) => {
+router.get('/tasks/:id/dependencies', authMiddleware, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
@@ -252,7 +263,7 @@ router.get('/tasks/:id/logs', optionalAuth, (req, res) => {
   res.json(stmts.logs.getByTask.all(req.params.id));
 });
 
-router.patch('/tasks/:id/execute', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/execute', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status === 'running') return res.status(409).json({ error: 'Task already running' });
@@ -275,7 +286,7 @@ router.patch('/tasks/:id/execute', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Cancel a running task
-router.patch('/tasks/:id/cancel', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/cancel', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status !== 'running') return res.status(409).json({ error: 'Only running tasks can be cancelled' });
@@ -287,7 +298,7 @@ router.patch('/tasks/:id/cancel', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Retry a failed/cancelled/done task — resets to pending and re-executes
-router.post('/tasks/:id/retry', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks/:id/retry', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   if (task.status === 'running') return res.status(409).json({ error: 'Cannot retry a running task' });
@@ -303,7 +314,7 @@ router.post('/tasks/:id/retry', authMiddleware, apiLimiter, (req, res) => {
 });
 
 // Assign task to agent
-router.patch('/tasks/:id/assign', authMiddleware, apiLimiter, (req, res) => {
+router.patch('/tasks/:id/assign', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const { agentId } = req.body;
   const task = stmts.tasks.getById.get(req.params.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
@@ -373,40 +384,8 @@ router.delete('/dags/:id', authMiddleware, (req, res) => {
 });
 
 // ─── DAG Execution with Parallel Fan-Out ───────────────────────────
-function topoSortLayers(nodes, edges) {
-  // Returns array of layers — each layer is an array of node IDs that can run in parallel
-  const inDeg = new Map();
-  const adj = new Map();
-  for (const n of nodes) {
-    inDeg.set(n.id, 0);
-    adj.set(n.id, []);
-  }
-  for (const e of edges) {
-    if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
-    if (!adj.has(e.source) || !adj.has(e.target)) continue;
-    adj.get(e.source).push(e.target);
-    inDeg.set(e.target, (inDeg.get(e.target) || 0) + 1);
-  }
-  const layers = [];
-  let current = [];
-  for (const [id, deg] of inDeg) if (deg === 0) current.push(id);
-
-  while (current.length) {
-    layers.push([...current]);
-    const next = [];
-    for (const cur of current) {
-      for (const nxt of adj.get(cur) || []) {
-        inDeg.set(nxt, inDeg.get(nxt) - 1);
-        if (inDeg.get(nxt) === 0) next.push(nxt);
-      }
-    }
-    current = next;
-  }
-
-  const totalSorted = layers.reduce((s, l) => s + l.length, 0);
-  if (totalSorted !== nodes.length) throw new Error('Cycle detected in DAG');
-  return layers;
-}
+// Node execution lives in the shared module (src/server/dag-run.mjs), used by
+// both the queue's `dag` handler and the in-process fallback below.
 
 router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
   const dag = stmts.dags.getById.get(req.params.id);
@@ -428,59 +407,51 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
         dagName: dag.name,
         layers: layers.map(layer => layer),
         nodes,
+        edges,
+        // P1.8: carry the runner's principal so the durable queue's handler
+        // can apply the same policy gate as the in-process fallback.
+        policyActor: { id: req.user.id, role: req.user.role },
       }, { priority: 5, traceId: `dag:${req.params.id}` });
 
       // Listen for completion via broadcast (the queue broadcasts job:completed)
       // The queue handler will update the DAG status and broadcast results
       res.json({ dagId: dag.id, jobId, status: 'running', layers: layers.length, totalNodes: nodes.length });
     } else {
-      // Fallback: in-process execution (for tests / no-queue mode)
-      const steps = [];
-      let currentLayer = 0;
-
-      const runLayer = () => {
-        if (currentLayer >= layers.length) {
-          const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layers.length, completedAt: new Date().toISOString() });
-          stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
-          broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
-          logger.info(`DAG completed: ${dag.name} (${dag.id})`);
-          return;
-        }
-
-        const layer = layers[currentLayer];
-        const layerPromises = layer.map(nodeId => new Promise((resolve) => {
-          const node = nodes.find((n) => n.id === nodeId);
-          if (!node || !node.command) {
-            steps.push({ nodeId, nodeName: node?.name || nodeId, status: 'skipped', durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-            resolve();
-            return;
-          }
-          const check = sanitizeCommand(node.command);
-          if (!check.safe) {
-            steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', error: check.error, durationMs: 0, timestamp: new Date().toISOString(), layer: currentLayer });
-            resolve();
-            return;
-          }
-          const start = Date.now();
-          exec(check.command, { timeout: 30000, shell: '/bin/sh', env: { PATH: process.env.PATH }, cwd: '/tmp' }, (error, stdout, stderr) => {
-            const durationMs = Date.now() - start;
-            if (error) {
-              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'failed', exitCode: error.killed ? -1 : (error.code ?? 1), output: (stderr || error.message).slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
-            } else {
-              steps.push({ nodeId, nodeName: node.name || nodeId, status: 'success', exitCode: 0, output: stdout.trim().slice(0, 500), durationMs, timestamp: new Date().toISOString(), layer: currentLayer });
-            }
-            resolve();
-          });
-        }));
-
-        Promise.all(layerPromises).then(() => {
-          broadcast('dag:layer', { id: req.params.id, layer: currentLayer, completed: true });
-          currentLayer++;
-          runLayer();
+      // Fallback: in-process execution (for tests / no-queue mode) via the
+      // shared executor — same node types, data flow, and sanitizer as the queue.
+      // P1.8: policy gate at node execution — a DAG cannot bypass authorization.
+      const policyGate = async (subject) => {
+        const capability = subject.nodeType === 'task' ? CAPABILITIES.PROCESS_EXECUTION : CAPABILITIES.CODE_EXECUTION;
+        const decision = await policyDecide({
+          actor: { id: req.user.id, role: req.user.role },
+          capability,
+          resource: `dag:${req.params.id}:${subject.node?.id}`,
+          scope: 'system',
+          provenance: 'user',
         });
+        return decision;
       };
-
-      runLayer();
+      runDag({
+        nodes,
+        edges,
+        sanitizeCommand,
+        broadcast,
+        policyGate,
+        dagId: req.params.id,
+        timeoutMs: 30000,
+        events: {
+          onLayerDone: (layerIdx) => broadcast('dag:layer', { id: req.params.id, layer: layerIdx, completed: true }),
+        },
+      }).then(({ layerResults, finalOutput }) => {
+        const steps = layerResults.flatMap((lr) => lr.results);
+        const result = JSON.stringify({ steps, totalNodes: nodes.length, layers: layerResults.length, completedAt: new Date().toISOString(), finalOutput });
+        stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'completed', result, req.params.id);
+        broadcast('dag:status', { id: req.params.id, status: 'completed', steps });
+        logger.info(`DAG completed: ${dag.name} (${dag.id})`);
+      }).catch((runErr) => {
+        stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'failed', JSON.stringify({ error: runErr.message }), req.params.id);
+        broadcast('dag:status', { id: req.params.id, status: 'failed', error: runErr.message });
+      });
       res.json({ dagId: dag.id, status: 'running', layers: layers.length, totalNodes: nodes.length });
     }
   } catch (err) {
@@ -521,7 +492,7 @@ router.get('/files/:id/download', optionalAuth, (req, res) => {
  if (!existsSync(filePath)) return res.status(404).json({ error: 'File data missing on disk' });
 
  res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
- res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`);
+ res.setHeader('Content-Disposition', `attachment; filename="${sanitizeDownloadFilename(file.original_name)}"`);
  createReadStream(filePath).pipe(res);
 });
 
@@ -542,7 +513,7 @@ router.delete('/files/:id', authMiddleware, requireRole('admin'), (req, res) => 
 });
 
 // Add dependencies to a task (POST endpoint — GET already defined above)
-router.post('/tasks/:id/dependencies', authMiddleware, apiLimiter, (req, res) => {
+router.post('/tasks/:id/dependencies', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
  const { dependsOn } = req.body;
  if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
   return res.status(400).json({ error: 'dependsOn must be a non-empty array of task IDs' });
@@ -569,14 +540,14 @@ router.post('/tasks/:id/dependencies', authMiddleware, apiLimiter, (req, res) =>
 });
 
 // Remove a dependency
-router.delete('/tasks/:id/dependencies/:depId', authMiddleware, (req, res) => {
+router.delete('/tasks/:id/dependencies/:depId', authMiddleware, requireRole('admin'), (req, res) => {
  db.prepare('DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?').run(req.params.id, req.params.depId);
  broadcast('task:deps', { taskId: req.params.id, removed: req.params.depId });
  res.json({ removed: true });
 });
 
 // Execute a task chain (task + all its dependencies in topological order)
-router.post('/tasks/:id/execute-chain', authMiddleware, apiLimiter, async (req, res) => {
+router.post('/tasks/:id/execute-chain', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
  const rootTask = stmts.tasks.getById.get(req.params.id);
  if (!rootTask) return res.status(404).json({ error: 'Task not found' });
 

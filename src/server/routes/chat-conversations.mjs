@@ -58,18 +58,29 @@ export default function chatConvRoutes(ctx) {
   router.post('/chat/upload', authMiddleware, apiLimiter, (req, res) => {
     const { filename, mime_type, content_b64, message_id } = req.body;
     if (!filename || !content_b64) return res.status(400).json({ error: 'filename and content_b64 required' });
+    // M2: never trust the client-supplied filename — strip to a bare name
+    // and reject anything that even smells like traversal.
+    const rawName = String(filename);
+    const safeName = path.basename(rawName);
+    if (!safeName || safeName === '.' || safeName === '..' || rawName.includes('..') || /[\\/]/.test(rawName)) {
+      return res.status(400).json({ error: 'invalid filename' });
+    }
     const id = randomUUID();
     const buf = Buffer.from(content_b64, 'base64');
-    const storagePath = path.join(UPLOAD_DIR, `${id}-${filename}`);
+    const storagePath = path.join(UPLOAD_DIR, `${id}-${safeName}`);
+    // Defense in depth: the resolved path must stay inside UPLOAD_DIR.
+    if (!path.resolve(storagePath).startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+      return res.status(400).json({ error: 'invalid filename' });
+    }
     writeFileSync(storagePath, buf);
     const msgId = message_id || null;
     try {
-      stmts.attachments.insert.run(id, msgId, null, filename, mime_type || 'application/octet-stream', buf.length, storagePath);
+      stmts.attachments.insert.run(id, msgId, null, safeName, mime_type || 'application/octet-stream', buf.length, storagePath);
     } catch (e) {
       db.prepare('INSERT INTO chat_attachments (id, filename, mime_type, size, storage_path) VALUES (?, ?, ?, ?, ?)')
-        .run(id, filename, mime_type || 'application/octet-stream', buf.length, storagePath);
+        .run(id, safeName, mime_type || 'application/octet-stream', buf.length, storagePath);
     }
-    res.status(201).json({ id, filename, mime_type: mime_type || 'application/octet-stream', size: buf.length, message_id: msgId });
+    res.status(201).json({ id, filename: safeName, mime_type: mime_type || 'application/octet-stream', size: buf.length, message_id: msgId });
   });
 
   router.get('/chat/attachments/:id', authMiddleware, (req, res) => {
@@ -77,7 +88,10 @@ export default function chatConvRoutes(ctx) {
     if (!att) return res.status(404).json({ error: 'Attachment not found' });
     if (!att.storage_path || !existsSync(att.storage_path)) return res.status(404).json({ error: 'File missing' });
     res.setHeader('Content-Type', att.mime_type);
-    res.setHeader('Content-Disposition', `inline; filename="${att.filename}"`);
+    // L2: sanitize the reflected filename — basename + strip quotes,
+    // backslashes and line breaks so it can't break out of the header.
+    const dlName = path.basename(String(att.filename || 'download')).replace(/["\\\r\n]/g, '');
+    res.setHeader('Content-Disposition', `inline; filename="${dlName}"`);
     res.sendFile(att.storage_path);
   });
 

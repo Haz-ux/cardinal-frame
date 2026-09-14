@@ -2,29 +2,66 @@ import express from 'express';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import { sanitizeCommand } from '../command-safety.mjs';
 
 /**
  * Meta routes: MCP, Groups, Schedules, Plugins, Audit Log
  * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID
  */
+
+// ─── MCP stdio config validation (M3, tightened per Haz) ─────────────
+// Registration is equivalent to code execution: the manager spawns
+// `command` as a child process on connect (and on boot for auto_connect
+// servers). Configs are therefore validated at write time, BEFORE
+// persistence, in the registration route below:
+//  - `command` must be a bare binary basename in the allowlist below.
+//    ALL absolute paths and path separators are rejected outright — Haz's
+//    explicit request: no more /usr/bin/python3, even in known bin dirs.
+//  - `args` must be an array of strings.
+//  - `http` transport is rejected outright: the manager only speaks stdio,
+//    so accepting it would create dead config surface.
+const MCP_COMMAND_ALLOWLIST = new Set([
+  'node', 'nodejs', 'python3', 'python', 'npx', 'uvx', 'deno', 'bun',
+]);
+
+export function validateMcpServerConfig({ transport, command, args }) {
+  if (transport === 'http') {
+    return 'Transport "http" is not supported — the MCP manager only speaks stdio. Register this server with transport "stdio".';
+  }
+  if (transport && transport !== 'stdio') {
+    return 'Transport must be "stdio"';
+  }
+  if (typeof command !== 'string' || !command.trim()) {
+    return 'Command is required for stdio transport';
+  }
+  const cmd = command.trim();
+  // Haz: reject ALL absolute paths — basenames only. Any '/' or '\\' is a
+  // path separator (or traversal attempt like '..'), so reject outright.
+  if (cmd.includes('/') || cmd.includes('\\')) {
+    return 'Command must be an allowlisted binary name with no path separators — absolute paths are not accepted';
+  }
+  if (!MCP_COMMAND_ALLOWLIST.has(cmd)) {
+    return `Command "${cmd}" is not in the MCP command allowlist`;
+  }
+  if (!Array.isArray(args)) return 'args must be an array of strings';
+  if (args.some(a => typeof a !== 'string')) return 'args must be an array of strings';
+  return null;
+}
+
 export default function metaRoutes(ctx) {
   const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID, mcp } = ctx;
   const router = express.Router();
 
 // ─── MCP Server Management API ─────────────────────────────────────
-// Register a new MCP server
-router.post('/mcp/servers', authMiddleware, apiLimiter, async (req, res) => {
+// Register a new MCP server — ADMIN ONLY. The stdio `command` is spawned as a
+// child process on connect, so registration is equivalent to code execution.
+router.post('/mcp/servers', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const { name, transport, command, args, url } = req.body;
   if (!name) return res.status(400).json({ error: 'Name is required' });
-  if (!transport || !['stdio', 'http'].includes(transport)) {
-    return res.status(400).json({ error: 'Transport must be "stdio" or "http"' });
-  }
-  if (transport === 'stdio' && !command) {
-    return res.status(400).json({ error: 'Command is required for stdio transport' });
-  }
-  if (transport === 'http' && !url) {
-    return res.status(400).json({ error: 'URL is required for http transport' });
-  }
+  if (!transport) return res.status(400).json({ error: 'Transport is required ("stdio")' });
+  // M3: validate command/args/transport at write time, before persistence.
+  const configError = validateMcpServerConfig({ transport, command, args: args || [] });
+  if (configError) return res.status(400).json({ error: configError });
 
   const id = randomUUID();
   const argsJson = JSON.stringify(args || []);
@@ -36,10 +73,16 @@ router.post('/mcp/servers', authMiddleware, apiLimiter, async (req, res) => {
   res.status(201).json(server);
 });
 
-// List all MCP servers
-router.get('/mcp/servers', optionalAuth, (_req, res) => {
+// List all MCP servers — authenticated users only. Command/args/url often
+// contain secrets (API keys), so they are only exposed to admins.
+router.get('/mcp/servers', authMiddleware, (_req, res) => {
   const rows = stmts.mcp.getAll.all();
-  res.json(rows.map(s => ({ ...s, args: JSON.parse(s.args), connected: mcp.isConnected(s.id) })));
+  const isAdmin = _req.user?.role === 'admin';
+  res.json(rows.map(s => {
+    const out = { ...s, args: JSON.parse(s.args), connected: mcp.isConnected(s.id) };
+    if (!isAdmin) { delete out.command; delete out.args; delete out.url; }
+    return out;
+  }));
 });
 
 // Delete an MCP server (admin only)
@@ -57,8 +100,9 @@ router.delete('/mcp/servers/:id', authMiddleware, requireRole('admin'), (req, re
   res.json({ deleted: true });
 });
 
-// Connect to an MCP server
-router.post('/mcp/servers/:id/connect', authMiddleware, apiLimiter, async (req, res) => {
+// Connect to an MCP server — ADMIN ONLY: this spawns the registered command
+// as a child process.
+router.post('/mcp/servers/:id/connect', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
   if (mcp.isConnected(req.params.id)) return res.status(409).json({ error: 'Already connected' });
@@ -82,8 +126,8 @@ router.post('/mcp/servers/:id/connect', authMiddleware, apiLimiter, async (req, 
   }
 });
 
-// Disconnect from an MCP server
-router.post('/mcp/servers/:id/disconnect', authMiddleware, apiLimiter, (req, res) => {
+// Disconnect from an MCP server — ADMIN ONLY: this kills child processes.
+router.post('/mcp/servers/:id/disconnect', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
 
@@ -93,8 +137,23 @@ router.post('/mcp/servers/:id/disconnect', authMiddleware, apiLimiter, (req, res
   res.json({ id: server.id, status: 'disconnected' });
 });
 
-// List tools from a specific MCP server
-router.get('/mcp/servers/:id/tools', optionalAuth, (req, res) => {
+// Set per-server auto-connect (admin only). Servers flagged auto_connect=1 are
+// connected at boot and kept alive by the MCP manager (Track C).
+router.patch('/mcp/servers/:id/autoconnect', authMiddleware, requireRole('admin'), (req, res) => {
+  const server = stmts.mcp.getById.get(req.params.id);
+  if (!server) return res.status(404).json({ error: 'MCP server not found' });
+  const { auto_connect } = req.body || {};
+  if (typeof auto_connect !== 'boolean') {
+    return res.status(400).json({ error: 'auto_connect must be a boolean' });
+  }
+  db.prepare('UPDATE mcp_servers SET auto_connect = ? WHERE id = ?').run(auto_connect ? 1 : 0, req.params.id);
+  logger.info(`MCP auto_connect ${auto_connect ? 'enabled' : 'disabled'}: ${server.name} (${req.params.id})`);
+  broadcast('mcp:autoconnect', { id: req.params.id, auto_connect });
+  res.json({ id: req.params.id, auto_connect });
+});
+
+// List tools from a specific MCP server — authenticated users only.
+router.get('/mcp/servers/:id/tools', authMiddleware, (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
 
@@ -103,8 +162,10 @@ router.get('/mcp/servers/:id/tools', optionalAuth, (req, res) => {
   res.json({ serverId: req.params.id, connected: mcp.isConnected(req.params.id), tools });
 });
 
-// Invoke a tool on an MCP server
-router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, apiLimiter, async (req, res) => {
+// Invoke a tool on an MCP server — ADMIN ONLY. Registration is admin-gated
+// but the servers may run with admin credentials, so non-admin users must
+// not invoke tools on them (M12).
+router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   const server = stmts.mcp.getById.get(req.params.id);
   if (!server) return res.status(404).json({ error: 'MCP server not found' });
   if (!mcp.isConnected(req.params.id)) {
@@ -116,9 +177,11 @@ router.post('/mcp/servers/:id/tools/:toolName/invoke', authMiddleware, apiLimite
     const result = await mcp.invokeTool(req.params.id, req.params.toolName, toolArgs || {});
     const now = new Date().toISOString();
     stmts.mcp.updateStatus.run('connected', server.connected_at, now, server.id);
+    audit('mcp.tool.invoke', 'mcp_server', req.params.id, req.user?.id, { tool: req.params.toolName, outcome: 'ok' });
     logger.info(`MCP tool invoked: ${req.params.toolName} on ${server.name}`);
     res.json({ serverId: req.params.id, tool: req.params.toolName, result });
   } catch (err) {
+    audit('mcp.tool.invoke', 'mcp_server', req.params.id, req.user?.id, { tool: req.params.toolName, outcome: 'error' });
     logger.error(`MCP tool invocation failed: ${req.params.toolName} on ${server.name}: ${err.message}`);
     res.status(500).json({ error: `Tool invocation failed: ${err.message}` });
   }

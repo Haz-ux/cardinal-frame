@@ -35,9 +35,12 @@ export function useActivityFeed() {
   const pausedRef = useRef(false);
   pausedRef.current = paused;
 
-  // Load initial activity on mount
+  // Load initial activity on mount (authenticated — /api/activity requires a token)
   useEffect(() => {
-    fetch('/api/activity?limit=30')
+    const token = localStorage.getItem('cf_token');
+    fetch('/api/activity?limit=30', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
       .then(r => r.ok ? r.json() : [])
       .then(data => {
         if (Array.isArray(data) && data.length) {

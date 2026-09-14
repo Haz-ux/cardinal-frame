@@ -1,18 +1,40 @@
 #!/usr/bin/env node
-// Cardinal Frame CLI — manage tasks, agents, DAGs, schedules from terminal
-import { randomUUID } from 'crypto';
+// Cardinal Frame CLI — manage tasks, agents, config, and comms from the terminal
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import fs from 'node:fs';
+
+// Repo root resolved from this file's location (src/cli/cardinal.mjs),
+// overridable via CF_DIR. Never hardcode a machine-specific path.
+const REPO_ROOT = process.env.CF_DIR || resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const BASE = process.env.CF_API || 'http://localhost:8080/api';
+const API_ROOT = BASE.replace(/\/api\/?$/, '');
 let TOKEN = process.env.CF_TOKEN;
+
+class CliError extends Error {}
 
 async function req(method, path, body) {
  const headers = { 'Content-Type': 'application/json' };
  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
  const opts = { method, headers };
  if (body) opts.body = JSON.stringify(body);
- const res = await fetch(`${BASE}${path}`, opts);
- const data = await res.json();
- if (!res.ok) { console.error(`Error: ${data.error || res.status}`); process.exit(1); }
+ let res;
+ try {
+   res = await fetch(`${BASE}${path}`, opts);
+ } catch (e) {
+   throw new CliError(`Cannot reach ${BASE} — is the server running? (${e.message})`);
+ }
+ const text = await res.text();
+ let data = null;
+ if (text) {
+   try { data = JSON.parse(text); }
+   catch { data = text; } // non-JSON (proxy/HTML error page) — don't crash parsing it
+ }
+ if (!res.ok) {
+   const detail = data && typeof data === 'object' ? (data.error || JSON.stringify(data)) : String(data || '');
+   throw new CliError(`HTTP ${res.status}${detail ? `: ${String(detail).slice(0, 300)}` : ''}`);
+ }
  return data;
 }
 
@@ -29,8 +51,6 @@ function table(items, fields) {
   console.log(fields.map((f, i) => String(item[f] ?? '').slice(0, 40).padEnd(widths[i])).join('  '));
  }
 }
-
-function truncate(s, len = 40) { return s && s.length > len ? s.slice(0, len) + '…' : s; }
 
 // ─── Command handlers ───────────────────────────────────────
 // Each handler receives the remaining argv slice (subcommand/arg already consumed).
@@ -88,8 +108,33 @@ async function token() {
 
 // `cardinal port` — GET /api/settings/dev, print current port (read-only; fixed to 8080 unless PORT env set)
 async function port() {
+  await ensureAuth();
   const data = await req('GET', '/settings/dev');
   console.log(`Current port: ${data.port} (fixed — set PORT env var to change)`);
+}
+
+// `cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...`
+// Register the Telegram webhook, optionally locked to specific sender user ids.
+// Only allowlisted senders are processed (webhook receiver + poller).
+async function telegramSetupWebhook(args) {
+  await ensureAuth();
+  const [channelId, webhookUrl, ...flags] = args;
+  const usage = 'Usage: cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <telegram_user_id>]...';
+  if (!channelId || !webhookUrl) { console.error(usage); process.exit(1); }
+  const allowed = [];
+  for (let i = 0; i < flags.length; i++) {
+    if (flags[i] === '--allow-user' && flags[i + 1]) allowed.push(flags[++i]);
+    else { console.error(`Unknown flag: ${flags[i]}\n${usage}`); process.exit(1); }
+  }
+  const body = { channel_id: channelId, webhook_url: webhookUrl };
+  if (allowed.length) body.allowed_user_ids = allowed;
+  const data = await req('POST', '/comms/telegram/setup-webhook', body);
+  console.log(`✓ Webhook registered: ${data.webhook_url || webhookUrl}`);
+  if (data.allowed_user_ids && data.allowed_user_ids.length) {
+    console.log(`✓ Locked to Telegram user id(s): ${data.allowed_user_ids.join(', ')}`);
+  } else {
+    console.log('⚠ No --allow-user given: any Telegram user who finds the bot can message it.');
+  }
 }
 
 // ─── config ──────────────────────────────────────────────────
@@ -100,13 +145,30 @@ async function port() {
 //   cardinal config unset <key>                  delete an env var
 //   cardinal config dev                         show dev settings
 //   cardinal config dev <key> <value>           set a dev setting (logLevel, debugMode, sandboxTimeout, maxConcurrentAgents, wsHeartbeatMs, embeddingModel)
+// Server no longer seeds default passwords: on boot it generates strong
+// random ones and saves them to <data>/.admin-credentials (mode 600).
+// Priority: CF_TOKEN (already handled) > CF_ADMIN_PASSWORD env > generated
+// file > legacy admin/admin123 (kept only for very old servers).
+function readAdminCreds() {
+  if (process.env.CF_ADMIN_PASSWORD) {
+    return { username: process.env.CF_ADMIN_USER || 'admin', password: process.env.CF_ADMIN_PASSWORD };
+  }
+  const dataDir = process.env.DATA_DIR || resolve(REPO_ROOT, 'data');
+  try {
+    const text = fs.readFileSync(resolve(dataDir, '.admin-credentials'), 'utf8');
+    const line = text.split('\n').map(l => l.trim()).find(l => l && !l.startsWith('#') && l.startsWith('admin:'));
+    if (line) return { username: 'admin', password: line.slice('admin:'.length) };
+  } catch {}
+  return { username: 'admin', password: 'admin123' };
+}
 async function ensureAuth() {
   if (TOKEN) return;
+  const creds = readAdminCreds();
   try {
-    const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+    const data = await req('POST', '/auth/login', { username: creds.username, password: creds.password });
     if (data.token) TOKEN = data.token;
   } catch (e) {
-    console.error(`✗ Could not log in as admin: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
+    console.error(`✗ Could not log in as ${creds.username}: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
     process.exit(1);
   }
 }
@@ -239,20 +301,354 @@ async function doctor(args) {
   process.exit(2);
 }
 
-// `cardinal chat <message>` — POST /api/chat
+// Stream one message to /api/aimi/chat, printing SSE content deltas live.
+// Shared by `cardinal chat` (one-shot) and the REPL.
+async function streamAimiChat(message) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (TOKEN) headers['Authorization'] = `Bearer ${TOKEN}`;
+  let res;
+  try {
+    res = await fetch(`${BASE}/aimi/chat`, { method: 'POST', headers, body: JSON.stringify({ message }) });
+  } catch (e) {
+    throw new CliError(`Cannot reach ${BASE} — is the server running? (${e.message})`);
+  }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new CliError(`HTTP ${res.status}${errText ? `: ${errText.slice(0, 300)}` : ''}`);
+  }
+  // Consume the text/event-stream, printing content deltas as they arrive.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '', printed = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        const delta = obj.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta) { process.stdout.write(delta); printed = true; }
+        if (obj.done) { process.stdout.write('\n'); return; }
+      }
+    }
+  }
+  if (printed) process.stdout.write('\n');
+}
+
+// `cardinal chat <message>` — one-shot chat with Aimi
 async function chat(args) {
+  await ensureAuth();
   const message = args.join(' ');
   if (!message) { console.error('Usage: cardinal chat <message>'); process.exit(1); }
-  const data = await req('POST', '/chat', { messages: [{ role: 'user', content: message }] });
-  if (data && typeof data === 'object' && typeof data.response === 'string') {
-    console.log(data.response);
-  } else {
-    pretty(data);
+  await streamAimiChat(message);
+}
+
+// Interactive REPL — `cardinal` with no args, or `cardinal repl`
+async function repl() {
+  await ensureAuth();
+  const readline = await import('node:readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'aimi> ' });
+  console.log('Cardinal Frame REPL — chatting with Aimi. /exit to quit.');
+  rl.prompt();
+  rl.on('line', async (line) => {
+    const input = line.trim();
+    if (!input) { rl.prompt(); return; }
+    if (input === '/exit' || input === '/quit') { rl.close(); return; }
+    if (input === '/clear') { console.clear(); rl.prompt(); return; }
+    try {
+      await streamAimiChat(input);
+    } catch (e) {
+      console.error(e instanceof CliError ? `Error: ${e.message}` : `Fatal: ${e.message}`);
+    }
+    rl.prompt();
+  });
+  rl.on('close', () => { console.log('Bye.'); process.exit(0); });
+}
+
+// Minimal `--flag value` parser for commands that need named options.
+function parseFlags(args) {
+  const flags = {}, positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--') && a.length > 2) {
+      const key = a.slice(2);
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++; }
+      else flags[key] = true;
+    } else positional.push(a);
+  }
+  return { flags, positional };
+}
+
+// ─── DAGs ───────────────────────────────────────────────────
+// `cardinal dags` — list; `dags:create|get|update|delete|run`
+async function dags() {
+  await ensureAuth();
+  const rows = await req('GET', '/dags');
+  table(rows.map(d => ({
+    id: d.id,
+    name: d.name,
+    status: d.status,
+    nodes: Array.isArray(d.nodes) ? d.nodes.length : '?',
+    edges: Array.isArray(d.edges) ? d.edges.length : '?',
+  })), ['id', 'name', 'status', 'nodes', 'edges']);
+}
+
+function loadDagFile(path) {
+  let raw;
+  try { raw = fs.readFileSync(path, 'utf8'); }
+  catch { throw new CliError(`Cannot read DAG file: ${path}`); }
+  let obj;
+  try { obj = JSON.parse(raw); }
+  catch { throw new CliError(`DAG file is not valid JSON: ${path}`); }
+  if (!Array.isArray(obj.nodes) || !Array.isArray(obj.edges))
+    throw new CliError(`DAG file must be a JSON object with "nodes" and "edges" arrays: ${path}`);
+  return { nodes: obj.nodes, edges: obj.edges };
+}
+
+async function dagCreate(args) {
+  const { flags, positional } = parseFlags(args);
+  const name = positional[0];
+  if (!name) { console.error('Usage: cardinal dags:create <name> [--file dag.json]'); process.exit(1); }
+  const { nodes, edges } = flags.file ? loadDagFile(flags.file) : { nodes: [], edges: [] };
+  await ensureAuth();
+  const dag = await req('POST', '/dags', { name, nodes, edges });
+  console.log(`Created DAG "${dag.name}" (${dag.id})`);
+}
+
+async function dagGet(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:get <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('GET', `/dags/${id}`));
+}
+
+async function dagUpdate(args) {
+  const { flags, positional } = parseFlags(args);
+  const id = positional[0];
+  if (!id) { console.error('Usage: cardinal dags:update <id> [--file dag.json] [--name <name>]'); process.exit(1); }
+  const body = {};
+  if (flags.name) body.name = flags.name;
+  if (flags.file) { const { nodes, edges } = loadDagFile(flags.file); body.nodes = nodes; body.edges = edges; }
+  if (!Object.keys(body).length) { console.error('Nothing to update — pass --file and/or --name.'); process.exit(1); }
+  await ensureAuth();
+  const dag = await req('PUT', `/dags/${id}`, body);
+  console.log(`Updated DAG "${dag.name}" (${dag.id})`);
+}
+
+async function dagDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/dags/${id}`);
+  console.log(`Deleted DAG ${id}`);
+}
+
+async function dagRun(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal dags:run <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('POST', `/dags/${id}/run`));
+}
+
+// ─── Schedules (heartbeat rules) ────────────────────────────
+// `cardinal schedules` — list; `schedules:create|toggle|delete`
+async function schedules() {
+  await ensureAuth();
+  const rows = await req('GET', '/heartbeat/rules');
+  table(rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    condition: r.condition,
+    action: `${r.action_type} → ${r.action_target}`,
+    enabled: r.enabled ? 'on' : 'off',
+  })), ['id', 'name', 'condition', 'action', 'enabled']);
+}
+
+async function scheduleCreate(args) {
+  const { flags, positional } = parseFlags(args);
+  const name = positional[0] || flags.name;
+  const condition = flags.condition, action = flags.action, target = flags.target;
+  if (!name || !condition || !action || !target) {
+    console.error('Usage: cardinal schedules:create <name> --condition "<expr>" --action <chain|skill|alert|webhook> --target <target> [--cooldown <sec>] [--description "..."]');
+    process.exit(1);
+  }
+  await ensureAuth();
+  const rule = await req('POST', '/heartbeat/rules', {
+    name,
+    condition,
+    action_type: action,
+    action_target: target,
+    cooldown_seconds: flags.cooldown ? Number(flags.cooldown) : 300,
+    description: flags.description || '',
+  });
+  console.log(`Created rule "${rule.name}" (${rule.id})`);
+}
+
+async function scheduleToggle(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal schedules:toggle <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('PATCH', `/heartbeat/rules/${id}/toggle`));
+}
+
+async function scheduleDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal schedules:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/heartbeat/rules/${id}`);
+  console.log(`Deleted rule ${id}`);
+}
+
+// `cardinal heartbeat` — daemon + agent pulse status
+async function heartbeat() {
+  await ensureAuth();
+  const s = await req('GET', '/heartbeat/status');
+  if (!s.running) { console.log('Heartbeat daemon is not running.'); return; }
+  console.log(`Heartbeat: running (tick every ${s.tickIntervalS}s)`);
+  const p = s.pulse || {};
+  if (!p.ready) console.log('Agent pulse: not configured');
+  else if (!p.enabled) console.log('Agent pulse: disabled (set AGENT_PULSE_ENABLED=true to enable)');
+  else {
+    console.log(`Agent pulse: enabled (every ${p.intervalS}s, ${p.runs} run(s))`);
+    console.log(`Last pulse: ${p.lastAt || 'never'}${p.lastAttention ? ` — ATTENTION: ${p.lastSummary}` : ' — quiet'}`);
   }
 }
 
-const CF_DIR = process.env.CF_DIR || '/home/cardinal-frame';
-const HEALTH_URL = 'http://localhost:8080/api/health';
+// ─── Sessions (chat conversations) ──────────────────────────
+// `cardinal sessions` — list; `sessions:show|delete`
+async function sessions() {
+  await ensureAuth();
+  const convs = await req('GET', '/chat/conversations');
+  table(convs.map(c => ({
+    id: c.id,
+    title: c.title,
+    model: c.model || '-',
+    updated: (c.updated_at || '').slice(0, 16).replace('T', ' '),
+  })), ['id', 'title', 'model', 'updated']);
+}
+
+async function sessionShow(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal sessions:show <id>'); process.exit(1); }
+  await ensureAuth();
+  const msgs = await req('GET', `/chat/conversations/${id}/messages`);
+  if (!msgs.length) { console.log('(no messages)'); return; }
+  for (const m of msgs) {
+    const role = (m.role || '?').toUpperCase();
+    let content = m.content || '';
+    if (content.length > 1200) content = content.slice(0, 1200) + '…';
+    console.log(`\n[${role}] ${content}`);
+    const calls = m.tool_calls || [];
+    if (calls.length) console.log(`  (tool calls: ${calls.map(t => t.name || t.function?.name || '?').join(', ')})`);
+  }
+}
+
+async function sessionDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal sessions:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/chat/conversations/${id}`);
+  console.log(`Deleted conversation ${id}`);
+}
+
+// ─── Memory ─────────────────────────────────────────────────
+// `cardinal memory` — stats; `memory:search|get|add|delete`
+async function memory() {
+  await ensureAuth();
+  const stats = await req('GET', '/memory/stats');
+  console.log(`Total memories: ${stats.total}`);
+  const cats = Object.entries(stats.by_category || {});
+  if (cats.length) table(cats.map(([category, count]) => ({ category, count })), ['category', 'count']);
+}
+
+async function memorySearch(args) {
+  const q = args.join(' ');
+  if (!q) { console.error('Usage: cardinal memory:search <query>'); process.exit(1); }
+  await ensureAuth();
+  const results = await req('GET', `/memory?q=${encodeURIComponent(q)}`);
+  const rows = Array.isArray(results) ? results : results.results || [];
+  if (!rows.length) { console.log('(no matches)'); return; }
+  table(rows.map(m => ({
+    id: String(m.id).slice(0, 8),
+    category: m.category,
+    content: (m.content || '').slice(0, 80),
+    confidence: m.confidence,
+  })), ['id', 'category', 'content', 'confidence']);
+}
+
+async function memoryGet(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal memory:get <id>'); process.exit(1); }
+  await ensureAuth();
+  pretty(await req('GET', `/memory/${id}`));
+}
+
+async function memoryAdd(args) {
+  const { flags, positional } = parseFlags(args);
+  const content = positional.join(' ');
+  if (!content) { console.error('Usage: cardinal memory:add <content...> [--category <cat>]'); process.exit(1); }
+  await ensureAuth();
+  const m = await req('POST', '/memory', { category: flags.category || 'memory', content });
+  console.log(`Saved memory (${m.id}) [${m.category}]`);
+}
+
+async function memoryDelete(args) {
+  const id = args[0];
+  if (!id) { console.error('Usage: cardinal memory:delete <id>'); process.exit(1); }
+  await ensureAuth();
+  await req('DELETE', `/memory/${id}`);
+  console.log(`Deleted memory ${id}`);
+}
+
+// ─── Skills ─────────────────────────────────────────────────
+// `cardinal skills` — list; `skills:run|stats`
+async function skills() {
+  await ensureAuth();
+  const rows = await req('GET', '/skills');
+  table(rows.map(s => ({
+    name: s.name,
+    category: s.category,
+    enabled: s.enabled ? 'on' : 'off',
+    description: (s.description || '').slice(0, 60),
+  })), ['name', 'category', 'enabled', 'description']);
+}
+
+async function skillRun(args) {
+  const name = args[0];
+  if (!name) { console.error('Usage: cardinal skills:run <name> [json-input]'); process.exit(1); }
+  await ensureAuth();
+  const rawInput = args.slice(1).join(' ');
+  let body = {};
+  if (rawInput) {
+    try { body = { input: JSON.parse(rawInput) }; }
+    catch { body = { input: rawInput }; }
+  }
+  pretty(await req('POST', `/skills/execute/${encodeURIComponent(name)}`, body));
+}
+
+async function skillStats() {
+  await ensureAuth();
+  const stats = await req('GET', '/skills/stats/failure-rates');
+  if (!stats.length) { console.log('(no invocations yet)'); return; }
+  table(stats.map(s => ({
+    skill: s.skill_name || s.name || s.skill_id,
+    total: s.total,
+    failures: s.failures,
+    rate: `${(s.failureRate * 100).toFixed(1)}%`,
+    review: s.needsReview ? 'YES' : '',
+  })), ['skill', 'total', 'failures', 'rate', 'review']);
+}
+
+const HEALTH_URL = `${API_ROOT}/api/health`;
 const PID_FILE = '/tmp/cardinal.pid';
 const LOG_FILE = process.env.CF_LOG_FILE || '/tmp/cardinal-server.log';
 
@@ -276,14 +672,14 @@ async function run(args) {
   console.log('Starting Cardinal Frame...');
 
   if (await isUp()) {
-    console.log('Server is already running on http://localhost:8080');
+    console.log(`Server is already running on ${API_ROOT}`);
     console.log('Dashboard: http://localhost:5173');
     return;
   }
 
   // Start the server (stable entrypoint — no file watcher)
   const serverProc = spawn('node', ['--max-old-space-size=512', 'src/server/server.mjs'], {
-    cwd: CF_DIR,
+    cwd: REPO_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const serverPid = serverProc.pid;
@@ -317,7 +713,7 @@ async function run(args) {
     process.exit(1);
   }
 
-  console.log('Server is up: http://localhost:8080 (PID ' + serverPid + ')');
+  console.log(`Server is up: ${API_ROOT} (PID ` + serverPid + ')');
 
   // Start client unless disabled
   let clientProc = null;
@@ -326,7 +722,7 @@ async function run(args) {
   if (!args.includes('--no-client') && !args.includes('--server-only')) {
     console.log('Starting dashboard...');
     clientProc = spawn('npm', ['run', 'dev'], {
-      cwd: CF_DIR + '/client',
+      cwd: REPO_ROOT + '/client',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     clientProc.stdout?.on('data', (d) => process.stdout.write(`Client: ${d}`));
@@ -338,7 +734,7 @@ async function run(args) {
     // os.networkInterfaces(), which the proot sandbox blocks), so this tiny raw-TCP
     // proxy makes http://127.0.0.1:5173 and http://localhost:5173 work too.
     forwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
-      cwd: CF_DIR,
+      cwd: REPO_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     forwardProc.stdout?.on('data', (d) => process.stdout.write(`Forward: ${d}`));
@@ -350,7 +746,7 @@ async function run(args) {
     // (Android's loopback handling for post-load fetches has been unreliable).
     if (process.env.CARDINAL_LAN_HOST) {
       lanForwardProc = spawn('node', ['client/vite-ipv4-forward.mjs'], {
-        cwd: CF_DIR,
+        cwd: REPO_ROOT,
         env: { ...process.env, FWD_LISTEN_HOST: process.env.CARDINAL_LAN_HOST },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -377,23 +773,49 @@ async function run(args) {
   await new Promise(() => {});
 }
 
-// `cardinal stop` — stop server + dashboard started by `cardinal run`
+// `cardinal stop` — stop server + dashboard started by `cardinal run`.
+// Only touches processes belonging to THIS repo checkout: the PID file is
+// verified via /proc cmdline, and the pgrep sweep only kills candidates whose
+// working directory or command line is under REPO_ROOT. Never kills another
+// project's server.
 async function stop() {
   const fs = await import('node:fs');
-  const pids = [];
-  try { pids.push(Number(fs.readFileSync(PID_FILE, 'utf8'))); } catch {}
-  // Also sweep for any stray server/dashboard processes
+  const { execSync } = await import('node:child_process');
+  const pids = new Set();
+  const cmdlineOf = (pid) => {
+    try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); } catch { return ''; }
+  };
+  const isOurs = (pid) => {
+    const cl = cmdlineOf(pid);
+    if (!cl) return false;
+    let cwd = '';
+    try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
+    return cwd === REPO_ROOT || cwd === REPO_ROOT + '/client' || cl.includes(REPO_ROOT);
+  };
+
+  // PID file — but verify it's actually our server before trusting it.
+  try {
+    const pidFilePid = Number(fs.readFileSync(PID_FILE, 'utf8'));
+    if (pidFilePid && cmdlineOf(pidFilePid).includes('src/server/server.mjs') && isOurs(pidFilePid)) {
+      pids.add(pidFilePid);
+    }
+  } catch {}
+
+  // Sweep for strays from this repo only.
   for (const pat of ['src/server/server.mjs', 'client/node_modules/.bin/vite', 'client/vite-ipv4-forward.mjs']) {
-    try {
-      const { execSync } = await import('node:child_process');
-      const out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim();
-      for (const pid of out.split('\n')) { if (pid) pids.push(Number(pid)); }
-    } catch {}
+    let out = '';
+    try { out = execSync(`pgrep -f "${pat}" 2>/dev/null || true`).toString().trim(); } catch {}
+    for (const line of out.split('\n')) {
+      const n = Number(line);
+      if (n && n !== process.pid && isOurs(n)) pids.add(n);
+    }
   }
-  if (pids.length === 0) { console.log('Nothing is running.'); return; }
-  for (const pid of new Set(pids)) {
+
+  if (pids.size === 0) { console.log('Nothing is running.'); return; }
+  for (const pid of pids) {
     try { process.kill(pid, 'SIGTERM'); console.log('Stopped PID ' + pid); } catch {}
   }
+  try { fs.unlinkSync(PID_FILE); } catch {}
   console.log('Cardinal Frame stopped.');
 }
 
@@ -414,7 +836,37 @@ Commands:
   tasks:create <title> [aid]   Create a task (POST /api/tasks)
   token                        Login as admin, print JWT (POST /api/auth/login)
   port                         Show current dev port (fixed to 8080; set PORT env var to change)
-  chat <message>               Send a chat message (POST /api/chat)
+  chat <message>               Chat with Aimi, one message (POST /api/aimi/chat, streams the reply)
+  repl                         Interactive chat session with Aimi (same as bare 'cardinal')
+  dags                         List DAGs (GET /api/dags)
+  dags:create <name> [--file dag.json]
+                               Create a DAG (POST /api/dags)
+  dags:get <id>                Show a DAG with its last run result
+  dags:update <id> [--file dag.json] [--name <name>]
+                               Update a DAG (PUT /api/dags/:id)
+  dags:delete <id>             Delete a DAG
+  dags:run <id>                Run a DAG (POST /api/dags/:id/run)
+  schedules                    List heartbeat rules (GET /api/heartbeat/rules)
+  schedules:create <name> --condition "<expr>" --action <chain|skill|alert|webhook>
+                     --target <target> [--cooldown <sec>] [--description "..."]
+                               Create a heartbeat rule
+  schedules:toggle <id>        Enable/disable a rule
+  schedules:delete <id>        Delete a rule
+  heartbeat                    Heartbeat daemon + agent pulse status
+  sessions                     List chat conversations (GET /api/chat/conversations)
+  sessions:show <id>           Read a conversation's messages
+  sessions:delete <id>         Delete a conversation
+  memory                       Memory stats: total + by category
+  memory:search <query>        Full-text search memories
+  memory:get <id>              Show one memory
+  memory:add <text...> [--category <cat>]
+                               Save a memory
+  memory:delete <id>           Delete a memory
+  skills                       List skills (GET /api/skills)
+  skills:run <name> [json]     Execute a skill by name (admin)
+  skills:stats                 Invocation counts + failure rates per skill
+  telegram setup-webhook <channel_id> <webhook_url> [--allow-user <id>]...
+                           Register Telegram webhook, optionally locked to sender id(s)
   run [args]                   Start server + dashboard (--no-client, --server-only)
   stop                         Stop server + dashboard
   setup                        First-run wizard: health check + seed skill library & chains
@@ -430,19 +882,24 @@ Commands:
 Environment:
   CF_API    API base URL (default: http://localhost:8080/api)
   CF_TOKEN  JWT token for authenticated endpoints
+  CF_DIR    Repo root override (default: resolved from the CLI's own location)
   CF_LOG_FILE  Path to log file (default: /tmp/cardinal-server.log)
 
-Run 'cardinal' (no args) or 'cardinal help' for this message.
+Run 'cardinal' (no args) to open the interactive REPL, 'cardinal help' for this message.
 `;
 
-if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
   console.log(HELP);
   process.exit(0);
 }
 
 (async () => {
   try {
+    if (!cmd) { await repl(); return; }
     switch (cmd) {
+      case 'repl':
+        await repl();
+        break;
       case 'status':
         await status();
         break;
@@ -463,6 +920,10 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
       case 'chat':
         await chat(sub !== undefined ? process.argv.slice(3) : []);
         break;
+      case 'telegram':
+        if (sub === 'setup-webhook') await telegramSetupWebhook(rest);
+        else { console.error(`Unknown telegram subcommand: ${sub}\nUsage: cardinal telegram setup-webhook <channel_id> <webhook_url> [--allow-user <telegram_user_id>]...`); process.exit(1); }
+        break;
       case 'setup':
         await setup(rest);
         break;
@@ -475,6 +936,56 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
       case 'doctor':
         await doctor([sub, ...rest].filter(a => a !== undefined));
         break;
+      case 'dags':
+        if (sub === 'create') await dagCreate(rest);
+        else if (sub === 'get') await dagGet(rest);
+        else if (sub === 'update') await dagUpdate(rest);
+        else if (sub === 'delete') await dagDelete(rest);
+        else if (sub === 'run') await dagRun(rest);
+        else await dags();
+        break;
+      case 'dags:create': await dagCreate(process.argv.slice(3)); break;
+      case 'dags:get': await dagGet(process.argv.slice(3)); break;
+      case 'dags:update': await dagUpdate(process.argv.slice(3)); break;
+      case 'dags:delete': await dagDelete(process.argv.slice(3)); break;
+      case 'dags:run': await dagRun(process.argv.slice(3)); break;
+      case 'schedules':
+        if (sub === 'create') await scheduleCreate(rest);
+        else if (sub === 'toggle') await scheduleToggle(rest);
+        else if (sub === 'delete') await scheduleDelete(rest);
+        else await schedules();
+        break;
+      case 'schedules:create': await scheduleCreate(process.argv.slice(3)); break;
+      case 'schedules:toggle': await scheduleToggle(process.argv.slice(3)); break;
+      case 'schedules:delete': await scheduleDelete(process.argv.slice(3)); break;
+      case 'heartbeat':
+        await heartbeat();
+        break;
+      case 'sessions':
+        if (sub === 'show') await sessionShow(rest);
+        else if (sub === 'delete') await sessionDelete(rest);
+        else await sessions();
+        break;
+      case 'sessions:show': await sessionShow(process.argv.slice(3)); break;
+      case 'sessions:delete': await sessionDelete(process.argv.slice(3)); break;
+      case 'memory':
+        if (sub === 'search') await memorySearch(rest);
+        else if (sub === 'get') await memoryGet(rest);
+        else if (sub === 'add') await memoryAdd(rest);
+        else if (sub === 'delete') await memoryDelete(rest);
+        else await memory();
+        break;
+      case 'memory:search': await memorySearch(process.argv.slice(3)); break;
+      case 'memory:get': await memoryGet(process.argv.slice(3)); break;
+      case 'memory:add': await memoryAdd(process.argv.slice(3)); break;
+      case 'memory:delete': await memoryDelete(process.argv.slice(3)); break;
+      case 'skills':
+        if (sub === 'run') await skillRun(rest);
+        else if (sub === 'stats') await skillStats();
+        else await skills();
+        break;
+      case 'skills:run': await skillRun(process.argv.slice(3)); break;
+      case 'skills:stats': await skillStats(); break;
       case 'run':
         await run(process.argv.slice(3));
         break;
@@ -486,7 +997,8 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
         process.exit(1);
     }
   } catch (err) {
-    console.error('Fatal:', err.message);
+    if (err instanceof CliError) console.error(`Error: ${err.message}`);
+    else console.error('Fatal:', err.message);
     process.exit(1);
   }
 })();

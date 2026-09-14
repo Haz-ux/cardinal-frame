@@ -232,7 +232,7 @@ export default function toolsRoutes(ctx) {
     let passed = 0;
 
     try {
-      const { result: handlerResult } = await runSandboxed({ code: skill.handler, input: test_input });
+      const { result: handlerResult } = await runSandboxed({ code: skill.handler, input: test_input, allowNetwork: skill.network_access === 1 });
       actualOutput = JSON.stringify(handlerResult);
       if (expected_output) {
         passed = actualOutput.includes(expected_output) ? 1 : 0;

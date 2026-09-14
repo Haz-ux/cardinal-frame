@@ -8,6 +8,40 @@ import express from 'express';
 
 const SUMMARY_SYSTEM_PROMPT = 'You are Aimi, the Cardinal Frame AI assistant. Summarize the following content concisely and accurately in 2-3 sentences.';
 
+// Embedding input guards — each item is a model inference pass, so unbounded
+// batches are a CPU/memory DoS vector.
+const MAX_EMBED_BATCH = 100;
+const MAX_EMBED_TEXT_LEN = 20000;
+
+function checkEmbedTexts(texts) {
+  if (!Array.isArray(texts) || texts.length > MAX_EMBED_BATCH) {
+    return `Provide 1–${MAX_EMBED_BATCH} texts per request`;
+  }
+  for (const t of texts) {
+    if (typeof t !== 'string' || t.length > MAX_EMBED_TEXT_LEN || !t.length) {
+      return 'Each text must be a non-empty string under 20000 characters';
+    }
+  }
+  return null;
+}
+
+/**
+ * Sanitize a user query for FTS5 MATCH. Each token is double-quoted so FTS5
+ * special characters (", *, (, OR, :, etc.) can't break query syntax and 500
+ * the search. Returns null when the query has no searchable tokens.
+ *
+ * Exported for reuse anywhere an FTS5 MATCH query is built (e.g. the agent
+ * loop's memory recall) — never hand-build MATCH strings at call sites.
+ */
+export function sanitizeFtsQuery(q) {
+  const tokens = String(q || '')
+    .split(/\s+/)
+    .map(t => t.trim())
+    .filter(t => t && /[\p{L}\p{N}]/u.test(t));
+  if (!tokens.length) return null;
+  return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ') + '*';
+}
+
 /**
  * Generate LLM summaries for a set of items.
  * If the LLM call fails, returns an empty summaries array (graceful degradation).
@@ -50,7 +84,9 @@ export default function memoryRoutes(ctx) {
       stmts.memories.insert.run(id, req.user.id, category, content, source, confidence);
       // Index in FTS
       try { db.prepare('INSERT INTO memories_fts(rowid, content) VALUES (?, ?)').run(db.prepare('SELECT rowid FROM memories WHERE id = ?').get(id).rowid, content); } catch { }
-      broadcast('memory:created', { id, category, content: content.slice(0, 100) });
+      // NOTE: broadcast carries no content — broadcast() fans out to every
+      // connected WS client, so memory text must never ride along.
+      broadcast('memory:created', { id, category });
       res.status(201).json({ id, category, content, source, confidence });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -74,12 +110,13 @@ export default function memoryRoutes(ctx) {
 
       let results;
       if (q) {
-        results = stmts.memories.search.all(q + '*', req.user.id, limit);
+        const fts = sanitizeFtsQuery(q);
+        results = fts ? stmts.memories.search.all(fts, req.user.id, limit) : [];
         for (const m of results) stmts.memories.updateAccess.run(m.id);
       } else if (category) {
-        results = stmts.memories.getByCategory.all(req.user.id, category);
+        results = stmts.memories.getByCategoryPaged.all(req.user.id, category, limit);
       } else {
-        results = stmts.memories.getByUser.all(req.user.id).slice(0, limit);
+        results = stmts.memories.getByUserPaged.all(req.user.id, limit);
       }
 
       if (summary && results.length > 0) {
@@ -143,7 +180,8 @@ export default function memoryRoutes(ctx) {
       const { q, limit: lim, summary } = req.query;
       if (!q) return res.status(400).json({ error: 'q (query) required' });
       const limit = Math.min(parseInt(lim) || 20, 100);
-      const results = stmts.sessionIndex.getUserSearch.all(q + '*', req.user.id, limit);
+      const fts = sanitizeFtsQuery(q);
+      const results = fts ? stmts.sessionIndex.getUserSearch.all(fts, req.user.id, limit) : [];
       if (summary && results.length > 0) {
         const items = results.map(r => ({ id: r.ref_id, content: r.content }));
         const summaries = await generateSummaries(callAgentLLM, items);
@@ -192,10 +230,14 @@ export default function memoryRoutes(ctx) {
     try {
       const { text, texts } = req.body;
       if (texts && Array.isArray(texts)) {
+        const err = checkEmbedTexts(texts);
+        if (err) return res.status(400).json({ error: err });
         const result = await embeddings.embedBatch(texts);
         return res.json({ embeddings: result, count: result.length, dim: result[0]?.length || 0 });
       }
       if (!text) return res.status(400).json({ error: 'text or texts required' });
+      const singleErr = checkEmbedTexts([text]);
+      if (singleErr) return res.status(400).json({ error: singleErr });
       const result = await embeddings.embed(text);
       res.json({ embedding: result, dim: result.length });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -206,6 +248,8 @@ export default function memoryRoutes(ctx) {
     try {
       const { text1, text2 } = req.body;
       if (!text1 || !text2) return res.status(400).json({ error: 'text1 and text2 required' });
+      const err = checkEmbedTexts([text1, text2]);
+      if (err) return res.status(400).json({ error: err });
       const [emb1, emb2] = await embeddings.embedBatch([text1, text2]);
       const sim = embeddings.cosineSimilarity(emb1, emb2);
       res.json({ similarity: sim });
@@ -220,6 +264,8 @@ export default function memoryRoutes(ctx) {
         return res.status(400).json({ error: 'query (string) and corpus (string[]) required' });
       }
       if (corpus.length === 0) return res.json({ results: [] });
+      const err = checkEmbedTexts([query, ...corpus]);
+      if (err) return res.status(400).json({ error: err });
       const queryEmb = await embeddings.embed(query);
       const corpusEmbs = await embeddings.embedBatch(corpus);
       const results = embeddings.searchSimilar(queryEmb, corpusEmbs, limit);

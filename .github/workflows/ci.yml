@@ -31,6 +31,7 @@ jobs:
           # Tests create temp DBs — no real credentials needed
           JWT_SECRET: test-secret-for-ci-only
           ENCRYPTION_KEY: test-encryption-key-for-ci-only-32bytes
+          AGENT_SANDBOX_DIR: /tmp/cf-agent-sandbox
 
   secret-scan:
     name: Secret Scan (Gitleaks)

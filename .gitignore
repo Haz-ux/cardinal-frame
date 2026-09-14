@@ -11,6 +11,12 @@ dist/
 *.db-wal
 *.db-shm
 
+# Generated secrets — never commit
+.admin-credentials
+.encrypt-key
+data/.admin-credentials
+data/.encrypt-key
+
 # Build artifacts
 client/dist/
 
@@ -37,6 +43,7 @@ gemini_api_key.txt
 !AUDIT_AND_PLAN.md
 !docs/adr/
 !docs/adr/**
+!docs/connectors.md
 !ROADMAP.md
 agent.md
 memory.md
@@ -58,3 +65,5 @@ metadata.json
 # Dead artifacts
 *.bak
 test-results/
+.password-reset-tokens
+data/.password-reset-tokens

@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { execFileSync } from 'child_process';
+import { rmSync, existsSync } from 'fs';
 import { getTestServer, cleanupTestServer, adminAuth, userAuth } from './helpers.mjs';
+import { runSandboxed } from '../src/server/routes/sandbox.mjs';
 
 let app;
 
@@ -124,6 +126,75 @@ describe('Sandbox API — POST /api/sandbox/execute', () => {
         const exitCode = res.body.exitCode ?? res.body.exitcode ?? 0;
         expect(exitCode).not.toBe(0);
       }
+    });
+  });
+
+  describe('Restricted execSync — shell metacharacter rejection (M4)', () => {
+    // Unit tests against runSandboxed's VM-provided execSync (the restricted
+    // one from createRestrictedExecSync), not /api/sandbox/execute which is a
+    // separate raw node/python exec path.
+    const pwnPath = '/tmp/pwned-sandbox-vitest';
+
+    beforeEach(() => {
+      rmSync(pwnPath, { force: true });
+    });
+
+    it('should still allow a plain allowlisted command', async () => {
+      const { result } = await runSandboxed({ code: `(input) => execSync('echo ok')`, input: null });
+      expect(String(result)).toContain('ok');
+    });
+
+    it('should reject $() command substitution and create no file', async () => {
+      await expect(runSandboxed({
+        code: `(input) => execSync('echo $(touch ${pwnPath})')`,
+        input: null,
+      })).rejects.toThrow(/metachar/i);
+      expect(existsSync(pwnPath)).toBe(false);
+    });
+
+    it('should reject backtick command substitution and create no file', async () => {
+      await expect(runSandboxed({
+        code: '(input) => execSync(\'echo `touch ' + pwnPath + '`\')',
+        input: null,
+      })).rejects.toThrow(/metachar/i);
+      expect(existsSync(pwnPath)).toBe(false);
+    });
+
+    it('should reject git $(...) even though git is allowlisted', async () => {
+      await expect(runSandboxed({
+        code: `(input) => execSync('git $(touch ${pwnPath})')`,
+        input: null,
+      })).rejects.toThrow(/metachar/i);
+      expect(existsSync(pwnPath)).toBe(false);
+    });
+
+    it('should reject ; and | chaining', async () => {
+      await expect(runSandboxed({ code: `(input) => execSync('echo a; echo b')`, input: null }))
+        .rejects.toThrow(/metachar/i);
+      await expect(runSandboxed({ code: `(input) => execSync('echo a | cat')`, input: null }))
+        .rejects.toThrow(/metachar/i);
+    });
+
+    it('should still reject non-allowlisted binaries', async () => {
+      await expect(runSandboxed({ code: `(input) => execSync('rm /tmp/x')`, input: null }))
+        .rejects.toThrow(/not in the allowlist/);
+    });
+  });
+
+  describe('Skill fetch SSRF defense-in-depth (L3)', () => {
+    it('refuses metadata/link-local hosts even with network_access granted', async () => {
+      await expect(runSandboxed({
+        code: `(input) => fetch('http://169.254.169.254/')`,
+        input: null,
+        allowNetwork: true,
+      })).rejects.toThrow(/blocked hostname|private\/internal/i);
+    });
+
+    it('still throws when network_access is not granted', async () => {
+      await expect(runSandboxed({
+        code: `(input) => fetch('http://169.254.169.254/')`,
+        input: null,
+      })).rejects.toThrow(/network access denied/);
     });
   });
 });

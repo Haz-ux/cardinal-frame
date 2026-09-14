@@ -40,14 +40,14 @@ describe('Health & Infrastructure', () => {
 
   describe('GET /api/dashboard/summary', () => {
     it('should return dashboard summary', async () => {
-      const res = await request(app).get('/api/dashboard/summary');
+      const res = await request(app).get('/api/dashboard/summary').set(adminAuth());
       expect(res.status).toBe(200);
     });
   });
 
   describe('GET /api/graph', () => {
     it('should return graph data with nodes and links', async () => {
-      const res = await request(app).get('/api/graph');
+      const res = await request(app).get('/api/graph').set(adminAuth());
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('nodes');
       expect(res.body).toHaveProperty('links');
@@ -113,13 +113,13 @@ describe('Health & Infrastructure', () => {
 
   describe('LLM Providers API', () => {
     it('should list providers', async () => {
-      const res = await request(app).get('/api/llm/providers');
+      const res = await request(app).get('/api/llm/providers').set(adminAuth());
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
     });
 
     it('should get default model', async () => {
-      const res = await request(app).get('/api/llm/models/default');
+      const res = await request(app).get('/api/llm/models/default').set(adminAuth());
       expect(res.status).toBe(200);
     });
   });

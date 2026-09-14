@@ -38,14 +38,13 @@ export default function dashboardRoutes(ctx) {
     wss,
     logger,
     authMiddleware,
-    optionalAuth,
     apiLimiter,
   } = ctx;
 
   const router = express.Router();
 
   // ─── Telemetry (system metrics for the dashboard) ───────────────
-  router.get('/telemetry', optionalAuth, async (_req, res) => {
+  router.get('/telemetry', authMiddleware, async (_req, res) => {
     const t = typeof ctx.collectTelemetry === 'function'
       ? await ctx.collectTelemetry()
       : ctx.telemetryCache;
@@ -53,7 +52,7 @@ export default function dashboardRoutes(ctx) {
   });
 
   // ─── Dashboard summary (top-level counts + live WS clients) ────
-  router.get('/dashboard/summary', optionalAuth, (_req, res) => {
+  router.get('/dashboard/summary', authMiddleware, (_req, res) => {
     const agentCount = stmts.dashboard.agentCount.get().c;
     const taskCount = stmts.dashboard.taskCount.get().c;
     const runningTasks = stmts.dashboard.runningTasks.get().c;

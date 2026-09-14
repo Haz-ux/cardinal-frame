@@ -24,10 +24,11 @@ const NeuralMapPage = lazy(() => import('./NeuralMap'));
 const ChatPage = lazy(() => import('./Chat'));
 const SkillsToolsPage = lazy(() => import('./SkillsTools'));
 const AimiLearnPage = lazy(() => import('./AimiLearn'));
+const LearningInboxPage = lazy(() => import('./LearningInbox'));
 const SettingsPage = lazy(() => import('./Settings'));
 const AutomationPage = lazy(() => import('./Automation'));
 import { ToastProvider } from './ToastContext';
-import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Link2, Monitor, Smartphone } from 'lucide-react';
+import { LayoutDashboard, ListTodo, Bot, GitBranch, Users as UsersIcon, HardDrive, Plug, Clock, Puzzle, LogOut, User, ShieldCheck, UsersRound, ScrollText, Loader, Sparkles, Menu, ChevronLeft, ChevronRight, X, Cpu, Network, MessageSquare, Wrench, Activity, Brain, Inbox, Link2, Monitor, Smartphone } from 'lucide-react';
 import AimiCanvasCompanion from './AimiCanvas';
 import { NEON, BG, FONTS } from './theme';
 import { isDesktopMode, applyViewportMode, toggleDesktopMode } from './viewportMode';
@@ -108,6 +109,7 @@ function ProtectedRoute({ children }) {
   { to: '/neural', icon: Network, label: 'Neural Map', color: NEON.magenta },
   { to: '/skills', icon: Wrench, label: 'Skills & Tools', color: NEON.orange },
   { to: '/learn', icon: Brain, label: `${companionName} Learn`, color: NEON.purple },
+  { to: '/learning', icon: Inbox, label: 'Learning Inbox', color: NEON.magenta },
   { to: '/plugins', icon: Puzzle, label: 'Plugins', color: NEON.pink },
   { to: '/settings', icon: ShieldCheck, label: 'Settings', color: NEON.cyan },
   ...(user?.role === 'admin' ? [
@@ -330,6 +332,7 @@ function ProtectedRoute({ children }) {
        <Route path="/chat" element={<ChatPage />} />
        <Route path="/skills" element={<SkillsToolsPage />} />
        <Route path="/learn" element={<AimiLearnPage />} />
+       <Route path="/learning" element={<LearningInboxPage />} />
        <Route path="/plugins" element={<Plugins />} />
        <Route path="/settings" element={<SettingsPage />} />
        <Route path="/audit" element={<AuditLog />} />

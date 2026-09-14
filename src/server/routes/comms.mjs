@@ -1,24 +1,80 @@
 import express from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'crypto';
 import { WebSocket } from 'ws';
+import { encryptSecret, decryptSecret, isAesPacked } from './settings.mjs';
 
 /**
  * Comms Engine: Telegram + Discord integration.
  * Dependencies (via ctx): db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast
  */
 
-export default function commsRoutes(ctx) {
-  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
-  const router = express.Router();
+// ── Webhook authentication ────────────────────────────────────────────
+// Both receivers are unauthenticated endpoints by necessity (Telegram/Discord
+// call them, not us). They MUST verify a shared secret instead:
+//   - Telegram: secret_token passed to setWebhook → Telegram echoes it back in
+//     the X-Telegram-Bot-Api-Secret-Token header.
+//   - Discord: this receiver doesn't speak the real interactions protocol
+//     (which would use Ed25519 signatures), so the provisioned
+//     config.webhook_secret must arrive in the X-Webhook-Secret header.
+// Timing-safe comparison — never `===` secrets.
+function webhookSecretsMatch(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
+// ── C2 fail-closed sender gating ────────────────────────────────────────
+// Automated comms actions (trigger_agent / auto_reply) let an inbound message
+// drive the agent loop or an LLM call. They may only be armed when the channel
+// carries an explicit, non-empty `allowed_user_ids` array — an empty or
+// missing allowlist means the operator never opted in, so automation is
+// refused with a logged denial (fail closed). Plain inbound message storage
+// is unaffected: it never executes anything.
+export function hasSenderAllowlist(config) {
+  const ids = config?.allowed_user_ids;
+  return Array.isArray(ids) && ids.length > 0;
+}
 
-// In-memory state
-const telegramPollers = new Map(); // channelId -> { offset, timer, stopFlag }
-const discordPollers = new Map();
+// Sender allowlist: only updates from Telegram user ids explicitly listed in
+// config.allowed_user_ids are processed. Fail closed: with an empty or
+// missing allowlist NO sender is allowed (callers additionally refuse to arm
+// trigger_agent/auto_reply at all when no allowlist is configured).
+export function telegramSenderAllowed(config, msg) {
+  const ids = config.allowed_user_ids;
+  if (!Array.isArray(ids) || ids.length === 0) return false;
+  const sid = String(msg.from?.id ?? '');
+  return sid !== '' && ids.map(String).includes(sid);
+}
 
-// ── Helpers ──
+// C2 identity gate: decide which CF user an inbound trigger runs as. Pure and
+// fail closed — only an explicitly resolved sender mapping (from
+// comms_user_sessions) is accepted. There is deliberately NO fallback to a
+// channel-configured user and NO fallback to the admin account: without a
+// known user the caller must refuse the trigger. Returns the user id, or null
+// when the trigger must be refused.
+export function resolveTriggerUserId(cfUserId) {
+  return (typeof cfUserId === 'string' && cfUserId.length > 0) ? cfUserId : null;
+}
 
-async function telegramApiCall(token, method, params = {}) {
+// Channel-config validation (C2): trigger_agent/auto_reply must not be enabled
+// without a non-empty allowed_user_ids. Returns an error message for the
+// operator, or null when the config is acceptable.
+export function validateCommsAutomationConfig(config) {
+  const cfg = config || {};
+  if ((cfg.trigger_agent || cfg.auto_reply) && !hasSenderAllowlist(cfg)) {
+    return 'trigger_agent/auto_reply require a non-empty allowed_user_ids array. ' +
+      'Set allowed_user_ids to the sender ids permitted to use automated actions before enabling them.';
+  }
+  return null;
+}
+
+// ── Module-level Telegram helpers ───────────────────────────
+// telegramApiCall is self-contained (token passed per call) so it lives at
+// module level, shared by the route closure, the notifier below, and the
+// learning-source Telegram adapter (exported for read-only getUpdates use).
+export async function telegramApiCall(token, method, params = {}) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
   const resp = await fetch(url, {
     method: 'POST',
@@ -33,6 +89,121 @@ async function telegramApiCall(token, method, params = {}) {
   if (!data.ok) throw new Error(`Telegram API returned !ok: ${JSON.stringify(data)}`);
   return data.result;
 }
+
+// ── Comms secret handling (M3) ──────────────────────────────────────
+// bot_token / webhook_secret are encrypted at rest with the same
+// AES-256-GCM store as LLM provider keys. isAesPacked() detects the
+// `iv:tag:ciphertext` format so plaintext is never double-encrypted and
+// already-encrypted values are never mistaken for plaintext.
+const COMMS_SECRET_KEYS = ['bot_token', 'webhook_secret'];
+
+export function encryptCommsSecrets(config) {
+  const out = { ...(config || {}) };
+  for (const k of COMMS_SECRET_KEYS) {
+    const v = out[k];
+    if (typeof v === 'string' && v && !isAesPacked(v)) out[k] = encryptSecret(v);
+  }
+  return out;
+}
+
+export function decryptCommsSecrets(config) {
+  const out = { ...(config || {}) };
+  for (const k of COMMS_SECRET_KEYS) {
+    const v = out[k];
+    if (isAesPacked(v)) {
+      const d = decryptSecret(v);
+      if (d != null) out[k] = d;
+    }
+  }
+  return out;
+}
+
+// ── Proactive Telegram notifier ───────────────────────────────
+// Used by the heartbeat agent pulse ("calls me" half of the on-call loop).
+// Sends `text` to every enabled Telegram channel's configured chat —
+// config.chat_id first, falling back to the first allowlisted user id
+// (sending to a user id works once they've started the bot).
+// Never throws: per-channel failures are logged, and with no Telegram
+// channel configured it resolves { sent: false }.
+export function createTelegramNotifier({ stmts, logger }) {
+  const log = logger || console;
+  return async function notifyTelegram(text) {
+    let channels = [];
+    try {
+      channels = stmts.commsChannels.getByPlatform.all('telegram');
+    } catch (e) {
+      log.warn(`[telegram-notify] Channel lookup failed: ${e.message}`);
+      return { sent: false, reason: 'lookup-failed' };
+    }
+    const sent = [];
+    for (const ch of channels) {
+      let config;
+      try { config = decryptCommsSecrets(JSON.parse(ch.config)); } catch { continue; }
+      if (!config.bot_token) continue;
+      const chatId = config.chat_id
+        || (Array.isArray(config.allowed_user_ids) && config.allowed_user_ids[0]);
+      if (!chatId) {
+        log.warn(`[telegram-notify] Channel "${ch.name}" has no chat_id or allowed_user_ids — skipped`);
+        continue;
+      }
+      try {
+        await telegramApiCall(config.bot_token, 'sendMessage', {
+          chat_id: chatId,
+          text: String(text).slice(0, 4000),
+        });
+        sent.push(ch.id);
+        log.info(`[telegram-notify] Sent to channel "${ch.name}"`);
+      } catch (e) {
+        log.warn(`[telegram-notify] Channel "${ch.name}" failed: ${e.message}`);
+      }
+    }
+    return { sent: sent.length > 0, channels: sent };
+  };
+}
+
+export default function commsRoutes(ctx) {
+  const { db, stmts, authMiddleware, requireRole, apiLimiter, logger, broadcast, callAgentLLM, fireHook, runAgentLoop } = ctx;
+  const router = express.Router();
+
+// Parse a channel row's config, migrating any plaintext secrets to
+// encrypted-at-rest in place, then return the decrypted config.
+// All in-closure config reads go through here.
+function loadChannelConfig(channel) {
+  let config = {};
+  try { config = JSON.parse(channel.config || '{}'); } catch { return {}; }
+  const migrated = encryptCommsSecrets(config);
+  if (JSON.stringify(migrated) !== JSON.stringify(config)) {
+    try {
+      stmts.commsChannels.update.run(channel.name, JSON.stringify(migrated), channel.enabled, channel.id);
+      channel.config = JSON.stringify(migrated);
+      logger.info(`[comms] migrated plaintext secrets to encrypted storage for channel "${channel.name}"`);
+    } catch (e) {
+      logger.warn(`[comms] secret migration failed for channel ${channel.id}: ${e.message}`);
+    }
+  }
+  return decryptCommsSecrets(migrated);
+}
+
+// Fail-closed automation gate (C2), evaluated at every ingress point after the
+// inbound message is stored: when a channel arms trigger_agent/auto_reply but
+// has no sender allowlist configured, automated actions are refused with a
+// logged denial. Channels with neither armed are unaffected.
+function automationAllowed(channel, config) {
+  if (!config.auto_reply && !config.trigger_agent) return true;
+  if (hasSenderAllowlist(config)) return true;
+  logger.warn(
+    `[comms] Refusing trigger_agent/auto_reply for channel "${channel.name}" (${channel.platform}): ` +
+    'allowed_user_ids is empty or missing — automated actions stay disabled until a non-empty allowlist is configured (fail closed).'
+  );
+  return false;
+}
+
+
+// In-memory state
+const telegramPollers = new Map(); // channelId -> { offset, timer, stopFlag }
+const discordPollers = new Map();
+
+// ── Helpers ──
 
 async function discordWebhookSend(webhookUrl, content, opts = {}) {
   const body = { content, username: opts.username || 'Cardinal Frame', ...opts.embeds ? { embeds: opts.embeds } : {} };
@@ -66,7 +237,7 @@ function storeCommsMessage(channelId, platform, direction, { remote_id, remote_u
 // ── Send agent result back to the comms channel ──
 
 async function sendCommsReply(channel, originalMsg, agentResult) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   const replyText = `🤖 ${agentResult.slice(0, 3000)}`;
 
   if (channel.platform === 'telegram') {
@@ -140,7 +311,7 @@ async function sendCommsReply(channel, originalMsg, agentResult) {
 // ── Telegram long-polling ──
 
 async function pollTelegram(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
   
   const state = telegramPollers.get(channel.id) || { offset: 0, stopFlag: false };
@@ -158,7 +329,16 @@ async function pollTelegram(channel) {
       
       const msg = update.message || update.channel_post;
       if (!msg || !msg.text) continue;
-      
+
+      // Sender allowlist (C2): when configured, only allowlisted senders are
+      // processed at all — before storing. With no allowlist configured,
+      // automated actions stay refused below (fail closed); plain inbound
+      // storage is still permitted.
+      if (hasSenderAllowlist(config) && !telegramSenderAllowed(config, msg)) {
+        logger.warn(`Skipped Telegram update from non-allowlisted sender ${msg.from?.id} for channel ${channel.name}`);
+        continue;
+      }
+
       // Store inbound message
       const commsMsg = storeCommsMessage(channel.id, 'telegram', 'inbound', {
         remote_id: String(msg.from?.id || msg.chat?.id || ''),
@@ -170,8 +350,11 @@ async function pollTelegram(channel) {
       
       logger.info(`Telegram inbound from ${commsMsg.remote_username}: ${msg.text.slice(0, 60)}`);
       
+      // C2 fail-closed automation gate (evaluated once per update; logs on denial).
+      const automationOk = automationAllowed(channel, config);
+      
       // Auto-respond if configured
-      if (config.auto_reply) {
+      if (config.auto_reply && automationOk) {
         try {
           const reply = await generateAutoReply(msg.text, channel);
           await telegramApiCall(config.bot_token, 'sendMessage', {
@@ -196,10 +379,11 @@ async function pollTelegram(channel) {
         }
       }
       
-      // Trigger agent if configured
-      if (config.trigger_agent && msg.text) {
+      // Trigger agent if configured (sender must resolve to a CF user; otherwise refused)
+      if (config.trigger_agent && msg.text && automationOk) {
         try {
-          const agentSessionId = await triggerAgentFromComms(channel, commsMsg);
+          const cfUserId = resolveCommsUser('telegram', String(msg.from?.id || msg.chat?.id || ''), msg.from?.username || msg.from?.first_name || '');
+          const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
           if (agentSessionId) {
             stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
           }
@@ -224,7 +408,7 @@ async function pollTelegram(channel) {
 // ── Discord (webhook for outbound, bot polling for inbound) ──
 
 async function pollDiscord(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
   
   const state = discordPollers.get(channel.id) || { lastMsgId: null, stopFlag: false };
@@ -262,8 +446,11 @@ async function pollDiscord(channel) {
       
       logger.info(`Discord inbound from ${commsMsg.remote_username}: ${dm.content.slice(0, 60)}`);
       
+      // C2 fail-closed automation gate (evaluated once per message; logs on denial).
+      const automationOk = automationAllowed(channel, config);
+      
       // Auto-respond
-      if (config.auto_reply) {
+      if (config.auto_reply && automationOk) {
         try {
           const reply = await generateAutoReply(dm.content, channel);
           await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
@@ -282,10 +469,11 @@ async function pollDiscord(channel) {
         }
       }
       
-      // Trigger agent
-      if (config.trigger_agent && dm.content) {
+      // Trigger agent (sender must resolve to a CF user; otherwise refused)
+      if (config.trigger_agent && dm.content && automationOk) {
         try {
-          const agentSessionId = await triggerAgentFromComms(channel, commsMsg);
+          const cfUserId = resolveCommsUser('discord', dm.author?.id || '', dm.author?.username || '');
+          const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
           if (agentSessionId) {
             stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
           }
@@ -310,7 +498,7 @@ async function pollDiscord(channel) {
 // ── Auto-reply generator (uses LLM if configured, else echo) ──
 
 async function generateAutoReply(text, channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   
   if (config.auto_reply_template) {
     return config.auto_reply_template.replace('{text}', text);
@@ -337,14 +525,21 @@ async function generateAutoReply(text, channel) {
 // ── Trigger an agent session from an incoming comms message ──
 
 async function triggerAgentFromComms(channel, commsMsg, cfUserId) {
-  const config = JSON.parse(channel.config);
-  const userId = cfUserId || config.user_id || 'haz-001'; // default to admin
-  
-  // Find or create a user mapping
-  if (!stmts.users.getById) {
-    stmts.users.getById = db.prepare('SELECT * FROM users WHERE id = ?');
+  const config = loadChannelConfig(channel);
+  // C2 fail closed on identity: the caller must resolve the inbound sender to
+  // a CF user via comms_user_sessions (resolveCommsUser) and pass it in.
+  // There is no fallback to a channel-configured user and no fallback to the
+  // admin account — without a known user we refuse rather than impersonate.
+  const userId = resolveTriggerUserId(cfUserId);
+  if (!userId) {
+    logger.warn(
+      `[comms] Refusing trigger_agent for channel "${channel.name}" (${channel.platform}): ` +
+      `no CF user mapped for sender ${commsMsg.remote_username || '?'} (${commsMsg.remote_id || '?'}) — ` +
+      'assign one via PUT /api/comms/sessions/:id (fail closed).'
+    );
+    return null;
   }
-  
+
   const sessionId = randomUUID();
   const task = `[${channel.platform}/${channel.name}] ${commsMsg.content}`;
   const scope = config.agent_scope || 'sandbox';
@@ -371,7 +566,7 @@ async function triggerAgentFromComms(channel, commsMsg, cfUserId) {
 const discordGateways = new Map(); // channelId -> { ws, heartbeatTimer, seq, sessionId, stopFlag }
 
 async function connectDiscordGateway(channel) {
-  const config = JSON.parse(channel.config);
+  const config = loadChannelConfig(channel);
   if (!config.bot_token) return;
 
   // Stop REST poller if running — gateway replaces it
@@ -446,11 +641,11 @@ async function connectDiscordGateway(channel) {
 
               logger.info(`Discord WS inbound from ${commsMsg.remote_username}: ${(d.content || '').slice(0, 60)}`);
 
-              // Route to user session
-              const cfUserId = resolveCommsUser('discord', d.author?.id || '', d.author?.username || '', config);
+              // C2 fail-closed automation gate (logs on denial).
+              const automationOk = automationAllowed(channel, config);
 
               // Auto-respond if configured
-              if (config.auto_reply) {
+              if (config.auto_reply && automationOk) {
                 try {
                   const reply = await generateAutoReply(d.content, channel);
                   await fetch(`https://discord.com/api/v10/channels/${d.channel_id}/messages`, {
@@ -467,9 +662,10 @@ async function connectDiscordGateway(channel) {
                 } catch (e) { logger.error(`Discord WS auto-reply failed: ${e.message}`); }
               }
 
-              // Trigger agent if configured
-              if (config.trigger_agent && d.content) {
+              // Trigger agent if configured (sender must resolve to a CF user; otherwise refused)
+              if (config.trigger_agent && d.content && automationOk) {
                 try {
+                  const cfUserId = resolveCommsUser('discord', d.author?.id || '', d.author?.username || '');
                   const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
                   if (agentSessionId) stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
                 } catch (e) { logger.error(`Agent trigger from Discord WS failed: ${e.message}`); }
@@ -540,21 +736,38 @@ function disconnectDiscordGateway(channelId) {
 
 // ── Session routing: map remote platform users to CF user sessions ──
 
-function resolveCommsUser(platform, remoteId, remoteUsername, channelConfig) {
+// Sender → CF user resolution (C2). Returns the mapped CF user id, or null when
+// the sender must not trigger anything. Fail closed: a sender with no mapping —
+// or a mapping with no CF user assigned yet — never resolves to the admin
+// account or any other default. New senders get an *unassigned* mapping row
+// (cf_user_id = '') so the admin can see them in GET /api/comms/sessions and
+// assign a CF user via PUT /api/comms/sessions/:id; until then, triggers from
+// that sender are refused.
+function resolveCommsUser(platform, remoteId, remoteUsername) {
   // Check for existing mapping
   let mapping = stmts.commsUserSessions.getByPlatformRemote.get(platform, remoteId);
-  if (mapping) {
-    // Update last-active + username
-    stmts.commsUserSessions.updateLastActive.run(remoteUsername, platform, remoteId);
-    return mapping.cf_user_id;
+  if (!mapping) {
+    const mappingId = randomUUID();
+    try {
+      stmts.commsUserSessions.insert.run(mappingId, platform, remoteId, remoteUsername, '', null);
+    } catch (e) {
+      // Concurrent insert won the race — re-read the winner's row.
+      mapping = stmts.commsUserSessions.getByPlatformRemote.get(platform, remoteId);
+    }
+    if (!mapping) {
+      logger.info(`Comms session mapping created (unassigned): ${platform}/${remoteUsername || remoteId} — assign a CF user via PUT /api/comms/sessions/:id before triggers will run`);
+      return null;
+    }
   }
-
-  // Create new mapping — default to admin user or configured user
-  const defaultUserId = channelConfig?.user_id || 'haz-001';
-  const mappingId = randomUUID();
-  stmts.commsUserSessions.insert.run(mappingId, platform, remoteId, remoteUsername, defaultUserId, null);
-  logger.info(`Comms session mapping created: ${platform}/${remoteUsername} → ${defaultUserId}`);
-  return defaultUserId;
+  // Update last-active + username (non-fatal if it fails)
+  try {
+    stmts.commsUserSessions.updateLastActive.run(remoteUsername, platform, remoteId);
+  } catch (e) { /* ignore */ }
+  if (!mapping.cf_user_id) {
+    logger.warn(`[comms] Refusing trigger for ${platform}/${remoteUsername || remoteId}: sender has no CF user assigned (fail closed)`);
+    return null;
+  }
+  return mapping.cf_user_id;
 }
 
 // ── Start/stop pollers for enabled channels ──
@@ -585,7 +798,7 @@ setTimeout(() => {
   try {
     const channels = stmts.commsChannels.getEnabled.all();
     for (const ch of channels) {
-      const config = JSON.parse(ch.config);
+      const config = loadChannelConfig(ch);
       if (ch.platform === 'telegram' && config.bot_token) startChannelPoller(ch);
       if (ch.platform === 'discord' && config.bot_token && config.channel_id) {
         if (config.gateway_mode) {
@@ -606,7 +819,7 @@ router.get('/comms/channels', authMiddleware, (_req, res) => {
   try {
     const channels = stmts.commsChannels.getAll.all().map(c => ({
       ...c,
-      config: JSON.parse(c.config),
+      config: loadChannelConfig(c),
       polling: c.polling,
     }));
     res.json(channels);
@@ -619,9 +832,13 @@ router.post('/comms/channels', authMiddleware, requireRole('admin'), apiLimiter,
     const { platform, name, config, enabled = true } = req.body;
     if (!platform || !name) return res.status(400).json({ error: 'platform and name required' });
     if (!['telegram', 'discord'].includes(platform)) return res.status(400).json({ error: 'Invalid platform' });
+    // C2: trigger_agent/auto_reply must not be enabled without a non-empty
+    // allowed_user_ids — fail closed at config time.
+    const cfgErr = validateCommsAutomationConfig(config || {});
+    if (cfgErr) return res.status(400).json({ error: cfgErr });
     
     const id = randomUUID();
-    const configStr = JSON.stringify(config || {});
+    const configStr = JSON.stringify(encryptCommsSecrets(config || {}));
     stmts.commsChannels.insert.run(id, platform, name, configStr, enabled ? 1 : 0);
     const channel = stmts.commsChannels.getById.get(id);
     
@@ -635,7 +852,7 @@ router.post('/comms/channels', authMiddleware, requireRole('admin'), apiLimiter,
     }
     
     broadcast('comms:channel', { type: 'created', channel });
-    res.status(201).json({ ...channel, config: JSON.parse(channel.config) });
+    res.status(201).json({ ...channel, config: decryptCommsSecrets(JSON.parse(channel.config)) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -646,8 +863,14 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
     
     const { name, config, enabled } = req.body;
+    // C2: enabling trigger_agent/auto_reply requires a non-empty
+    // allowed_user_ids — fail closed at config time.
+    if (config) {
+      const cfgErr = validateCommsAutomationConfig(config);
+      if (cfgErr) return res.status(400).json({ error: cfgErr });
+    }
     const newName = name ?? channel.name;
-    const newConfig = config ? JSON.stringify(config) : channel.config;
+    const newConfig = config ? JSON.stringify(encryptCommsSecrets(config)) : channel.config;
     const newEnabled = enabled !== undefined ? (enabled ? 1 : 0) : channel.enabled;
     
     stmts.commsChannels.update.run(newName, newConfig, newEnabled, channel.id);
@@ -655,7 +878,7 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     
     // Start/stop pollers
     if (newEnabled) {
-      const configParsed = JSON.parse(newConfig);
+      const configParsed = decryptCommsSecrets(JSON.parse(newConfig));
       if (channel.platform === 'telegram' && configParsed.bot_token) startChannelPoller(updated);
       if (channel.platform === 'discord' && configParsed.bot_token && configParsed.channel_id) {
         if (configParsed.gateway_mode) connectDiscordGateway(updated);
@@ -666,7 +889,7 @@ router.put('/comms/channels/:id', authMiddleware, requireRole('admin'), apiLimit
     }
     
     broadcast('comms:channel', { type: 'updated', channel: updated });
-    res.json({ ...updated, config: JSON.parse(updated.config) });
+    res.json({ ...updated, config: decryptCommsSecrets(JSON.parse(updated.config)) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -691,7 +914,7 @@ router.post('/comms/dispatch', authMiddleware, requireRole('admin'), apiLimiter,
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
     
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     
     if (channel.platform === 'telegram') {
       if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
@@ -772,20 +995,36 @@ router.get('/comms/status', authMiddleware, (_req, res) => {
 // Register Telegram webhook (one-click setup)
 router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   try {
-    const { channel_id, webhook_url } = req.body;
+    const { channel_id, webhook_url, allowed_user_ids } = req.body;
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
+
+    // Sender allowlist: lock the bot to specific Telegram user ids. Accepts
+    // an array or a comma-separated string. Only allowlisted senders are
+    // processed by the webhook receiver and the poller.
+    if (allowed_user_ids !== undefined) {
+      const ids = Array.isArray(allowed_user_ids)
+        ? allowed_user_ids
+        : String(allowed_user_ids).split(',').map(s => s.trim()).filter(Boolean);
+      config.allowed_user_ids = ids.map(String);
+    }
 
     const baseUrl = webhook_url || req.body.base_url;
     if (!baseUrl) return res.status(400).json({ error: 'webhook_url or base_url required' });
     const fullUrl = `${baseUrl.replace(/\/$/, '')}/api/comms/telegram/webhook?channel_id=${channel_id}`;
 
+    // (Re)generate the webhook secret on every registration and hand it to
+    // Telegram via secret_token — Telegram echoes it back in the
+    // X-Telegram-Bot-Api-Secret-Token header, which the receiver verifies.
+    // Without this, anyone on the internet could forge updates.
+    config.webhook_secret = randomBytes(32).toString('hex');
+
     // Delete existing webhook, then set new one
     await telegramApiCall(config.bot_token, 'deleteWebhook', {});
-    const result = await telegramApiCall(config.bot_token, 'setWebhook', { url: fullUrl, allowed_updates: ['message', 'channel_post'] });
+    const result = await telegramApiCall(config.bot_token, 'setWebhook', { url: fullUrl, allowed_updates: ['message', 'channel_post'], secret_token: config.webhook_secret });
 
     // Stop polling if active, switch to webhook mode
     stopChannelPoller(channel_id);
@@ -794,7 +1033,12 @@ router.post('/comms/telegram/setup-webhook', authMiddleware, requireRole('admin'
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
 
     logger.info(`Telegram webhook registered for channel ${channel.name}: ${fullUrl}`);
-    res.json({ ok: true, webhook_url: fullUrl, description: result.description || 'Webhook set' });
+    res.json({
+      ok: true,
+      webhook_url: fullUrl,
+      description: result.description || 'Webhook set',
+      allowed_user_ids: config.allowed_user_ids || [],
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -805,12 +1049,13 @@ router.post('/comms/telegram/remove-webhook', authMiddleware, requireRole('admin
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'telegram') return res.status(400).json({ error: 'Telegram channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
 
     await telegramApiCall(config.bot_token, 'deleteWebhook', {});
     config.webhook_mode = false;
     delete config.webhook_url;
+    delete config.webhook_secret;
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
 
     // Restart polling
@@ -827,7 +1072,7 @@ router.post('/comms/discord/setup-commands', authMiddleware, requireRole('admin'
     if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
     const channel = stmts.commsChannels.getById.get(channel_id);
     if (!channel || channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token) return res.status(400).json({ error: 'No bot_token configured' });
 
     // Register global slash commands
@@ -854,6 +1099,32 @@ router.post('/comms/discord/setup-commands', authMiddleware, requireRole('admin'
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Provision/rotate the Discord webhook secret (admin only). The receiver
+// rejects any call without the secret in the X-Webhook-Secret header, so
+// configure the sender with the returned values.
+router.post('/comms/discord/setup-webhook', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  try {
+    const { channel_id, base_url } = req.body;
+    if (!channel_id) return res.status(400).json({ error: 'channel_id required' });
+    const channel = stmts.commsChannels.getById.get(channel_id);
+    if (!channel || channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
+
+    const config = JSON.parse(channel.config || '{}');
+    config.webhook_secret = randomBytes(32).toString('hex');
+    stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel_id);
+
+    const baseUrl = (base_url || '').replace(/\/$/, '');
+    logger.info(`Discord webhook secret provisioned for channel ${channel.name}`);
+    res.json({
+      ok: true,
+      webhook_url: `${baseUrl}/api/comms/discord/webhook?channel_id=${channel_id}`,
+      webhook_secret: config.webhook_secret,
+      header: 'X-Webhook-Secret',
+      note: 'Store the secret where the webhook sender runs. The receiver rejects calls without it.',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Telegram webhook receiver (alternative to polling)
 router.post('/comms/telegram/webhook', async (req, res) => {
   try {
@@ -861,10 +1132,28 @@ router.post('/comms/telegram/webhook', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channel_id query param required' });
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
+
+    // Authenticate the caller: when the channel has a provisioned secret_token
+    // (set via setup-webhook / setWebhook), the header must match. Fail closed —
+    // a wrong secret is always rejected. Channels without a provisioned secret
+    // keep the legacy no-secret behavior with automation gated below.
+    const authConfig = loadChannelConfig(channel);
+    if (authConfig.webhook_secret && !webhookSecretsMatch(req.headers['x-telegram-bot-api-secret-token'], authConfig.webhook_secret)) {
+      logger.warn(`Rejected unauthenticated Telegram webhook for channel ${channel.id}`);
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     
     const update = req.body;
     const msg = update.message || update.channel_post;
     if (msg && msg.text) {
+      // Sender allowlist (C2): when configured, drop updates from anyone not
+      // explicitly allowed. Ack ok so we don't signal the bot's configuration
+      // to strangers. With no allowlist, automated actions stay refused below
+      // (fail closed); plain inbound storage is still permitted.
+      if (hasSenderAllowlist(authConfig) && !telegramSenderAllowed(authConfig, msg)) {
+        logger.warn(`Rejected Telegram update from non-allowlisted sender ${msg.from?.id} for channel ${channel.id}`);
+        return res.json({ ok: true });
+      }
       const commsMsg = storeCommsMessage(channel.id, 'telegram', 'inbound', {
         remote_id: String(msg.from?.id || msg.chat?.id || ''),
         remote_username: msg.from?.username || msg.from?.first_name || '',
@@ -873,8 +1162,10 @@ router.post('/comms/telegram/webhook', async (req, res) => {
         status: 'received',
       });
       
-      const config = JSON.parse(channel.config);
-      if (config.auto_reply) {
+      const config = loadChannelConfig(channel);
+      // C2 fail-closed automation gate (logs on denial).
+      const automationOk = automationAllowed(channel, config);
+      if (config.auto_reply && automationOk) {
         try {
           const reply = await generateAutoReply(msg.text, channel);
           await telegramApiCall(config.bot_token, 'sendMessage', {
@@ -891,9 +1182,10 @@ router.post('/comms/telegram/webhook', async (req, res) => {
         } catch (e) { logger.error(`Telegram webhook reply failed: ${e.message}`); }
       }
       
-      if (config.trigger_agent) {
+      if (config.trigger_agent && automationOk) {
         try {
-          const agentSessionId = await triggerAgentFromComms(channel, commsMsg);
+          const cfUserId = resolveCommsUser('telegram', String(msg.from?.id || msg.chat?.id || ''), msg.from?.username || msg.from?.first_name || '');
+          const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
           if (agentSessionId) stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
         } catch (e) { logger.error(`Agent trigger from webhook failed: ${e.message}`); }
       }
@@ -912,11 +1204,22 @@ router.post('/comms/discord/webhook', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channel_id query param required' });
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
-    
+
+    // Authenticate the caller: when a webhook_secret has been provisioned via
+    // /comms/discord/setup-webhook it must arrive in the X-Webhook-Secret
+    // header. NOTE: this endpoint does not speak the real Discord interactions
+    // protocol — if it ever does, verify Ed25519 signatures
+    // (X-Signature-Ed25519) against the application public key instead of / in
+    // addition to this shared secret.
+    const authConfig = loadChannelConfig(channel);
     const interaction = req.body;
     if (interaction.type === 1) {
       // Discord interaction type 1 = PING
       return res.json({ type: 1 });
+    }
+    if (authConfig.webhook_secret && !webhookSecretsMatch(req.headers['x-webhook-secret'], authConfig.webhook_secret)) {
+      logger.warn(`Rejected unauthenticated Discord webhook for channel ${channel.id}`);
+      return res.status(403).json({ error: 'Forbidden' });
     }
     
     if (interaction.data?.content || interaction.content) {
@@ -932,10 +1235,14 @@ router.post('/comms/discord/webhook', async (req, res) => {
         status: 'received',
       });
       
-      const config = JSON.parse(channel.config);
-      if (config.trigger_agent) {
+      const config = loadChannelConfig(channel);
+      // C2 fail-closed automation gate: trigger_agent requires a non-empty
+      // allowed_user_ids (logs on denial). The sender must also resolve to a
+      // CF user via comms_user_sessions, otherwise the trigger is refused.
+      if (config.trigger_agent && automationAllowed(channel, config)) {
         try {
-          const agentSessionId = await triggerAgentFromComms(channel, commsMsg);
+          const cfUserId = resolveCommsUser('discord', userId, username);
+          const agentSessionId = await triggerAgentFromComms(channel, commsMsg, cfUserId);
           if (agentSessionId) stmts.commsMessages.updateAgentSession.run(agentSessionId, commsMsg.id);
         } catch (e) { logger.error(`Agent trigger from Discord webhook failed: ${e.message}`); }
       }
@@ -969,7 +1276,7 @@ router.post('/comms/discord/:id/start-gateway', authMiddleware, requireRole('adm
     const channel = stmts.commsChannels.getById.get(req.params.id);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
     if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     if (!config.bot_token || !config.channel_id) return res.status(400).json({ error: 'bot_token and channel_id required' });
 
     config.gateway_mode = true;
@@ -987,7 +1294,7 @@ router.post('/comms/discord/:id/stop-gateway', authMiddleware, requireRole('admi
     if (channel.platform !== 'discord') return res.status(400).json({ error: 'Discord channel required' });
 
     disconnectDiscordGateway(channel.id);
-    const config = JSON.parse(channel.config);
+    const config = loadChannelConfig(channel);
     config.gateway_mode = false;
     stmts.commsChannels.update.run(channel.name, JSON.stringify(config), channel.enabled ? 1 : 0, channel.id);
 

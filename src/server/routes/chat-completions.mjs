@@ -38,7 +38,7 @@ export default function chatCompletionsRoutes(ctx) {
   const { db, stmts, logger, authMiddleware, optionalAuth, apiLimiter, audit, broadcast, randomUUID, fireHook } = ctx;
   const router = express.Router();
 
-  router.get('/personas', optionalAuth, (_req, res) => {
+  router.get('/personas', authMiddleware, (_req, res) => {
     res.json({ personas: listPersonas(stmts), default: getActivePersonaId(db) });
   });
 
@@ -53,7 +53,7 @@ export default function chatCompletionsRoutes(ctx) {
     res.json({ ok: true, active: id, persona });
   });
 
-  router.get('/personas/:id', optionalAuth, (req, res) => {
+  router.get('/personas/:id', authMiddleware, (req, res) => {
     if (!PERSONAS[req.params.id]) return res.status(404).json({ error: 'Unknown persona' });
     res.json({ persona: getPersonaDetail(stmts, req.params.id) });
   });
@@ -140,6 +140,9 @@ export default function chatCompletionsRoutes(ctx) {
 
       try {
         const fetch = globalThis.fetch;
+        // Intentional direct fetch: provider URLs are admin-configured (all provider
+        // writes are requireRole('admin')); Ollama at localhost is explicitly supported
+        // (see isOllama failover below), which safeFetch's localhost block would break.
         const { headers, url: chatUrl } = buildProviderAuth(provider, url);
         const resp = await fetch(chatUrl, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(30000) });
 
@@ -235,6 +238,8 @@ export default function chatCompletionsRoutes(ctx) {
     } else {
       try {
         const fetch = globalThis.fetch;
+        // Intentional direct fetch: same as above — admin-configured provider URL,
+        // Ollama localhost explicitly supported; safeFetch would break it.
         const { headers: nonStreamHeaders, url: nonStreamUrl } = buildProviderAuth(provider, url);
         const nonStreamPayload = buildChatPayload(pType, modelId, messages, false);
         const resp = await fetch(nonStreamUrl, { method: 'POST', headers: nonStreamHeaders, body: JSON.stringify(nonStreamPayload), signal: AbortSignal.timeout(30000) });

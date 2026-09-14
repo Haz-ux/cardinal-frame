@@ -72,6 +72,14 @@ export default function heartbeatRoutes(ctx) {
     }
   });
 
+  router.get('/heartbeat/status', authMiddleware, (_req, res) => {
+    if (globalThis._heartbeat) {
+      res.json(globalThis._heartbeat.status());
+    } else {
+      res.json({ running: false, pulse: { enabled: false, ready: false } });
+    }
+  });
+
   // ─── Skill Match ─────────────────────────────────────────────────
   router.get('/skills/match/:input', authMiddleware, (req, res) => {
     try {
@@ -109,6 +117,11 @@ export default function heartbeatRoutes(ctx) {
           JSON.stringify(s.parameters || {}), 1, s.confidence || 0.5, 0,
           s.trigger || '', 1
         );
+        // Seed skills that use the network get the egress gate opened —
+        // same heuristic as migration 020's grandfathering.
+        if (/fetch\s*\(|\bcurl\b|\bwget\b/.test(s.handler || '')) {
+          stmts.skills.setNetworkAccess.run(1, id);
+        }
         seeded.push(s.name);
       }
 
