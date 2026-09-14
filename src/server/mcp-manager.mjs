@@ -121,11 +121,24 @@ export function startMcpManager(deps) {
     }
   }
 
+  // Per-server scoped environment: only keys the ADMIN stored on the row are
+  // ever passed to the child (mcp-client only inherits a safe allowlist from
+  // process.env — never secrets). This is the explicit capability mechanism
+  // for giving an MCP server the credentials it genuinely needs.
+  function serverEnvOpts(row) {
+    if (!row || !row.env) return undefined;
+    try {
+      const parsed = JSON.parse(row.env);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { env: parsed };
+    } catch { /* malformed env config → no env passed */ }
+    return undefined;
+  }
+
   async function connectTracked(row, command, args) {
     const { id, name } = row;
     const s = state.get(id);
     try {
-      const result = await mcp.connectServer(id, command, args);
+      const result = await mcp.connectServer(id, command, args, serverEnvOpts(row));
       const tools = result?.tools || await mcp.listTools(id).catch(() => []);
       surfaceTools(id, name, tools);
       markStatus(id, 'connected');
@@ -157,7 +170,7 @@ export function startMcpManager(deps) {
     s.backoffTimer = setTimeout(() => {
       s.backoffTimer = null;
       if (stopped) return;
-      mcp.reconnectServer(id, command, args)
+      mcp.reconnectServer(id, command, args, serverEnvOpts(row))
         .then(async (result) => {
           const tools = result?.tools || await mcp.listTools(id).catch(() => []);
           surfaceTools(id, name, tools);

@@ -202,8 +202,8 @@ function renderHandlerSkeleton(kind, candidate, spec, caps) {
   // never touches learned text at all.
   const stepData = (spec.procedure || []).map(p => ({
     step: Number(p && p.step) || 0,
-    action: String(p && p.action != null ? p.action : ''),
-    why: String(p && p.why != null ? p.why : ''),
+    action: stripLineTerminators(String(p && p.action != null ? p.action : '')),
+    why: stripLineTerminators(String(p && p.why != null ? p.why : '')),
   }));
   const stepComments = stepData
     .map(p => `    // ${p.step}. ${stripLineTerminators(p.action)}`)
@@ -283,8 +283,13 @@ export function compile(db, candidateId, userId) {
 
   let caps = [];
   try {
-    const parsed = JSON.parse(candidate.requested_caps || '[]');
-    if (Array.isArray(parsed)) caps = parsed.map(c => String(c));
+    // parseCandidateRow already coerces requested_caps to an array; handle
+    // both raw TEXT ('["exec"]') and pre-parsed array shapes.
+    const raw = candidate.requested_caps;
+    caps = Array.isArray(raw)
+      ? raw.filter(c => typeof c === 'string').map(c => c)
+      : JSON.parse(raw || '[]');
+    if (!Array.isArray(caps)) caps = [];
   } catch { caps = []; }
 
   const decision = decideKind(spec, candidate.risk_tier, caps, candidate.kind);

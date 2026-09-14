@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -172,8 +172,16 @@ describe('scoring math', () => {
   });
 
   it('is deterministic', () => {
-    const items = [mkItem('success', 't', 'success'), mkItem('success', 't', 'success')];
-    expect(scoreCandidate(items, 'low').promotionScore).toBe(scoreCandidate(items, 'low').promotionScore);
+    // Freeze the clock: scoreCandidate folds Date.now() into recency, so
+    // two back-to-back calls drift by ms otherwise.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T00:00:00.000Z'));
+    try {
+      const items = [mkItem('success', 't', 'success'), mkItem('success', 't', 'success')];
+      expect(scoreCandidate(items, 'low').promotionScore).toBe(scoreCandidate(items, 'low').promotionScore);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('matches the documented formula: 3 successes, low risk → 2.625', () => {

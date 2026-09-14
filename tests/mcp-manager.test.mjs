@@ -96,6 +96,16 @@ function makeDeps(servers, extra = {}) {
 
 const trackedTools = () => agentTools.filter(t => t.name.startsWith('mcp_') && t.name.includes('__'));
 
+// The agentTools registry is module-global and managers never unregister
+// their own tools on stop() — so test-to-test leakage (stale tool.execute
+// closures bound to a previous test's fake state) breaks isolation. Clear
+// every MCP-surfaced tool after each test.
+afterEach(() => {
+  for (const t of [...agentTools]) {
+    if (t.name.startsWith('mcp_') && t.name.includes('__')) unregisterAgentTool(t.name);
+  }
+});
+
 // ─── Tests ──────────────────────────────────────────────────────────
 describe('unregisterAgentTool', () => {
   afterEach(() => {

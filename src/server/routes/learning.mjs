@@ -830,6 +830,11 @@ export default function learningRoutes(ctx) {
         fallback_rate: totalDecisions > 0 ? fallbacks / totalDecisions : 0,
         avg_margin: avgMargin ?? null,
       },
+      summary: {
+        total_decisions: totalDecisions,
+        fallback_rate: totalDecisions > 0 ? fallbacks / totalDecisions : 0,
+        avg_margin: avgMargin ?? null,
+      },
     });
   });
 

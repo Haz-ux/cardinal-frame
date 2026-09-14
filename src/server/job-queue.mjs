@@ -186,8 +186,30 @@ export function createJobQueue(db, opts = {}) {
   // so node types, data flow, and the sanitizeCommand allowlist apply here too.
   registerHandler('dag', async (job, ctx) => {
     const { payload, id: jobId } = job;
-    const { dagId, nodes, edges } = JSON.parse(payload);
+    const { dagId, nodes, edges, policyActor } = JSON.parse(payload);
     const { db, broadcast } = ctx;
+
+    // P1.8: DAGs cannot bypass the policy layer. The runner's principal is
+    // carried on the job; every node's capability is decided before execution.
+    let policyDecide = null;
+    let CAPABILITIES = null;
+    try {
+      const policyMod = await import('./defense/policy.mjs');
+      policyDecide = policyMod.decide;
+      CAPABILITIES = policyMod.CAPABILITIES;
+    } catch {}
+    const policyGate = async (subject) => {
+      if (!policyDecide) return { allowed: true };
+      const capability = subject.nodeType === 'task' ? CAPABILITIES.PROCESS_EXECUTION : CAPABILITIES.CODE_EXECUTION;
+      const decision = await policyDecide({
+        actor: policyActor || { id: 'dag', role: 'system' },
+        capability,
+        resource: `${subject.nodeType}:${subject.node?.id}`,
+        scope: 'system',
+        provenance: 'user',
+      });
+      return decision;
+    };
 
     // Prepared statement to update DAG status in the dags table
     // (wrapped in try — the dags table may not exist in isolated queue tests)
@@ -206,6 +228,7 @@ export function createJobQueue(db, opts = {}) {
         edges: edges || [], // tolerate jobs enqueued before edges were stored
         sanitizeCommand,
         broadcast,
+        policyGate,
         dagId,
         timeoutMs: job.timeout_ms,
         events: {

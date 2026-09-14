@@ -1,7 +1,7 @@
 import express from 'express';
 import { randomUUID, createHash } from 'crypto';
 import { spawn } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync, mkdirSync } from 'fs';
 import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { sanitizeFtsQuery } from './memory.mjs';
@@ -9,8 +9,9 @@ import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
 import { record as recordLearningEvent } from '../learning/events.mjs';
 import { shadowRoute } from '../learning/retrieval.mjs';
-import { sanitizeCommand, spawnArgv } from '../command-safety.mjs';
+import { sanitizeCommand, sanitizeAgentCommand, spawnArgv } from '../command-safety.mjs';
 import { safeFetch } from '../safe-fetch.mjs';
+import { decide as policyDecide, CAPABILITIES } from '../defense/policy.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -43,24 +44,94 @@ const _deps = new Proxy({}, {
   get(_t, prop) { return _ctxRef?.[prop]; },
 });
 
-function resolveSandboxPath(scope, targetPath) {
-  const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
-  const resolved = path.resolve(base, targetPath || '.');
-  if (!resolved.startsWith(base)) {
-    throw new Error('Path traversal blocked: target outside scope');
-  }
-  return resolved;
+// ─── Filesystem containment (P0: realpath + relative gate) ─────────
+// The old lexical `resolved.startsWith(base)` check is NOT a filesystem
+// boundary: `..` traversal, sibling-prefix collisions (`/x-secret` vs `/x`),
+// and symlink escapes all defeat it. This resolver:
+//   1. rejects `..` / absolute escapes lexically (fast first gate),
+//   2. realpath()s the configured scope root (its true identity),
+//   3. realpath()s the deepest EXISTING ancestor of the target (so a
+//      symlinked parent directory is resolved to what it actually points at),
+//   4. joins the remaining "new" path components to that real ancestor, then
+//   5. requires the result to remain inside the real scope root via
+//      path.relative(). Sibling-prefix attacks fail here because the real
+//      root `/srv/ws` and `/srv/ws-secret` differ by more than a path prefix.
+// Fail closed: any resolution that escapes is rejected with a traversal error.
+
+function ensureBaseExists(base) {
+  try { mkdirSync(base, { recursive: true }); return realpathSync(base); }
+  catch { throw new Error('Path traversal blocked: cannot access scope root'); }
 }
 
-// ─── Shared shell-free command runner (C1 fix) ─────────────────────
+function deepestExistingAncestor(candidate) {
+  let cur = candidate;
+  while (true) {
+    if (existsSync(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+export function resolveSandboxPath(scope, targetPath, options = {}) {
+  const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
+  const candidate = path.resolve(base, String(targetPath || '.'));
+
+  // Gate 1 — lexical containment (fast reject of obvious escapes).
+  const relLex = path.relative(base, candidate);
+  if (relLex === '..' || relLex.startsWith(`..${path.sep}`) || path.isAbsolute(relLex)) {
+    throw new Error('Path traversal blocked: target outside scope');
+  }
+
+  const realBase = ensureBaseExists(base);
+
+  // Gate 2 — real containment. Resolve symlinks for every EXISTING part of
+  // the target; only the final "not yet created" components stay unresolved
+  // (they are plain names under an already-contained real ancestor).
+  const existingAncestor = deepestExistingAncestor(candidate);
+  let realTarget;
+  if (existingAncestor) {
+    const realAncestor = realpathSync(existingAncestor);
+    const tail = path.relative(existingAncestor, candidate);
+    if (tail === '..' || tail.startsWith(`..${path.sep}`) || path.isAbsolute(tail)) {
+      throw new Error('Path traversal blocked: target outside scope');
+    }
+    realTarget = tail ? path.join(realAncestor, tail) : realAncestor;
+  } else {
+    realTarget = path.join(realBase, path.relative(base, candidate));
+  }
+
+  const relReal = path.relative(realBase, realTarget);
+  if (relReal === '..' || relReal.startsWith(`..${path.sep}`) || path.isAbsolute(relReal)) {
+    throw new Error('Path traversal blocked: target resolves outside scope (symlink escape)');
+  }
+  return realTarget;
+}
+
+// ─── Shared shell-free command runner (C1 fix + P0.2 agent policy) ──
 // The agent's shell_exec tool and POST /api/agent/exec both run through
-// here: the shared sanitizeCommand allowlist + spawn(shell:false) — the same
-// path as executeTask. No shell ever interprets the command string, so
-// shell metacharacters are rejected, never executed. Returns a result
-// object (never throws for bad input) so agent loops stay alive.
-async function runAgentCommand(command, workDir) {
-  const check = sanitizeCommand(command);
-  if (!check.safe) return { error: `Command blocked by safety filter: ${check.error}` };
+// here: the AGENT-restricted sanitizeAgentCommand allowlist (no code
+// interpreters, no network binaries) + spawn(shell:false) — the same path
+// as executeTask minus the interpreter/egress primitives. No shell ever
+// interprets the command string, so shell metacharacters are rejected,
+// never executed. Path-like arguments are additionally resolved against
+// the agent scope so the shell cannot be used to read or write outside the
+// workspace (e.g. `cat /etc/passwd` or `ls ../..`). Returns a result object
+// (never throws for bad input) so agent loops stay alive.
+
+function isAgentPathToken(tok) {
+  return tok === '.' || tok === '..' || tok.startsWith('./') || tok.startsWith('../') || tok.startsWith('/');
+}
+
+async function runAgentCommand(command, workDir, scope = 'sandbox') {
+  const check = sanitizeAgentCommand(command);
+  if (!check.safe) return { error: `Command blocked by agent safety filter: ${check.error}` };
+  for (const arg of [check.command, ...(check.args || [])]) {
+    if (isAgentPathToken(arg)) {
+      try { resolveSandboxPath(scope, arg); }
+      catch { return { error: `Command blocked by agent safety filter: target path outside sandbox (${arg})` }; }
+    }
+  }
   try { (await import('fs')).mkdirSync(workDir, { recursive: true }); }
   catch (e) { return { error: `Cannot create working directory: ${e.message}` }; }
   return new Promise((resolve) => {
@@ -170,8 +241,9 @@ registerAgentTool(
     },
   },
   async (args, ctx) => {
-    const base = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
-    const resolved = resolveSandboxPath(args.scope || ctx.scope || 'sandbox', args.dir || '.');
+    const scope = args.scope || ctx.scope || 'sandbox';
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
+    const resolved = resolveSandboxPath(scope, args.dir || '.');
     const maxDepth = args.depth || 3;
     function walk(dir, currentDepth) {
       const items = [];
@@ -180,7 +252,8 @@ registerAgentTool(
         for (const entry of entries) {
           if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue;
           const full = path.join(dir, entry.name);
-          const rel = path.relative(base, full);
+          const rel = path.relative(realBase, full);
+          if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
           if (entry.isDirectory() && currentDepth < maxDepth) {
             items.push({ name: entry.name, path: rel, type: 'dir' });
             if (!['node_modules', '.git', 'dist', 'build', '__pycache__'].includes(entry.name)) {
@@ -210,7 +283,8 @@ registerAgentTool(
     required: ['pattern'],
   },
   async (args, ctx) => {
-    const base = (args.scope || ctx.scope || 'sandbox') === 'home' ? HOME_DIR : SANDBOX_DIR;
+    const scope = args.scope || ctx.scope || 'sandbox';
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
     const maxResults = Math.min(Math.max(parseInt(args.max_results, 10) || 20, 1), 200);
     const pattern = String(args.pattern || '');
     if (!pattern) return { matches: [], count: 0, error: 'Search pattern is required' };
@@ -221,22 +295,22 @@ registerAgentTool(
     // head(1) truncation is done in JS instead.
     const check = sanitizeCommand('grep');
     if (!check.safe) return { matches: [], count: 0, error: check.error };
-    try { (await import('fs')).mkdirSync(base, { recursive: true }); }
+    try { (await import('fs')).mkdirSync(realBase, { recursive: true }); }
     catch (e) { return { matches: [], count: 0, error: `Cannot access directory: ${e.message}` }; }
     const grepArgs = [
       '-rn',
       ...['js', 'jsx', 'ts', 'tsx', 'mjs', 'json', 'md', 'txt', 'py', 'sh'].map((e) => `--include=*.${e}`),
       `--max-count=${maxResults}`,
       pattern,
-      base,
+      realBase,
     ];
     try {
-      const stdout = await spawnArgv('grep', grepArgs, { timeout: 10000, cwd: base });
+      const stdout = await spawnArgv('grep', grepArgs, { timeout: 10000, cwd: realBase });
       const results = stdout.split('\n').filter(Boolean).slice(0, maxResults).map(line => {
         const [file, ...rest] = line.split(':');
         const lineNum = rest[0];
         const content = rest.slice(1).join(':');
-        return { file: path.relative(base, file), line: parseInt(lineNum) || 0, content: content.slice(0, 200) };
+        return { file: path.relative(realBase, file), line: parseInt(lineNum) || 0, content: content.slice(0, 200) };
       });
       return { matches: results, count: results.length };
     } catch (e) {
@@ -249,7 +323,7 @@ registerAgentTool(
 
 registerAgentTool(
   'shell_exec',
-  'Execute a command in the workspace. Runs through the server command allowlist with no shell: only allowlisted commands (echo, ls, cat, pwd, date, whoami, hostname, uname, df, free, uptime, ps, wc, head, tail, grep, sort, uniq, curl, wget, python3, node, bash) and no shell metacharacters (; | & > < $ ` \\ ! {} () [] * ? ~ #). Chained commands, pipes, redirects, and command substitution are rejected.',
+  'Execute a command in the workspace through the restricted agent allowlist with no shell: only read-only inspection commands (echo, ls, cat, pwd, date, whoami, hostname, uname, df, free, uptime, ps, wc, head, tail, grep, sort, uniq) and no shell metacharacters (; | & > < $ ` \\ ! {} () [] * ? ~ #). Code interpreters (node, python3, bash) are disabled — writing a script and invoking it is not possible. Network binaries (curl, wget) are disabled — use the web_fetch/web_search tools for network access. Chained commands, pipes, redirects, and command substitution are rejected.',
   {
     type: 'object',
     properties: {
@@ -260,10 +334,11 @@ registerAgentTool(
     required: ['command'],
   },
   async (args, ctx) => {
-    // C1 fix: shared sanitizeCommand allowlist + shell:false argv execution
+    // C1 fix + P0.2 agent policy: sanitizeAgentCommand (interpreters and
+    // network binaries removed for the agent) + shell:false argv execution
     // (see runAgentCommand above). No shell ever interprets this string.
     const workDir = (ctx.scope || args.scope || 'sandbox') === 'home' ? HOME_DIR : resolveSandboxPath(ctx.scope || args.scope || 'sandbox', args.cwd || '.');
-    return runAgentCommand(args.command, workDir);
+    return runAgentCommand(args.command, workDir, ctx.scope || args.scope || 'sandbox');
   }
 );
 
@@ -476,10 +551,46 @@ registerAgentTool(
 );
 
 // ─── Execute a tool by name ───────────────────────────────────────
+// Policy boundary: every agent tool maps to a capability and is decided
+// fail-closed before execution (P1.6). `actNoPolicy`/`policyProvenance` are
+// internal escape hatches for trusted, already-authorized callers only; the
+// default is enforcement on every agent tool call reaching the funnel.
+const AGENT_TOOL_CAPABILITY = {
+  file_read: CAPABILITIES.FILESYSTEM_READ,
+  file_list: CAPABILITIES.FILESYSTEM_READ,
+  file_search: CAPABILITIES.FILESYSTEM_READ,
+  file_write: CAPABILITIES.FILESYSTEM_WRITE,
+  shell_exec: CAPABILITIES.PROCESS_EXECUTION,
+  git_op: CAPABILITIES.PROCESS_EXECUTION,
+  web_fetch: CAPABILITIES.NETWORK_EXTERNAL,
+  web_search: CAPABILITIES.NETWORK_EXTERNAL,
+  mcp_invoke: CAPABILITIES.MCP_CALL,
+  skill_invoke: CAPABILITIES.CODE_EXECUTION,
+  delegate_task: CAPABILITIES.PROCESS_EXECUTION,
+};
+
 async function executeAgentTool(toolName, args, ctx) {
   const tool = agentTools.find(t => t.name === toolName);
   if (!tool) return { error: `Unknown tool: ${toolName}` };
   try {
+    const capability = AGENT_TOOL_CAPABILITY[toolName];
+    if (capability && !(ctx && ctx.actNoPolicy)) {
+      const decision = await policyDecide({
+        actor: { id: ctx?.userId || null, role: ctx?.role || 'user' },
+        capability,
+        resource: toolName,
+        scope: ctx?.scope || 'sandbox',
+        provenance: (ctx && ctx.policyProvenance) || 'user',
+      });
+      if (!decision.allowed) {
+        _deps.fireHook('onAgentStep', {
+          sessionId: ctx?.sessionId, toolName, args,
+          result: { error: `Policy denied ${toolName}: ${decision.reason}` },
+          success: false, policyDenied: true, auditId: decision.auditId,
+        });
+        return { error: `Policy denied ${toolName}: ${decision.reason}`, policyDenied: true };
+      }
+    }
     const result = await tool.execute(args || {}, ctx || {});
     _deps.fireHook('onAgentStep', { sessionId: ctx?.sessionId, toolName, args, result, success: !result.error });
     return result;
@@ -561,7 +672,11 @@ async function runAgentLoop(sessionId, options = {}) {
       .catch(() => { /* fire-and-forget: swallow */ });
   } catch { /* the call itself must not disturb the loop */ }
 
-  const ctx = { scope: session.scope, sessionId, userId: session.user_id };
+  const ctx = { scope: session.scope, sessionId, userId: session.user_id, role: 'user' };
+  try {
+    const userRec = _deps.stmts?.users?.getById?.get(session.user_id);
+    if (userRec?.role) ctx.role = userRec.role;
+  } catch { /* default to 'user' on lookup failure */ }
   const maxSteps = options.maxSteps || MAX_AGENT_STEPS;
   const model = options.model || session.model || undefined;
   const toolDefs = getToolDefinitions();
@@ -1202,7 +1317,7 @@ router.post('/agent/read', authMiddleware, apiLimiter, async (req, res) => {
 router.get('/agent/workspace', authMiddleware, (req, res) => {
   try {
     const { scope = 'sandbox', depth = 3 } = req.query;
-    const base = scope === 'home' ? HOME_DIR : SANDBOX_DIR;
+    const realBase = ensureBaseExists(scope === 'home' ? HOME_DIR : SANDBOX_DIR);
     function walk(dir, currentDepth, maxDepth) {
       const items = [];
       try {
@@ -1210,7 +1325,8 @@ router.get('/agent/workspace', authMiddleware, (req, res) => {
         for (const entry of entries) {
           if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue;
           const full = path.join(dir, entry.name);
-          const rel = path.relative(base, full);
+          const rel = path.relative(realBase, full);
+          if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
           if (entry.isDirectory() && currentDepth < maxDepth) {
             items.push({ name: entry.name, path: rel, type: 'dir' });
             if (!['node_modules', '.git', 'dist', 'build', '__pycache__'].includes(entry.name)) {
@@ -1223,7 +1339,7 @@ router.get('/agent/workspace', authMiddleware, (req, res) => {
       } catch {}
       return items;
     }
-    const tree = walk(base, 0, parseInt(depth));
+    const tree = walk(realBase, 0, parseInt(depth));
     res.json(tree);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1302,6 +1418,7 @@ router.post('/agent/approve', authMiddleware, apiLimiter, async (req, res) => {
       scope: session?.scope || 'sandbox',
       sessionId: session?.id,
       userId: req.user.id,
+      role: req.user.role,
       // M5: this call was approved by a human via this endpoint — lets
       // gated tools (e.g. gmail_send) treat the approval as satisfying
       // their confirmation gate instead of creating another pending action.
@@ -1327,14 +1444,15 @@ router.post('/agent/reject', authMiddleware, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/agent/exec — execute a command (admin only). Same allowlist +
-// shell-free execution as the shell_exec tool (see runAgentCommand).
+// POST /api/agent/exec — execute a command (admin only). Same restricted
+// agent allowlist (interpreters/network removed) + shell-free execution as
+// the shell_exec tool (see runAgentCommand).
 router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
   try {
     const { command, scope = 'sandbox', session_id, cwd } = req.body;
     if (!command) return res.status(400).json({ error: 'command required' });
-    const check = sanitizeCommand(command);
-    if (!check.safe) return res.status(403).json({ error: `Command blocked by safety filter: ${check.error}` });
+    const check = sanitizeAgentCommand(command);
+    if (!check.safe) return res.status(403).json({ error: `Command blocked by agent safety filter: ${check.error}` });
     const workDir = scope === 'home' ? HOME_DIR : resolveSandboxPath(scope, cwd || '.');
     const actionId = randomUUID();
     const sessionId = (session_id && stmts.agentSessions.getById.get(session_id)) ? session_id : null;
@@ -1343,7 +1461,7 @@ router.post('/agent/exec', authMiddleware, requireRole('admin'), apiLimiter, asy
     try {
       const { mkdirSync } = await import('fs');
       mkdirSync(workDir, { recursive: true });
-      const result = await runAgentCommand(command, workDir);
+      const result = await runAgentCommand(command, workDir, scope);
       if (result.error) {
         stmts.agentActions.insert.run(actionId, sessionId, stepIdx, 'exec', command, '', result.error.slice(0, 2000), 'failed');
         return res.json({ exitCode: 1, stdout: '', stderr: result.error.slice(0, 2000), action_id: actionId });

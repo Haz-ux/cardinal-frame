@@ -246,7 +246,7 @@ describe('WARDEN — delegation enforcement (integration)', () => {
     const res = await request(app)
       .post('/api/delegate')
       .set(adminAuth())
-      .send({ name: 'Warden high', command: "bash -c 'rm -rf /; sudo reboot'", synchronous: false });
+      .send({ name: 'Warden high', command: "bash -c 'rm -rf / dd if=/dev/zero of=/dev/sda'", synchronous: false });
     expect(res.status).toBe(403);
     expect(res.body.error).toBe('WARDEN: high-risk command blocked');
     expect(res.body.warden.verdict).toBe('block');

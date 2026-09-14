@@ -123,7 +123,7 @@ describe('shell_exec agent tool (C1)', () => {
   });
 
   it('returns exit code + stderr for failing commands instead of throwing', async () => {
-    const r = await shellExec.execute({ command: 'ls /does/not/exist-xyz' }, { scope: 'sandbox' });
+    const r = await shellExec.execute({ command: 'ls does-not-exist-xyz' }, { scope: 'sandbox' });
     expect(r.error).toBeUndefined();
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toBeTruthy();

@@ -70,14 +70,14 @@ describe('Delegation', () => {
   });
 
   it('should list delegations', async () => {
-    const res = await request(app).get('/api/delegations');
+    const res = await request(app).get('/api/delegations').set(adminAuth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeGreaterThan(0);
   });
 
   it('should get a delegation by id', async () => {
-    const res = await request(app).get(`/api/delegations/${delegationId}`);
+    const res = await request(app).get(`/api/delegations/${delegationId}`).set(adminAuth());
     // May be 200 or 404 if the delegation was cleaned up
     if (res.status === 200) {
       expect(res.body.id).toBe(delegationId);
@@ -88,7 +88,7 @@ describe('Delegation', () => {
   });
 
   it('should return 404 for missing delegation', async () => {
-    const res = await request(app).get('/api/delegations/nonexistent');
+    const res = await request(app).get('/api/delegations/nonexistent').set(adminAuth());
     expect(res.status).toBe(404);
   });
 
@@ -112,7 +112,7 @@ describe('Delegation', () => {
       })
       .expect(201);
 
-    const res = await request(app).get(`/api/delegations?parentId=${parentId}`);
+    const res = await request(app).get(`/api/delegations?parentId=${parentId}`).set(adminAuth());
     expect(res.status).toBe(200);
     expect(res.body.length).toBeGreaterThan(0);
     expect(res.body.every(d => d.parent_task_id === parentId)).toBe(true);
@@ -133,6 +133,7 @@ describe('Delegation', () => {
     // Wait on it (should either complete or timeout)
     const res = await request(app)
       .post(`/api/delegations/${createRes.body.id}/wait`)
+      .set(adminAuth())
       .query({ timeout: 3000 });
     expect([200, 202]).toContain(res.status);
   });

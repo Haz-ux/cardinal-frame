@@ -94,7 +94,13 @@ beforeEach(() => {
 });
 
 async function twoReviewedDryRuns(user = U1) {
+  // Each dry run must actually produce findings (L10: a finding-less or
+  // errored dry run does not count toward prune eligibility). Seed a fresh
+  // stale version per run so every run yields >=1 finding.
   for (let i = 0; i < 2; i++) {
+    seedCandidate(`proof-c${i}`, user);
+    seedVersion(`proof-v${i}`, user, `proof-c${i}`);
+    seedStats(`proof-v${i}`, { last: dISO(45) });
     const run = await request(app).post('/api/learning/curator/run').set(H(user)).send({ mode: 'dry_run' });
     await request(app).post(`/api/learning/curator/runs/${run.body.run.id}/review`).set(H(user));
   }

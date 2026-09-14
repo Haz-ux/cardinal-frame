@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createJobQueue } from '../src/server/job-queue.mjs';
+import { sanitizeCommand } from '../src/server/command-safety.mjs';
 
 let tmpDir, db, queue;
 
@@ -193,6 +194,7 @@ describe('Job Queue', () => {
 
   it('should track step progress for DAG jobs', async () => {
     queue = createJobQueue(db, { concurrency: 1, defaultTimeout: 5000 });
+    queue.setSanitizeCommand(sanitizeCommand); // production wires this via server.mjs
     const dagPayload = {
       dagId: 'test-dag-1',
       layers: [['node-a']],

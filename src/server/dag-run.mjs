@@ -192,6 +192,16 @@ export async function runNode(node, nodeCtx) {
   switch (type) {
     case 'task': {
       if (!field) return done({ status: 'skipped', reason: 'no command' });
+      // P1.8: central policy gate — a DAG must not become a way to bypass
+      // authorization. When a policyGate is wired, every command (and every
+      // vm expression below) is decided before execution; a denial is a node
+      // failure, never a fall-through to execution.
+      if (nodeCtx.policyGate) {
+        const gate = await nodeCtx.policyGate({ node, nodeType: type, command: field });
+        if (!gate.allowed) {
+          return done({ status: 'failed', error: `policy denied: ${gate.reason || 'not authorized'}` });
+        }
+      }
       const check = nodeCtx.sanitizeCommand
         ? nodeCtx.sanitizeCommand(field)
         : { safe: false, error: 'no sanitizer configured' };
@@ -215,6 +225,12 @@ export async function runNode(node, nodeCtx) {
 
     case 'transform': {
       if (!field) return done({ status: 'skipped', reason: 'no expression' });
+      if (nodeCtx.policyGate) {
+        const gate = await nodeCtx.policyGate({ node, nodeType: type, command: field });
+        if (!gate.allowed) {
+          return done({ status: 'failed', error: `policy denied: ${gate.reason || 'not authorized'}` });
+        }
+      }
       try {
         const value = evalExpr(field, nodeCtx.$);
         return done({ status: 'success', output: value === undefined ? null : value });
@@ -249,6 +265,12 @@ export async function runNode(node, nodeCtx) {
       if (!field) {
         note = 'no expression — defaulted to true';
       } else {
+        if (nodeCtx.policyGate) {
+          const gate = await nodeCtx.policyGate({ node, nodeType: type, command: field });
+          if (!gate.allowed) {
+            return done({ status: 'failed', error: `policy denied: ${gate.reason || 'not authorized'}` });
+          }
+        }
         try {
           result = !!evalExpr(field, nodeCtx.$);
         } catch (err) {
@@ -265,6 +287,12 @@ export async function runNode(node, nodeCtx) {
       if (!field) {
         note = 'no expression — defaulted to A';
       } else {
+        if (nodeCtx.policyGate) {
+          const gate = await nodeCtx.policyGate({ node, nodeType: type, command: field });
+          if (!gate.allowed) {
+            return done({ status: 'failed', error: `policy denied: ${gate.reason || 'not authorized'}` });
+          }
+        }
         try {
           selected = mapBranchLabel(evalExpr(field, nodeCtx.$));
         } catch (err) {
@@ -291,7 +319,7 @@ export async function runNode(node, nodeCtx) {
  * Returns { layers, layerResults:[{layer, results}], resultsById, outputs, finalOutput }.
  * Throws only on structural problems (cycle); node failures are recorded per-node.
  */
-export async function runDag({ nodes, edges, sanitizeCommand, broadcast, dagId, timeoutMs = 30000, events = {} }) {
+export async function runDag({ nodes, edges, sanitizeCommand, broadcast, dagId, timeoutMs = 30000, events = {}, policyGate }) {
   const normEdges = normalizeEdges(edges);
   const layers = topoSortLayers(nodes, normEdges);
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -347,6 +375,7 @@ export async function runDag({ nodes, edges, sanitizeCommand, broadcast, dagId, 
           $,
           resultsById,
           sanitizeCommand,
+          policyGate,
           timeoutMs,
           broadcast,
           dagId,

@@ -4,6 +4,7 @@ import path from 'path';
 import multer from 'multer';
 import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
 import { topoSortLayers, runDag } from '../dag-run.mjs';
+import { decide as policyDecide, CAPABILITIES } from '../defense/policy.mjs';
 
 /**
  * Task + DAG + File routes
@@ -407,6 +408,9 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
         layers: layers.map(layer => layer),
         nodes,
         edges,
+        // P1.8: carry the runner's principal so the durable queue's handler
+        // can apply the same policy gate as the in-process fallback.
+        policyActor: { id: req.user.id, role: req.user.role },
       }, { priority: 5, traceId: `dag:${req.params.id}` });
 
       // Listen for completion via broadcast (the queue broadcasts job:completed)
@@ -415,11 +419,24 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
     } else {
       // Fallback: in-process execution (for tests / no-queue mode) via the
       // shared executor — same node types, data flow, and sanitizer as the queue.
+      // P1.8: policy gate at node execution — a DAG cannot bypass authorization.
+      const policyGate = async (subject) => {
+        const capability = subject.nodeType === 'task' ? CAPABILITIES.PROCESS_EXECUTION : CAPABILITIES.CODE_EXECUTION;
+        const decision = await policyDecide({
+          actor: { id: req.user.id, role: req.user.role },
+          capability,
+          resource: `dag:${req.params.id}:${subject.node?.id}`,
+          scope: 'system',
+          provenance: 'user',
+        });
+        return decision;
+      };
       runDag({
         nodes,
         edges,
         sanitizeCommand,
         broadcast,
+        policyGate,
         dagId: req.params.id,
         timeoutMs: 30000,
         events: {

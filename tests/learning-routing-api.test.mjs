@@ -222,6 +222,15 @@ describe('GET /api/learning/retrieval/flags', () => {
     const res = await request(app).get('/api/learning/retrieval/flags').set(H(U1));
     expect(res.status).toBe(200);
     expect(res.body.flags).toEqual(getRetrievalFlags());
-    expect(res.body.flags.curator).toBe(false);
+    expect(res.body.flags.curator).toBe(true); // M8: curated-enabled by default
+
+    // With LEARNING_CURATOR_ENABLED=false the kill-switch flips off.
+    process.env.LEARNING_CURATOR_ENABLED = 'false';
+    try {
+      const off = await request(app).get('/api/learning/retrieval/flags').set(H(U1));
+      expect(off.body.flags.curator).toBe(false);
+    } finally {
+      delete process.env.LEARNING_CURATOR_ENABLED;
+    }
   });
 });

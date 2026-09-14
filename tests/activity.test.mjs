@@ -14,19 +14,19 @@ afterAll(async () => {
 
 describe('Activity Feed', () => {
   it('should return activity log entries (may be empty initially)', async () => {
-    const res = await request(app).get('/api/activity');
+    const res = await request(app).get('/api/activity').set(adminAuth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
   });
 
   it('should respect limit parameter', async () => {
-    const res = await request(app).get('/api/activity?limit=5');
+    const res = await request(app).get('/api/activity?limit=5').set(adminAuth());
     expect(res.status).toBe(200);
     expect(res.body.length).toBeLessThanOrEqual(5);
   });
 
   it('should cap limit at 200', async () => {
-    const res = await request(app).get('/api/activity?limit=99999');
+    const res = await request(app).get('/api/activity?limit=99999').set(adminAuth());
     expect(res.status).toBe(200);
     expect(res.body.length).toBeLessThanOrEqual(200);
   });
@@ -39,7 +39,7 @@ describe('Activity Feed', () => {
       .send({ name: 'Activity Test Task', command: 'echo test' })
       .expect(201);
 
-    const res = await request(app).get('/api/activity?type=task:created');
+    const res = await request(app).get('/api/activity?type=task:created').set(adminAuth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     // Should find the task:created event we just generated
@@ -49,7 +49,7 @@ describe('Activity Feed', () => {
   });
 
   it('should return stats', async () => {
-    const res = await request(app).get('/api/activity/stats');
+    const res = await request(app).get('/api/activity/stats').set(adminAuth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
   });
@@ -58,7 +58,7 @@ describe('Activity Feed', () => {
     // The fact that our task creation above worked AND we can query
     // activity events proves the broadcast → logActivity pipeline works.
     // If logActivity wasn't wired, /api/activity would always return [].
-    const res = await request(app).get('/api/activity?limit=10');
+    const res = await request(app).get('/api/activity?limit=10').set(adminAuth());
     expect(res.status).toBe(200);
     // After creating tasks and other test activity, we should have events
     // (might be in-memory ring or DB)

@@ -630,6 +630,14 @@ export function dismissRecommendation(db, recId, actor) {
 
 // ─── Lifecycle primitives ───────────────────────────────────────────
 
+// v2 scaffold contract aliases (guard the learning-governance surface):
+//   review  → runCurator        (evaluate candidates / findings)
+//   promote → approveRecommendation
+//   reject  → dismissRecommendation
+export const review = runCurator;
+export const reject = dismissRecommendation;
+export const promote = approveRecommendation;
+
 /** Clear all curator flags — the reversible way back. Returns the version row (or null). */
 export function restoreVersion(db, versionId, actor) {
   const row = db.prepare('SELECT * FROM learning_skill_versions WHERE id = ?').get(versionId);

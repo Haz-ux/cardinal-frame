@@ -18,6 +18,28 @@ const connections = new Map();
 // process, so an uncapped count is a process-exhaustion DoS vector.
 const MAX_CONNECTIONS = 10;
 
+// ─── Environment isolation (P0.4) ───────────────────────────────────
+// An MCP server must NOT automatically inherit the Cardinal process
+// environment: JWT secrets, encryption keys, DB credentials, OAuth tokens,
+// connector/API keys, and unrelated secrets would all leak to an untrusted
+// child. Only a small allowlist of safe runtime variables is inherited, plus
+// any keys EXPLICITLY requested for that server via the `env` option.
+export const MCP_ENV_ALLOWLIST = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'USER', 'LOGNAME'];
+
+/**
+ * Build the environment object for an MCP child process.
+ * @param {object} [extra]  explicit, per-server env keys (already scoped by
+ *   the caller — e.g. `MCP_GITHUB_TOKEN`). Never pass process.env wholesale.
+ * @returns {object} env to hand to spawn()
+ */
+export function buildMcpEnv(extra = {}) {
+  const env = {};
+  for (const key of MCP_ENV_ALLOWLIST) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  return { ...env, ...extra };
+}
+
 // ─── JSON-RPC helpers ───────────────────────────────────────────────
 function makeRequest(method, params, id) {
   return JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
@@ -28,7 +50,7 @@ function makeNotification(method, params) {
 }
 
 // ─── Connect to an MCP server via stdio ─────────────────────────────
-export function connectServer(serverId, command, args = []) {
+export function connectServer(serverId, command, args = [], opts = {}) {
   return new Promise((resolve, reject) => {
     if (connections.has(serverId)) {
       disconnectServer(serverId); // clean up old connection
@@ -41,7 +63,10 @@ export function connectServer(serverId, command, args = []) {
     try {
       child = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
+        // P0.4: scoped environment — ALWAYS safe-runtime allowlist + only the
+        // explicitly requested env keys for this server. process.env is never
+        // inherited wholesale (secrets would leak to the child).
+        env: buildMcpEnv(opts.env || {}),
         shell: false,
       });
     } catch (err) {
@@ -238,9 +263,9 @@ export function isConnected(serverId) {
 }
 
 // ─── Reconnect helper: disconnect then connect ──────────────────────
-export async function reconnectServer(serverId, command, args) {
+export async function reconnectServer(serverId, command, args, opts) {
   disconnectServer(serverId);
-  return connectServer(serverId, command, args);
+  return connectServer(serverId, command, args, opts);
 }
 
 // ─── Heartbeat ping ─────────────────────────────────────────────────

@@ -11,7 +11,7 @@ afterAll(() => cleanupTestServer());
 
 describe('live telemetry device classification', () => {
   it('exposes device info on /api/telemetry', async () => {
-    const res = await request(app).get('/api/telemetry');
+    const res = await request(app).get('/api/telemetry').set(adminAuth());
     expect(res.status).toBe(200);
     const t = res.body;
     expect(t.device).toBeTruthy();
@@ -25,7 +25,7 @@ describe('live telemetry device classification', () => {
   });
 
   it('reports cpu/mem as numbers and gpu/npu as number or null', async () => {
-    const res = await request(app).get('/api/telemetry');
+    const res = await request(app).get('/api/telemetry').set(adminAuth());
     expect(res.status).toBe(200);
     const t = res.body;
     expect(typeof t.cpu).toBe('number');

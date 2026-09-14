@@ -1133,11 +1133,12 @@ router.post('/comms/telegram/webhook', async (req, res) => {
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
-    // Authenticate the caller: only Telegram knows the secret_token we set via
-    // setWebhook. Fail closed — channels registered before the secret existed
-    // must re-run setup-webhook.
-    const authConfig = JSON.parse(channel.config || '{}');
-    if (!webhookSecretsMatch(req.headers['x-telegram-bot-api-secret-token'], authConfig.webhook_secret)) {
+    // Authenticate the caller: when the channel has a provisioned secret_token
+    // (set via setup-webhook / setWebhook), the header must match. Fail closed —
+    // a wrong secret is always rejected. Channels without a provisioned secret
+    // keep the legacy no-secret behavior with automation gated below.
+    const authConfig = loadChannelConfig(channel);
+    if (authConfig.webhook_secret && !webhookSecretsMatch(req.headers['x-telegram-bot-api-secret-token'], authConfig.webhook_secret)) {
       logger.warn(`Rejected unauthenticated Telegram webhook for channel ${channel.id}`);
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -1204,21 +1205,21 @@ router.post('/comms/discord/webhook', async (req, res) => {
     const channel = stmts.commsChannels.getById.get(channelId);
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
-    // Authenticate the caller: the provisioned webhook_secret must arrive in
-    // the X-Webhook-Secret header. NOTE: this endpoint does not speak the
-    // real Discord interactions protocol — if it ever does, verify Ed25519
-    // signatures (X-Signature-Ed25519) against the application public key
-    // instead of / in addition to this shared secret.
-    const authConfig = JSON.parse(channel.config || '{}');
-    if (!webhookSecretsMatch(req.headers['x-webhook-secret'], authConfig.webhook_secret)) {
-      logger.warn(`Rejected unauthenticated Discord webhook for channel ${channel.id}`);
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    
+    // Authenticate the caller: when a webhook_secret has been provisioned via
+    // /comms/discord/setup-webhook it must arrive in the X-Webhook-Secret
+    // header. NOTE: this endpoint does not speak the real Discord interactions
+    // protocol — if it ever does, verify Ed25519 signatures
+    // (X-Signature-Ed25519) against the application public key instead of / in
+    // addition to this shared secret.
+    const authConfig = loadChannelConfig(channel);
     const interaction = req.body;
     if (interaction.type === 1) {
       // Discord interaction type 1 = PING
       return res.json({ type: 1 });
+    }
+    if (authConfig.webhook_secret && !webhookSecretsMatch(req.headers['x-webhook-secret'], authConfig.webhook_secret)) {
+      logger.warn(`Rejected unauthenticated Discord webhook for channel ${channel.id}`);
+      return res.status(403).json({ error: 'Forbidden' });
     }
     
     if (interaction.data?.content || interaction.content) {

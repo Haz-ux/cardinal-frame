@@ -138,7 +138,7 @@ describe('personas module', () => {
 
 describe('persona API', () => {
   it('GET /api/personas lists personas', async () => {
-    const res = await request(app).get('/api/personas');
+    const res = await request(app).get('/api/personas').set(adminAuth());
     expect(res.status).toBe(200);
     expect(res.body.default).toBe('aimi');
     expect(res.body.personas.map(p => p.id)).toContain('cipher');
@@ -187,7 +187,7 @@ describe('persona API', () => {
   });
 
   it('GET /api/personas/:id returns full detail including rendered system prompt', async () => {
-    const res = await request(app).get('/api/personas/aimi');
+    const res = await request(app).get('/api/personas/aimi').set(adminAuth());
     expect(res.status).toBe(200);
     expect(res.body.persona.name).toBe('Aimi');
     expect(res.body.persona.systemPrompt).toContain('You are Aimi');
@@ -204,7 +204,7 @@ describe('persona API', () => {
     expect(res.body.persona.name).toBe('Jarvis');
     expect(res.body.persona.systemPrompt).toContain('You are Jarvis');
 
-    const list = await request(app).get('/api/personas');
+    const list = await request(app).get('/api/personas').set(adminAuth());
     expect(list.body.personas.find(p => p.id === 'aimi').name).toBe('Jarvis');
 
     fetchMock.mockClear();
@@ -224,12 +224,12 @@ describe('persona API', () => {
     expect(res.body.persona.name).toBe('Aimi');
     expect(res.body.persona.systemPrompt).toContain('You are Aimi');
 
-    const list = await request(app).get('/api/personas');
+    const list = await request(app).get('/api/personas').set(adminAuth());
     expect(list.body.personas.find(p => p.id === 'aimi').name).toBe('Aimi');
   });
 
   it('unknown persona endpoints return 404', async () => {
-    const res = await request(app).get('/api/personas/nope');
+    const res = await request(app).get('/api/personas/nope').set(adminAuth());
     expect(res.status).toBe(404);
   });
 });
