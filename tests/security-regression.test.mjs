@@ -16,9 +16,15 @@
  *                be reached through a DAG node
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
+import Database from 'better-sqlite3';
+import express from 'express';
+import request from 'supertest';
+import learningRoutes from '../src/server/routes/learning.mjs';
+import { resolvePrincipal } from '../src/server/identity/identity.mjs';
+import { fileURLToPath } from 'url';
 
 // ─── Point the agent at temp scopes BEFORE importing agent.mjs ─────
 const TEST_DIR = mkdtempSync(join(tmpdir(), 'cf-secreg-'));
@@ -317,5 +323,199 @@ describe('DAG — policy enforced at node execution (P1.8)', () => {
     const r = await runNode({ id: 'n4', type: 'task', command: 'echo legacy' }, baseCtx(undefined));
     expect(r.status).toBe('success');
     expect(r.output).toBe('legacy');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+describe('IDENTITY — principal grounded in actual identity (P1.10)', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE users (
+    id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'user', metadata TEXT DEFAULT '{}', created_at TEXT DEFAULT (datetime('now'))
+  )`);
+  db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES ('haz-001','Haz','x','admin')").run();
+  db.prepare("INSERT INTO users (id, username, password_hash, role) VALUES ('plain-1','plain','x','user')").run();
+
+  it('forged admin claim cannot escalate through the policy layer', async () => {
+    const principal = resolvePrincipal(db, { id: 'plain-1', role: 'admin' });
+    expect(principal).toEqual({ id: 'plain-1', role: 'user' });
+    const decision = await decide({ actor: principal, capability: CAPABILITIES.LEARNING_APPROVE, provenance: 'user' });
+    expect(decision.allowed).toBe(false);
+  });
+
+  it('the real stored admin identity is granted promotion capability', async () => {
+    const principal = resolvePrincipal(db, { id: 'haz-001', role: 'user' });
+    expect(principal).toEqual({ id: 'haz-001', role: 'admin' });
+    const decision = await decide({ actor: principal, capability: CAPABILITIES.LEARNING_APPROVE, provenance: 'user' });
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('unknown identity fails closed for high-risk capability decisions', async () => {
+    const principal = resolvePrincipal(db, { id: 'ghost-user', role: 'admin' });
+    expect(principal).toBeNull();
+    const decision = await decide({ actor: {}, capability: CAPABILITIES.LEARNING_ACTIVATE, provenance: 'user' });
+    expect(decision.allowed).toBe(false);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+describe('LEARNING — promotion pipeline protections (P1.9)', () => {
+  const LEARNING_MIGRATIONS = [
+    '014_learning_events.sql', '022_learning_events.sql', '026_learning_candidates.sql',
+    '028_learning_skill_versions.sql', '030_learning_curator.sql', '032_learning_skill_versions_one_active.sql',
+  ];
+  const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'server', 'migrations');
+
+  function makeLearningApp() {
+    const db = new Database(':memory:');
+    for (const f of LEARNING_MIGRATIONS) {
+      db.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8'));
+    }
+    const warnings = [];
+    const ctx = {
+      db,
+      stmts: {},
+      logger: { info() {}, debug() {}, warn: (m) => warnings.push(String(m)), error() {} },
+      audit() {},
+      auditLog() {},
+      resolvePrincipal: (u) => u,
+      authMiddleware: (req, res, next) => {
+        const u = req.headers['x-test-user'];
+        if (!u) return res.status(401).json({ error: 'unauthorized' });
+        req.user = { id: u, role: req.headers['x-test-role'] || 'user', username: u };
+        next();
+      },
+      requireRole: (role) => (req, res, next) => {
+        if (req.user?.role !== role) return res.status(403).json({ error: 'forbidden' });
+        next();
+      },
+      apiLimiter: (_req, _res, next) => next(),
+      executeSkill: null,
+    };
+    const app = express();
+    app.use(express.json());
+    app.use('/api', learningRoutes(ctx));
+    return { app, db, warnings };
+  }
+
+  function seedCandidate(db, id, userId, overrides = {}) {
+    db.prepare(`INSERT INTO learning_candidates (id, user_id, kind, title, risk_tier, state, promotion_score)
+      VALUES (?,?,?,?,?,?,?)`)
+      .run(id, userId, 'procedure', `cand-${id}`, 'low', 'promoted', 0.8);
+    return id;
+  }
+
+  function seedVersion(db, id, userId, candId, overrides = {}) {
+    db.prepare(`INSERT INTO learning_skill_versions
+      (id, user_id, candidate_id, version_number, kind, spec, rationale, artifact, content_hash,
+       scanner_verdict, test_report, requires_docker, state, pinned, stale, archived, quarantined)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, userId, candId, 1, 'prompt_template', JSON.stringify({ problem_signature: `sig-${id}` }),
+        'r', `artifact-${id}`, 'hash',
+        overrides.scanner ?? '{"verdict":"clean","blocked":false}',
+        overrides.test_report ?? '{"failed":0,"total":1}',
+        0, overrides.state ?? 'scanned',
+        overrides.pinned ? 1 : 0, overrides.stale ? 1 : 0,
+        overrides.archived ? 1 : 0, overrides.quarantined ? 1 : 0);
+    return id;
+  }
+
+  afterEach(() => {
+    delete process.env.LEARNING_REQUIRE_SCANNER;
+  });
+
+  it('candidate cannot self-activate — compiling a candidate yields a disabled version, never active', async () => {
+    const { app, db } = makeLearningApp();
+    seedCandidate(db, 'c1', 'u1');
+    seedVersion(db, 'v1', 'u1', 'c1', { state: 'scanned', scanner: '{"verdict":"clean","blocked":false}' });
+
+    // No path moves state without an explicit admin approve→activate.
+    await request(app).post('/api/learning/skill-versions/v1/activate')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin').query({ user_id: 'u1' }).expect(400); // not approved yet
+    await request(app).post('/api/learning/skill-versions/v1/approve')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin').query({ user_id: 'u1' }).expect(200);
+    const afterApprove = db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get('v1');
+    expect(afterApprove.state).toBe('approved');
+    await request(app).post('/api/learning/skill-versions/v1/activate')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin').query({ user_id: 'u1' }).expect(200);
+    const afterActivate = db.prepare('SELECT state, archived FROM learning_skill_versions WHERE id = ?').get('v1');
+    expect(afterActivate.state).toBe('active');
+  });
+
+  it('unauthorized promotion denied — a plain user cannot compile, approve, or activate', async () => {
+    const { app, db } = makeLearningApp();
+    seedCandidate(db, 'c2', 'u1');
+    seedVersion(db, 'v2', 'u1', 'c2', { state: 'scanned' });
+
+    await request(app).post('/api/learning/candidates/c2/compile')
+      .set('x-test-user', 'u1').set('x-test-role', 'user').expect(403);
+    await request(app).post('/api/learning/skill-versions/v2/approve')
+      .set('x-test-user', 'u1').set('x-test-role', 'user').expect(403);
+    await request(app).post('/api/learning/skill-versions/v2/activate')
+      .set('x-test-user', 'u1').set('x-test-role', 'user').expect(403);
+    expect(db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get('v2').state).toBe('scanned');
+  });
+
+  it('ownership cannot be bypassed — cross-user promotion returns 404', async () => {
+    const { app, db } = makeLearningApp();
+    seedCandidate(db, 'c3', 'u1');
+    seedVersion(db, 'v3', 'u1', 'c3', { state: 'scanned' });
+
+    await request(app).post('/api/learning/skill-versions/v3/approve')
+      .set('x-test-user', 'u2').set('x-test-role', 'admin').expect(404);
+    await request(app).post('/api/learning/skill-versions/v3/activate')
+      .set('x-test-user', 'u2').set('x-test-role', 'admin').expect(404);
+    await request(app).post('/api/learning/candidates/c3/compile')
+      .set('x-test-user', 'u2').set('x-test-role', 'admin').expect(404);
+  });
+
+  it('scanner requirement cannot be silently bypassed (H3 fail-closed)', async () => {
+    const { app, db } = makeLearningApp();
+    seedCandidate(db, 'c4', 'u1');
+    const degraded = '{"verdict":"no_scanner","blocked":false}';
+    seedVersion(db, 'v4', 'u1', 'c4', { scanner: degraded });
+
+    // Default: scanner required → hard 400, no exception path.
+    await request(app).post('/api/learning/skill-versions/v4/approve')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin').query({ user_id: 'u1' }).expect(400);
+
+    // Even with the requirement disabled, the degraded verdict must be
+    // explicitly acknowledged; otherwise the request is still refused.
+    process.env.LEARNING_REQUIRE_SCANNER = 'false';
+    await request(app).post('/api/learning/skill-versions/v4/approve')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin').query({ user_id: 'u1' }).expect(400);
+    expect(db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get('v4').state).toBe('scanned');
+
+    // Documented exception: explicit acknowledge_no_scanner + scanner
+    // requirement disabled → admin may approve the degraded version.
+    await request(app).post('/api/learning/skill-versions/v4/approve')
+      .set('x-test-user', 'admin1').set('x-test-role', 'admin')
+      .query({ user_id: 'u1' }).send({ acknowledge_no_scanner: true }).expect(200);
+    expect(db.prepare('SELECT state FROM learning_skill_versions WHERE id = ?').get('v4').state).toBe('approved');
+  });
+
+  it('policy gate denies promotion for a role the central layer forbids', async () => {
+    const { app, db } = makeLearningApp();
+    seedCandidate(db, 'c5', 'u1');
+    seedVersion(db, 'v5', 'u1', 'c5', { state: 'scanned' });
+    // Viewer role passes authentication but is not in ROLE_GRANTS, so even
+    // reaching the admin-gated endpoint (x-test-role literally 'admin' here)
+    // cannot bypass policy when the canonical principal is a viewer.
+    const ctx = {
+      db,
+      stmts: {},
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+      audit() {}, auditLog() {},
+      resolvePrincipal: () => ({ id: 'u1', role: 'viewer' }),
+      authMiddleware: (_req, _res, next) => next(),
+      requireRole: () => (_req, _res, next) => next(),
+      apiLimiter: (_req, _res, next) => next(),
+      executeSkill: null,
+    };
+    const appViewer = express();
+    appViewer.use(express.json());
+    appViewer.use('/api', learningRoutes(ctx));
+    await request(appViewer).post('/api/learning/skill-versions/v5/approve').expect(403);
+    await request(appViewer).post('/api/learning/skill-versions/v5/activate').expect(403);
   });
 });

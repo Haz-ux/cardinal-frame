@@ -65,6 +65,7 @@ import nodesRoutes from './routes/nodes.mjs';
 import compressionRoutes from './routes/compression.mjs';
 import companionRoutes from './routes/companion.mjs';
 import identityRoutes from './routes/identity.mjs';
+import { resolvePrincipal as resolvePrincipalFromIdentity } from './identity/identity.mjs';
 import defenseRoutes from './routes/defense.mjs';
 import { createJobQueue } from './job-queue.mjs';
 import { PluginLoader } from './plugins.mjs';
@@ -1579,6 +1580,9 @@ async function fireHook(hookName, data) {
 }
 
 // ─── Shared Context Object ──────────────────────────────────────────────
+// P1.10 — the canonical principal resolver grounds authorization in the DB
+// users table (actual identity), used by the learning policy gate.
+const resolvePrincipal = (tokenUser) => resolvePrincipalFromIdentity(db, tokenUser);
 const ctx = {
   app, db, stmts, wss, logger,
   JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES,
@@ -1588,6 +1592,7 @@ const ctx = {
   mcp, embeddings,
   pluginLoader, fireHook,
   DATA_DIR, PORT,
+  resolvePrincipal,
   matchSkillTrigger,
   executeSkill,
   getDevSetting, getDevSettings,

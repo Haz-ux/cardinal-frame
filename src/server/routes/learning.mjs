@@ -64,6 +64,7 @@ import {
   getRecommendation,
   CURATOR_REC_STATES,
 } from '../learning/curator.mjs';
+import { decide as policyDecide, CAPABILITIES } from '../defense/policy.mjs';
 
 // API state filter → DB state. `review` is the visible untrusted queue
 // (DB state 'candidate').
@@ -126,6 +127,27 @@ function toJob(j) {
     started_at: j.started_at,
     finished_at: j.finished_at,
     error: j.error,
+  };
+}
+
+// P1.9 — Central policy gate for the learning promotion/activation path.
+// Uses ctx.resolvePrincipal (production) to ground the actor in the DB
+// identity rather than trusting the token's role claim. Falls back to
+// req.user when no resolver is provided (unit test harnesses).
+function requireLearningPolicy(ctx, capability) {
+  return async (req, res, next) => {
+    try {
+      const tokenUser = req.user || null;
+      const principal = ctx.resolvePrincipal ? await ctx.resolvePrincipal(tokenUser) : tokenUser;
+      const decision = await policyDecide({ actor: principal || {}, capability, resource: req.path, provenance: 'user' });
+      if (!decision.allowed) {
+        return res.status(403).json({ error: `forbidden: ${decision.reason || 'policy denied'}` });
+      }
+      res.locals.policyDecision = decision;
+      next();
+    } catch (err) {
+      return res.status(500).json({ error: 'policy gate error' });
+    }
   };
 }
 
@@ -574,7 +596,7 @@ export default function learningRoutes(ctx) {
   // skeleton in a vm sandbox, so it must not be reachable by arbitrary
   // authenticated users. Owner-scoped: admins compile their own
   // candidates; a cross-user id 404s.
-  router.post('/learning/candidates/:id/compile', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  router.post('/learning/candidates/:id/compile', authMiddleware, requireRole('admin'), requireLearningPolicy(ctx, CAPABILITIES.CODE_EXECUTION), apiLimiter, async (req, res) => {
     const c = getCandidate(db, req.params.id, req.user.id);
     if (!c) return res.status(404).json({ error: 'not found' });
 
@@ -639,7 +661,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Approve: scanned -> approved. Still DISABLED — nothing executes.
-  router.post('/learning/skill-versions/:id/approve', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/skill-versions/:id/approve', authMiddleware, requireRole('admin'), requireLearningPolicy(ctx, CAPABILITIES.LEARNING_APPROVE), apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const row = getOwnedVersion(req.params.id, targetUser);
     if (!row) return res.status(404).json({ error: 'not found' });
@@ -692,7 +714,7 @@ export default function learningRoutes(ctx) {
 
   // Activate: approved -> active. Atomic: any currently active version for
   // the same candidate is rolled back first (exactly one active enforced).
-  router.post('/learning/skill-versions/:id/activate', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
+  router.post('/learning/skill-versions/:id/activate', authMiddleware, requireRole('admin'), requireLearningPolicy(ctx, CAPABILITIES.LEARNING_ACTIVATE), apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const row = getOwnedVersion(req.params.id, targetUser);
     if (!row) return res.status(404).json({ error: 'not found' });
@@ -977,7 +999,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Run the curator. Prune mode requires >= 2 reviewed dry runs.
-  router.post('/learning/curator/run', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, async (req, res) => {
+  router.post('/learning/curator/run', authMiddleware, requireRole('admin'), requireCuratorEnabled, requireLearningPolicy(ctx, CAPABILITIES.LEARNING_APPROVE), apiLimiter, async (req, res) => {
     const targetUser = resolveTargetUser(req);
     const mode = req.body?.mode === 'prune' ? 'prune' : 'dry_run';
     if (mode === 'prune' && !pruneEligible(db, targetUser)) {
@@ -1014,7 +1036,7 @@ export default function learningRoutes(ctx) {
 
   // Approve a proposed recommendation: applies the lifecycle flag
   // (stale/archive/quarantine) or stages the merge path. Never deletes.
-  router.post('/learning/curator/recommendations/:id/approve', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
+  router.post('/learning/curator/recommendations/:id/approve', authMiddleware, requireRole('admin'), requireCuratorEnabled, requireLearningPolicy(ctx, CAPABILITIES.LEARNING_APPROVE), apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const rec = getRecommendation(db, req.params.id, targetUser);
     if (!rec) return res.status(404).json({ error: 'not found' });
@@ -1045,7 +1067,7 @@ export default function learningRoutes(ctx) {
   });
 
   // Mark a curator run reviewed (counts toward prune eligibility).
-  router.post('/learning/curator/runs/:id/review', authMiddleware, requireRole('admin'), requireCuratorEnabled, apiLimiter, (req, res) => {
+  router.post('/learning/curator/runs/:id/review', authMiddleware, requireRole('admin'), requireCuratorEnabled, requireLearningPolicy(ctx, CAPABILITIES.LEARNING_APPROVE), apiLimiter, (req, res) => {
     const targetUser = resolveTargetUser(req);
     const run = db.prepare('SELECT * FROM learning_curator_runs WHERE id = ? AND user_id = ?')
       .get(req.params.id, targetUser);
