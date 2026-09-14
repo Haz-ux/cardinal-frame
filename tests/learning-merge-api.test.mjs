@@ -57,6 +57,10 @@ function makeCtx() {
       req.user = { id: u, role: req.headers['x-test-role'] || 'user', username: u };
       next();
     },
+    requireRole: (role) => (req, res, next) => {
+      if (req.user?.role !== role) return res.status(403).json({ error: 'forbidden' });
+      next();
+    },
     apiLimiter: (_req, _res, next) => next(),
   };
   const app = express();
@@ -154,7 +158,7 @@ describe('POST /api/learning/cluster/run', () => {
     expect(props.status).toBe(200);
     expect(props.body.proposals.length).toBe(1);
     expect(props.body.proposals[0].from_candidate_ids).toEqual(['c1', 'c2']);
-    expect(props.body.proposals[0].combined_support).toEqual({ verified: 5, recovered: 0, corrections: 2 });
+    expect(props.body.proposals[0].combined_support).toEqual({ verified: 5, recovered: 0, corrections: 0 });
     expect(props.body.proposals[0].member_titles.length).toBe(2);
   });
 

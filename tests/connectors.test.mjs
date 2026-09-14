@@ -317,6 +317,12 @@ describe('connector admin routes', () => {
 
 // ─── M5: gmail_send out-of-band human approval (agent tool path) ────
 describe('gmail_send human approval (M5)', () => {
+  beforeEach(() => {
+    stmts.connectors.upsert.run(
+      randomUUID(), 'gmail', 'Gmail', 'google', 1, '{}', '{}', 'configured'
+    );
+  });
+
   async function gmailTool() {
     makeApp(); // connectorsRoutes() registers the agent tools
     const { agentTools } = await import('../src/server/routes/agent.mjs');

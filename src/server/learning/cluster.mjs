@@ -267,7 +267,8 @@ function loadMergeableCandidates(db, userId) {
       promotion_score, cooldown_until, created_at
     FROM learning_candidates
     WHERE user_id = ? AND state IN (${placeholders})
-      AND (cooldown_until IS NULL OR cooldown_until <= ?)`)
+      AND (cooldown_until IS NULL OR cooldown_until <= ?)
+    ORDER BY promotion_score DESC, created_at ASC`)
     .all(userId, ...MERGEABLE_STATES, now);
 }
 
@@ -341,10 +342,20 @@ export async function runClustering({ db, userId, logger = console, threshold, s
       // Fresh re-cluster: drop this user's non-legacy clusters, their
       // member rows (cascade), and their open proposals. Legacy
       // read-only clusters are left alone, always.
+      // Count proposals that will be cascade-deleted via cluster FK.
+      const cascadeProposals = db.prepare(`SELECT id FROM learning_merge_proposals
+        WHERE user_id = ? AND state = 'proposed' AND cluster_id IN (
+          SELECT id FROM learning_clusters WHERE user_id = ? AND is_legacy_readonly = 0
+        )`).all(userId, userId);
+      const cascadeCount = cascadeProposals.length;
+
       deletedClusters = db.prepare(`DELETE FROM learning_clusters
         WHERE user_id = ? AND is_legacy_readonly = 0`).run(userId).changes ?? 0;
-      deletedProposals = db.prepare(`DELETE FROM learning_merge_proposals
-        WHERE user_id = ? AND state = 'proposed'`).run(userId).changes ?? 0;
+      // Explicit delete catches any proposed proposals NOT tied to a deleted cluster
+      // (should be rare, but defense in depth).
+      const explicitDelete = db.prepare(`DELETE FROM learning_merge_proposals
+        WHERE user_id = ? AND state = 'proposed'`).run(userId);
+      deletedProposals = cascadeCount + (explicitDelete.changes ?? 0);
 
       // History rows for the killed open proposals, in the same
       // transaction as the delete. The helper never throws, so this

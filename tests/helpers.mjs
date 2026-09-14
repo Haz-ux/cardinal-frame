@@ -2,7 +2,7 @@
  * Test helpers: create a test server instance with an isolated temp DB.
  * Each test file gets its own fresh database.
  */
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import jwt from 'jsonwebtoken';
@@ -82,4 +82,24 @@ export function adminAuth() {
  */
 export function userAuth(userId = 'user-test', username = 'testuser') {
   return authHeader(makeToken(userId, username, 'user'));
+}
+
+/**
+ * Read generated admin credentials from the .admin-credentials file.
+ * Returns { adminPassword, hazPassword } or throws if not found.
+ */
+export function getAdminCredentials() {
+  if (!_tmpDir) throw new Error('Test server not initialized');
+  const credFile = join(_tmpDir, '.admin-credentials');
+  const content = readFileSync(credFile, 'utf-8');
+  const lines = content.trim().split('\n').filter(l => l && !l.startsWith('#'));
+  const creds = {};
+  for (const line of lines) {
+    const [username, password] = line.split(':');
+    if (username && password) creds[username] = password;
+  }
+  if (!creds.admin || !creds.Haz) {
+    throw new Error('Admin credentials not found in ' + credFile);
+  }
+  return { adminPassword: creds.admin, hazPassword: creds.Haz };
 }

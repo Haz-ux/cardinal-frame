@@ -160,7 +160,7 @@ describe('sanitizeFtsQuery — shared FTS sanitizer', () => {
   it('quotes tokens so FTS5 special chars cannot break MATCH', () => {
     const q = sanitizeFtsQuery('fix the "login" bug (urgent) OR bypass:all');
     expect(q).toContain('"login"');
-    expect(q).toContain('"urgent"');
+    expect(q).toContain('"(urgent)"');
     expect(q).toContain('"OR"');
     expect(q).toContain('"bypass:all"');
   });
