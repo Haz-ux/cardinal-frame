@@ -1934,7 +1934,7 @@ async function collectTelemetry() {
     // Generic sysfs GPU sources when not a Jetson
     if (gpuUtil == null) gpuUtil = await readGpuUtil();
 
-    telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, device: deviceInfo, ts: Date.now() };
+    telemetryCache = { cpu: cpuLoad, mem: memUsage, gpu: gpuUtil, npu: npuUtil, temp: Math.round(tempC), uptime: Math.floor(process.uptime()), wsClients: wss.clients.size, device: deviceInfo || fallbackDeviceInfo, ts: Date.now() };
   } catch {}
   return telemetryCache;
 }
