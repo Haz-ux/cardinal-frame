@@ -20,7 +20,7 @@ describe('Security Mechanisms', () => {
       const res = await request(app).get('/api/health');
       expect(res.status).toBe(200);
       // If we get here without hanging, rate limiting middleware is properly mounted
-      expect(res.body.status).toBe('ok');
+      expect(res.body.payload.status).toBe('ok');
     });
   });
 

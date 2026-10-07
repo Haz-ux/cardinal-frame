@@ -16,7 +16,9 @@
     "hooks:install": "bash scripts/setup-hooks.sh",
     "test": "vitest run",
     "test:watch": "vitest watch",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "lint": "echo \"No root linter configured; client has no lint script\"",
+    "typecheck": "tsc --noEmit"
   },
   "bin": {
     "cardinal": "src/cli/cardinal.mjs"

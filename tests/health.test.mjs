@@ -17,19 +17,19 @@ describe('Health & Infrastructure', () => {
     it('should return enhanced health info', async () => {
       const res = await request(app).get('/api/health');
       expect(res.status).toBe(200);
-      expect(res.body.status).toBe('ok');
-      expect(res.body.mode).toBe('AI-Powered');
+      expect(res.body.payload.status).toBe('ok');
+      expect(res.body.payload.node_id).toBeDefined();
       // Enhanced fields
-      expect(res.body).toHaveProperty('db');
-      expect(res.body.db).toHaveProperty('type', 'SQLite');
-      expect(res.body.db).toHaveProperty('tables');
-      expect(res.body.db).toHaveProperty('size_mb');
-      expect(res.body).toHaveProperty('ws');
-      expect(res.body.ws).toHaveProperty('connected_clients');
-      expect(res.body).toHaveProperty('uptime');
-      expect(res.body).toHaveProperty('memory');
-      expect(res.body.memory).toHaveProperty('rss_mb');
-      expect(res.body).toHaveProperty('timestamp');
+      expect(res.body.payload).toHaveProperty('db');
+      expect(res.body.payload.db).toHaveProperty('type', 'SQLite');
+      expect(res.body.payload.db).toHaveProperty('tables');
+      expect(res.body.payload.db).toHaveProperty('size_mb');
+      expect(res.body.payload).toHaveProperty('ws');
+      expect(res.body.payload.ws).toHaveProperty('connected_clients');
+      expect(res.body.payload).toHaveProperty('uptime');
+      expect(res.body.payload).toHaveProperty('memory');
+      expect(res.body.payload.memory).toHaveProperty('rss_mb');
+      expect(res.body).toHaveProperty('signature');
     });
 
     it('should not require auth', async () => {

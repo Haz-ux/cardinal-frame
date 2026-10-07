@@ -68,8 +68,6 @@ import { initNodeRegistry } from './node-registry.mjs';
 import { getOrCreateNodeIdentity, signPayload } from './node-identity.mjs';
 import { runMigrations } from './migrator.mjs';
 
-dotenv.config({ path: path.resolve(import.meta.dirname, '..', '..', '.env') });
-
 const require = createRequire(import.meta.url);
 const APP_VERSION = require('../../package.json').version;
 
@@ -1351,8 +1349,6 @@ function authMiddleware(req, res, next) {
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'No token provided' });
   }
-  console.log('[DEBUG authMiddleware] JWT_SECRET:', JWT_SECRET);
-  console.log('[DEBUG authMiddleware] Token prefix:', header.slice(7, 27) + '...');
   try {
     const decoded = jwt.verify(header.slice(7), JWT_SECRET);
     req.user = decoded;
