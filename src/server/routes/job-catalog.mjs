@@ -1,5 +1,6 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
+import { scoreCommand } from '../warden.mjs';
 
 /**
  * Job Catalog — Reusable task templates + AI-suggested patterns
@@ -20,6 +21,18 @@ import { randomUUID } from 'crypto';
 export default function jobCatalogRoutes(ctx) {
   const { db, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, audit, logger, callAgentLLM } = ctx;
   const router = express.Router();
+
+  // WARDEN risk gate applied at task instantiation: template commands are
+  // admin-curated, but params substitution and later template edits can
+  // inject a destructive command, so we still gate before creating/executing
+  // the task.
+  function gateTemplateCommand(command) {
+    const warden = scoreCommand(command);
+    if (warden.verdict === 'block') {
+      return { safe: false, error: 'WARDEN: high-risk command blocked' };
+    }
+    return { safe: true };
+  }
 
   // ─── Schema (idempotent) ──────────────────────────────────────────
   db.exec(`
@@ -125,7 +138,7 @@ export default function jobCatalogRoutes(ctx) {
     res.json(parseTemplate(row));
   });
 
-  router.post('/job-catalog', authMiddleware, apiLimiter, (req, res) => {
+  router.post('/job-catalog', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
     const err = validateTemplate(req.body);
     if (err) return res.status(400).json({ error: err.error });
 
@@ -138,7 +151,7 @@ export default function jobCatalogRoutes(ctx) {
     res.status(201).json(parseTemplate(row));
   });
 
-  router.put('/job-catalog/:id', authMiddleware, apiLimiter, (req, res) => {
+  router.put('/job-catalog/:id', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
     const existing = stmts.getById.get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Template not found' });
 
@@ -188,6 +201,9 @@ export default function jobCatalogRoutes(ctx) {
     const { sanitizeCommand, stmts: ctxStmts, executeTask } = ctx;
     const check = sanitizeCommand(command);
     if (!check.safe) return res.status(400).json({ error: check.error });
+
+    const tGate = gateTemplateCommand(command);
+    if (!tGate.safe) return res.status(400).json({ error: tGate.error });
 
     const taskId = randomUUID();
     const taskName = req.body.name || `[${tpl.name}] ${new Date().toISOString().slice(0, 16)}`;
@@ -274,7 +290,7 @@ Analyze these tasks. Group similar commands, identify patterns, and suggest reus
   });
 
   // ─── Import suggested template ─────────────────────────────────────
-  router.post('/job-catalog/import', authMiddleware, apiLimiter, (req, res) => {
+  router.post('/job-catalog/import', authMiddleware, requireRole('admin'), apiLimiter, (req, res) => {
     const err = validateTemplate(req.body);
     if (err) return res.status(400).json({ error: err.error });
 

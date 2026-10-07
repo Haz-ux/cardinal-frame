@@ -65,9 +65,10 @@ import { executeSkillChain } from './chains.mjs';
 import { HeartbeatDaemon } from './heartbeat.mjs';
 import { LearnLoopDaemon } from './learning-loop.mjs';
 import { initNodeRegistry } from './node-registry.mjs';
+import { getOrCreateNodeIdentity, signPayload } from './node-identity.mjs';
 import { runMigrations } from './migrator.mjs';
 
-dotenv.config();
+dotenv.config({ path: path.resolve(import.meta.dirname, '..', '..', '.env') });
 
 const require = createRequire(import.meta.url);
 const APP_VERSION = require('../../package.json').version;
@@ -175,8 +176,19 @@ runMigrations(db);
 // override was removed — use the PORT env var to change it.
 
 // Schema with task_logs, task_assignments, and RBAC
-const adminHash = bcrypt.hashSync('admin123', 10);
-const hazHash = bcrypt.hashSync('cardinal', 10);
+// Admin bootstrap credentials. Overridable via env so a deployment never has
+// to ship the well-known dev defaults; in production a default password is
+// treated as a fatal misconfiguration (mirrors the JWT_SECRET guard above).
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === 'production' ? '' : 'admin123');
+const HAZ_USERNAME = process.env.HAZ_USERNAME || 'Haz';
+const HAZ_PASSWORD = process.env.HAZ_PASSWORD || (process.env.NODE_ENV === 'production' ? '' : 'cardinal');
+if (process.env.NODE_ENV === 'production' && (!ADMIN_PASSWORD || !HAZ_PASSWORD)) {
+  console.error('FATAL: ADMIN_PASSWORD and HAZ_PASSWORD must be set in production (no default admin credentials allowed).');
+  process.exit(1);
+}
+const adminHash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+const hazHash = bcrypt.hashSync(HAZ_PASSWORD, 10);
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -714,10 +726,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_chain_exec_chain_id ON chain_executions(chain_id);
 
   INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('admin-000', 'admin', '${adminHash}', 'admin');
+  VALUES ('admin-000', '${ADMIN_USERNAME}', '${adminHash}', 'admin');
 
   INSERT OR IGNORE INTO users (id, username, password_hash, role)
-  VALUES ('haz-001', 'Haz', '${hazHash}', 'admin');
+  VALUES ('haz-001', '${HAZ_USERNAME}', '${hazHash}', 'admin');
 
   INSERT OR IGNORE INTO personas (id, agent_id, name, description, soul, permissions, constraints, enabled)
   VALUES ('persona-default', NULL, 'Default', 'Baseline governance — allows all actions with audit logging',
@@ -1339,11 +1351,14 @@ function authMiddleware(req, res, next) {
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'No token provided' });
   }
+  console.log('[DEBUG authMiddleware] JWT_SECRET:', JWT_SECRET);
+  console.log('[DEBUG authMiddleware] Token prefix:', header.slice(7, 27) + '...');
   try {
     const decoded = jwt.verify(header.slice(7), JWT_SECRET);
     req.user = decoded;
     next();
   } catch (err) {
+    console.log('[DEBUG authMiddleware] Verify error:', err.message);
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
@@ -1365,7 +1380,7 @@ function requireRole(...roles) {
 }
 
 // ─── Command Sanitization ─────────────────────────────────────────
-const ALLOWED_COMMANDS = ['echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort', 'uniq', 'curl', 'wget', 'python3', 'node', 'bash'];
+const ALLOWED_COMMANDS = ['echo', 'ls', 'cat', 'pwd', 'date', 'whoami', 'hostname', 'uname', 'df', 'free', 'uptime', 'ps', 'wc', 'head', 'tail', 'grep', 'sort', 'uniq', 'curl', 'wget', 'python3', 'node', 'bash', 'sleep'];
 
 function sanitizeCommand(cmd) {
   const trimmed = cmd.trim();
@@ -1454,6 +1469,9 @@ const ctx = {
   executeInDocker, isDockerAvailable,
   getModelCost, buildAimiSystemPrompt: (userId) => buildAimiSystemPrompt(stmts, userId, db),
   checkPermission, auditLog,
+  // Node identity for cross-node verification
+  nodeIdentity: getOrCreateNodeIdentity(db),
+  signPayload,
   // These are populated later (declared with const/let below)
   get collectTelemetry() { return collectTelemetry; },
   get telemetryCache() { return telemetryCache; },

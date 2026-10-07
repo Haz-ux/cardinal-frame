@@ -6,6 +6,7 @@ import path from 'path';
 import { PROVIDER_TYPES, buildProviderAuth, buildChatUrl, buildChatPayload } from './llm-helpers.mjs';
 import { decryptProvider } from './settings.mjs';
 import { getModelCost } from './costs.mjs';
+import { safeFetch } from '../safe-fetch.mjs';
 
 /**
  * Aimi Coding Agent: sandbox agent with plan/read/write/exec/iterate loop.
@@ -270,7 +271,10 @@ registerAgentTool(
   },
   async (args) => {
     try {
-      const resp = await fetch(args.url, { timeout: 15000 });
+      // safeFetch validates the URL against private/loopback/link-local
+      // ranges and re-checks every redirect hop, preventing SSRF to the
+      // metadata service or internal hosts. Throws on unsafe targets.
+      const resp = await safeFetch(args.url);
       const text = await resp.text();
       // Strip HTML tags if it's HTML
       const stripped = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')

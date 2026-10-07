@@ -4,6 +4,10 @@ import { randomUUID } from 'crypto';
 
 const BASE = process.env.CF_API || 'http://localhost:8080/api';
 let TOKEN = process.env.CF_TOKEN;
+// Admin bootstrap credentials for CLI login — mirror the server env vars so a
+// deployment with a custom admin password still works (defaults are the dev ones).
+const ADMIN_USER = process.env.CF_ADMIN_USER || process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.CF_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'admin123';
 
 async function req(method, path, body) {
  const headers = { 'Content-Type': 'application/json' };
@@ -77,7 +81,7 @@ async function tasksCreate(args) {
 
 // `cardinal token` — POST /api/auth/login (admin/admin123), print JWT
 async function token() {
-  const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+  const data = await req('POST', '/auth/login', { username: ADMIN_USER, password: ADMIN_PASSWORD });
   if (data.token) {
     console.log(data.token);
   } else {
@@ -103,7 +107,7 @@ async function port() {
 async function ensureAuth() {
   if (TOKEN) return;
   try {
-    const data = await req('POST', '/auth/login', { username: 'admin', password: 'admin123' });
+    const data = await req('POST', '/auth/login', { username: ADMIN_USER, password: ADMIN_PASSWORD });
     if (data.token) TOKEN = data.token;
   } catch (e) {
     console.error(`✗ Could not log in as admin: ${e.message}\n  Set CF_TOKEN or run 'cardinal token' and export it.`);
@@ -251,7 +255,7 @@ async function chat(args) {
   }
 }
 
-const CF_DIR = process.env.CF_DIR || '/home/cardinal-frame';
+const CF_DIR = process.env.CF_DIR || new URL('../..', import.meta.url).pathname;
 const HEALTH_URL = 'http://localhost:8080/api/health';
 const PID_FILE = '/tmp/cardinal.pid';
 const LOG_FILE = process.env.CF_LOG_FILE || '/tmp/cardinal-server.log';

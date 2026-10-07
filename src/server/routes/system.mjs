@@ -17,9 +17,11 @@ export default function systemRoutes(ctx) {
     const tableCount = db.prepare("SELECT count(*) as c FROM sqlite_master WHERE type='table'").get().c;
     const dbSize = db.prepare("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()").get().size;
 
-    res.json({
+    // Build health payload for node registry verification
+    const payload = {
       status: 'ok',
-      mode: 'AI-Powered',
+      node_id: ctx.nodeIdentity?.node_id || 'unknown',
+      timestamp: new Date().toISOString(),
       db: {
         type: 'SQLite',
         journal_mode: dbStats,
@@ -35,7 +37,15 @@ export default function systemRoutes(ctx) {
         heap_used_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
         heap_total_mb: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
       },
-      timestamp: new Date().toISOString(),
+    };
+
+    // Sign the payload with this node's identity for registry verification
+    const signature = ctx.signPayload ? ctx.signPayload(ctx.nodeIdentity?.private_key_pem, payload) : null;
+
+    // Registry expects: { payload: {...}, signature: "..." }
+    res.json({
+      payload,
+      signature,
     });
   });
 

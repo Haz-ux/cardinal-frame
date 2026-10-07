@@ -38,8 +38,9 @@ async function testHealth() {
  console.log('\n🩺 Health & Basics');
  const { status, data } = await req('GET', '/health');
  assert('Health endpoint returns 200', status === 200);
- assert('Status is ok', data.status === 'ok');
- assert('DB is SQLite', data.db === 'SQLite');
+ const payload = data.payload || data;
+ assert('Status is ok', payload.status === 'ok');
+ assert('DB is SQLite', payload.db?.type === 'SQLite');
 }
 
 async function testAuth() {
@@ -248,10 +249,10 @@ async function testCLI() {
  console.log('\n💻 CLI Tool');
  const { execSync } = await import('child_process');
  try {
-  const out = execSync('node src/cli/cardinal.mjs health', { cwd: '/home/haz/cardinal-frame/cardinal-frame', env: { ...process.env, CF_TOKEN: token }, timeout: 10000 }).toString();
-  assert('CLI health works', out.includes('"ok"'));
+  const out = execSync('node src/cli/cardinal.mjs status', { cwd: '/home/haz/cardinal-frame/cardinal-frame', env: { ...process.env, CF_TOKEN: token }, timeout: 10000 }).toString();
+  assert('CLI status works', out.includes('Status:'));
  } catch (e) {
-  assert('CLI health works', false, e.message.slice(0, 100));
+  assert('CLI status works', false, e.message.slice(0, 100));
  }
 
  try {
@@ -267,7 +268,7 @@ async function testSprint8() {
  console.log('\n🚀 Sprint 8 — Cancel / Retry / Audit / Search');
 
  // Create a task to cancel (use long-running allowed command)
- const t = await req('POST', '/tasks', { name: 'cancel-test', command: 'node -e "setTimeout(()=>{},60000)"' });
+ const t = await req('POST', '/tasks', { name: 'cancel-test', command: 'sleep 60' });
  const tid = t.data.id;
  created.cancelTaskId = tid;
 

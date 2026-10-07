@@ -4,6 +4,7 @@ import { exec } from 'child_process';
 import path from 'path';
 import multer from 'multer';
 import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
+import { scoreCommand } from '../warden.mjs';
 
 /**
  * Task + DAG + File routes
@@ -12,6 +13,46 @@ import { unlinkSync, createReadStream, mkdirSync, existsSync } from 'fs';
 export default function taskRoutes(ctx) {
   const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, broadcastLog, executeTask, sanitizeCommand, fireHook } = ctx;
   const router = express.Router();
+
+  /**
+   * WARDEN risk gate for task/DAG commands — mirrors the delegate route.
+   * Blocks high-risk commands outright; requires explicit admin approval
+   * for medium-risk commands. Task/DAG execution previously ran only the
+   * allowlist check and could be trivially bypassed (e.g. `bash -c '...'`),
+   * giving any authenticated user arbitrary command execution.
+   *
+   * In addition to the WARDEN scorer, shell/embedded interpreters are
+   * blocked outright: the WARDEN does not flag e.g. `python3 -c
+   * "os.system('rm -rf /')"` as remote-exec, so relying on it alone would
+   * leave a real arbitrary-code-execution path open.
+   */
+  const BLOCKED_INTERPRETERS = new Set([
+    'bash', 'sh', 'zsh', 'csh', 'ksh', 'dash', 'ash', 'fish',
+    'node', 'nodejs', 'deno', 'bun', 'python3', 'python', 'perl', 'ruby', 'php', 'lua', 'tclsh', 'pwsh', 'powershell',
+    'curl', 'wget', 'nc', 'ncat', 'telnet', 'ssh', 'socat',
+  ]);
+  function gateCommand(command, actor, opts = {}) {
+    const base = (command || '').trim().split(/\s+/)[0]?.split('/').pop();
+    if (base && BLOCKED_INTERPRETERS.has(base)) {
+      return { ok: false, status: 403, body: { error: `WARDEN: command interpreter '${base}' is not permitted for task execution` } };
+    }
+    const warden = scoreCommand(command);
+    audit('create', 'warden:command', command, actor, { score: warden.score, level: warden.level, verdict: warden.verdict, reasons: warden.reasons });
+    if (warden.verdict === 'block') {
+      return { ok: false, status: 403, body: { error: 'WARDEN: high-risk command blocked', warden } };
+    }
+    if (warden.verdict === 'approve' && opts.warden_approve !== true) {
+      const approvalId = randomUUID();
+      stmts.warden.insert.run(approvalId, 'task', 'execute', JSON.stringify({ command }), JSON.stringify(warden), 'pending', actor || null);
+      broadcast('warden:approval_required', { approval_id: approvalId, scope: 'task', warden });
+      return {
+        ok: false,
+        status: 403,
+        body: { error: 'WARDEN: command requires explicit approval', needs_approval: true, approval_id: approvalId, warden },
+      };
+    }
+    return { ok: true };
+  }
 
   // Multer config for file uploads
   const UPLOADS_DIR = path.join(path.resolve(process.env.DATA_DIR || path.join(import.meta.dirname, '..', '..', '..', 'data')), 'uploads');
@@ -173,6 +214,8 @@ const { name, command, dependsOn } = req.body;
 if (!name || !command) return res.status(400).json({ error: 'Name and command are required' });
 const check = sanitizeCommand(command);
 if (!check.safe) return res.status(400).json({ error: check.error });
+const gate = gateCommand(command, req.user?.username || req.user?.id, { warden_approve: req.body?.warden_approve });
+if (!gate.ok) return res.status(gate.status).json(gate.body);
 const id = randomUUID();
 stmts.tasks.insert.run(id, name, command, 'pending', req.user?.id || null, null);
 
@@ -270,6 +313,9 @@ router.patch('/tasks/:id/execute', authMiddleware, apiLimiter, (req, res) => {
     return res.status(409).json({ error: 'Task has unmet dependencies', unmetDependencies: unmetDeps });
   }
 
+  const gate = gateCommand(task.command, req.user?.username || req.user?.id, { warden_approve: req.body?.warden_approve });
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+
   executeTask(req.params.id, task.command);
   res.json({ id: req.params.id, status: 'running', message: 'Execution started' });
 });
@@ -296,6 +342,11 @@ router.post('/tasks/:id/retry', authMiddleware, apiLimiter, (req, res) => {
   stmts.logs.deleteByTask.run(req.params.id);
   // Reset status to pending, then execute
   stmts.tasks.updateStatus.run('pending', null, null, null, null, req.params.id);
+  const gate = gateCommand(task.command, req.user?.username || req.user?.id, { warden_approve: req.body?.warden_approve });
+  if (!gate.ok) {
+    stmts.tasks.updateStatus.run('failed', null, new Date().toISOString(), 'Command requires warden approval', 0, req.params.id);
+    return res.status(gate.status).json(gate.body);
+  }
   executeTask(req.params.id, task.command);
   broadcast('task:status', { id: req.params.id, status: 'running', message: 'Retried' });
   logger.info(`Task retried: ${task.name} (${req.params.id})`);
@@ -415,6 +466,26 @@ router.post('/dags/:id/run', authMiddleware, apiLimiter, (req, res) => {
 
   const nodes = JSON.parse(dag.nodes);
   const edges = JSON.parse(dag.edges);
+
+  const actor = req.user?.username || req.user?.id;
+  const gated = req.body?.warden_approve === true; // one-shot approval flag for this run
+  if (Array.isArray(nodes)) {
+    const wardenApprovals = [];
+    for (const node of nodes) {
+      if (!node || !node.command) continue;
+      const gate = gateCommand(node.command, actor, { warden_approve: gated });
+      if (!gate.ok) {
+        if (gate.body?.needs_approval) wardenApprovals.push(gate.body.approval_id);
+        else {
+          stmts.dags.update.run(dag.name, dag.nodes, dag.edges, 'failed', JSON.stringify({ error: gate.body.error, warden: gate.body.warden }), req.params.id);
+          return res.status(gate.status).json(gate.body);
+        }
+      }
+    }
+    if (wardenApprovals.length > 0) {
+      return res.status(403).json({ error: 'WARDEN: DAG requires explicit approval', needs_approval: true, approval_ids: wardenApprovals, warden: true });
+    }
+  }
 
   try {
     const layers = topoSortLayers(nodes, edges);

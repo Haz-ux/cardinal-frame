@@ -10,6 +10,7 @@ import { validateBody, schemas } from '../validate.mjs';
  */
 export default function authRoutes(ctx) {
   const { stmts, JWT_SECRET, JWT_EXPIRES, JWT_REFRESH_EXPIRES, logger, audit, authMiddleware, authLimiter } = ctx;
+  console.log('[DEBUG authRoutes] JWT_SECRET received:', JWT_SECRET);
   const router = express.Router();
 
   // Cache-control headers for all auth routes
@@ -47,6 +48,7 @@ export default function authRoutes(ctx) {
   }
 
   function issueTokens(user) {
+    console.log('[DEBUG issueTokens] JWT_SECRET:', JWT_SECRET);
     const token = jwt.sign(
       { id: user.id, username: user.username, role: user.role },
       JWT_SECRET,

@@ -2,14 +2,19 @@ import express from 'express';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import cronParser from 'cron-parser';
+const { parseExpression } = cronParser;
 
 /**
  * Meta routes: MCP, Groups, Schedules, Plugins, Audit Log
- * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID
+ * Dependencies: db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID, mcp
  */
 export default function metaRoutes(ctx) {
-  const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID, mcp } = ctx;
+  const { db, stmts, logger, audit, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, randomUUID, mcp, sanitizeCommand, executeTask } = ctx;
   const router = express.Router();
+  
+  // Local alias for cron parser
+  const parseCronExpression = parseExpression;
 
 // ─── MCP Server Management API ─────────────────────────────────────
 // Register a new MCP server

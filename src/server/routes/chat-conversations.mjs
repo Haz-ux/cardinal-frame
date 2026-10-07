@@ -58,23 +58,39 @@ export default function chatConvRoutes(ctx) {
   router.post('/chat/upload', authMiddleware, apiLimiter, (req, res) => {
     const { filename, mime_type, content_b64, message_id } = req.body;
     if (!filename || !content_b64) return res.status(400).json({ error: 'filename and content_b64 required' });
+    // Sanitize the user-supplied filename so it can never escape UPLOAD_DIR
+    // (strip path separators, directory traversal, and control chars).
+    const safeName = String(filename).split(/[\\/]/).pop().replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
     const id = randomUUID();
     const buf = Buffer.from(content_b64, 'base64');
-    const storagePath = path.join(UPLOAD_DIR, `${id}-${filename}`);
+    const storagePath = path.join(UPLOAD_DIR, `${id}-${safeName}`);
     writeFileSync(storagePath, buf);
     const msgId = message_id || null;
     try {
-      stmts.attachments.insert.run(id, msgId, null, filename, mime_type || 'application/octet-stream', buf.length, storagePath);
+      stmts.attachments.insert.run(id, msgId, null, safeName, mime_type || 'application/octet-stream', buf.length, storagePath);
     } catch (e) {
       db.prepare('INSERT INTO chat_attachments (id, filename, mime_type, size, storage_path) VALUES (?, ?, ?, ?, ?)')
-        .run(id, filename, mime_type || 'application/octet-stream', buf.length, storagePath);
+        .run(id, safeName, mime_type || 'application/octet-stream', buf.length, storagePath);
     }
-    res.status(201).json({ id, filename, mime_type: mime_type || 'application/octet-stream', size: buf.length, message_id: msgId });
+    res.status(201).json({ id, filename: safeName, mime_type: mime_type || 'application/octet-stream', size: buf.length, message_id: msgId });
   });
 
   router.get('/chat/attachments/:id', authMiddleware, (req, res) => {
-    const att = db.prepare('SELECT * FROM chat_attachments WHERE id = ?').get(req.params.id);
+    // Ownership check: an attachment belongs to the user who owns the
+    // conversation that its message belongs to. Admins can read any.
+    const att = db.prepare(`
+      SELECT a.*, c.user_id AS owner_id
+      FROM chat_attachments a
+      LEFT JOIN chat_messages m ON a.message_id = m.id
+      LEFT JOIN chat_conversations c ON m.conversation_id = c.id
+      WHERE a.id = ?
+    `).get(req.params.id);
     if (!att) return res.status(404).json({ error: 'Attachment not found' });
+    // file_id-only attachments carry no conversation owner; lock those to
+    // their uploader at creation time if available, otherwise require admin.
+    if (att.owner_id && att.owner_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     if (!att.storage_path || !existsSync(att.storage_path)) return res.status(404).json({ error: 'File missing' });
     res.setHeader('Content-Type', att.mime_type);
     res.setHeader('Content-Disposition', `inline; filename="${att.filename}"`);
