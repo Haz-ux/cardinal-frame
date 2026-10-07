@@ -116,16 +116,40 @@ app.use(compression({
     const type = res.getHeader('Content-Type');
     if (type && (String(type).includes('text/event-stream') || String(type).includes('image/'))) return false;
     return compression.filter(req, res);
-  },
+  }
 }));
 app.use(express.json({ limit: '10mb' }));
 
-// ─── Security headers ──────────────────────────────────────────
-app.disable('x-powered-by'); // Don't leak Express
+// ─── Security headers (Helmet + CSP) ──────────────────────────────
+import helmet from 'helmet';
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"], // React dev server needs inline scripts
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      fontSrc: ["'self'", "data:"],
+      connectSrc: ["'self'", "ws:", "wss:"],
+      frameAncestors: ["'self'"],
+      formAction: ["'self'"],
+      baseUri: ["'self'"],
+      objectSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Allow embedding for dev
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  noSniff: true,
+  xssFilter: true,
+  frameguard: { action: 'sameorigin' },
+}));
+
+// Additional security headers not covered by helmet
 app.use((req, res, next) => {
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   next();
 });
 
@@ -158,6 +182,71 @@ const sandboxLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders
 // Legacy alias — maps to writeLimiter for backward compat on existing routes
 const apiLimiter = writeLimiter;
 app.set('trust proxy', 1);
+
+// ─── Prometheus Metrics ────────────────────────────────────────────
+import client from 'prom-client';
+const register = new client.Registry();
+register.setDefaultLabels({ app: 'cardinal-frame' });
+client.collectDefaultMetrics({ register, prefix: 'cf_' });
+
+// Custom metrics
+const httpRequestsTotal = new client.Counter({
+  name: 'cf_http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status'],
+  registers: [register],
+});
+const httpRequestDuration = new client.Histogram({
+  name: 'cf_http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
+const activeSessions = new client.Gauge({
+  name: 'cf_active_sessions',
+  help: 'Active agent sessions',
+  registers: [register],
+});
+const queueDepth = new client.Gauge({
+  name: 'cf_job_queue_depth',
+  help: 'Job queue depth (pending + running)',
+  registers: [register],
+});
+const llmTokensTotal = new client.Counter({
+  name: 'cf_llm_tokens_total',
+  help: 'Total LLM tokens consumed',
+  labelNames: ['provider', 'model', 'type'],
+  registers: [register],
+});
+const dbQueriesTotal = new client.Counter({
+  name: 'cf_db_queries_total',
+  help: 'Total database queries',
+  labelNames: ['operation', 'table'],
+  registers: [register],
+});
+
+// Metrics middleware
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const duration = Number(process.hrtime.bigint() - start) / 1e9;
+    const route = req.route?.path || req.path || 'unknown';
+    httpRequestsTotal.inc({ method: req.method, route, status: res.statusCode });
+    httpRequestDuration.observe({ method: req.method, route, status: res.statusCode }, duration);
+  });
+  next();
+});
+
+// /metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (e) {
+    res.status(500).end(e.message);
+  }
+});
 
 // ─── SQLite Database ───────────────────────────────────────────────
 import { mkdirSync } from 'fs';

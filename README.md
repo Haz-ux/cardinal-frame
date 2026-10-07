@@ -24,11 +24,12 @@ Built with Express + SQLite (WAL) monolith backend, Vite + React 19 SPA frontend
 - **Neural Map** — force-directed graph showing file/connection relationships
 - **Durable job queue** — SQLite-backed with retry/backoff and resume-on-restart
 - **Cost tracking** — per-token accounting with budget alerts
-- **Observability** — request tracing with trace IDs and structured logs
+- **Observability** — request tracing with trace IDs, structured JSON logs, Prometheus `/metrics` endpoint
 - **Memory + session search** — FTS5 full-text search with optional LLM-powered summaries (`?summary=true`)
 - **Embedding engine** — MiniLM on-demand load/unload for semantic search
 - **Secrets management** — AES-256-GCM encryption at rest (see [Security & Audit](#security--audit))
-- **CI/CD** — GitHub Actions (tests on Node 20/22, gitleaks secret scan, history check)
+- **CI/CD** — GitHub Actions (tests on Node 20/22, gitleaks secret scan, history check, typecheck, Docker build)
+- **Dependabot** — automated dependency updates with security alerts
 
 ## Architecture
 
@@ -445,6 +446,49 @@ GitHub Actions (`.github/workflows/ci.yml`):
 1. **Tests** on Node 20 + 22 (`NODE_ENV=test`)
 2. **Gitleaks secret scan** (full commit history)
 3. **History check** on PRs (catches secrets before merge)
+4. **Typecheck** (`tsc --noEmit`)
+5. **Docker build** — multi-stage image pushed to GHCR
+
+## Docker Deployment
+
+```bash
+# Build
+docker build -t cardinal-frame:latest .
+
+# Run (production)
+docker run -d \
+  --name cardinal-frame \
+  -p 8080:8080 \
+  -e JWT_SECRET="$(openssl rand -base64 48)" \
+  -e ENCRYPT_SECRET="$(openssl rand -base64 48)" \
+  -e NODE_ENV=production \
+  -e ADMIN_PASSWORD="your-secure-admin-password" \
+  -e HAZ_PASSWORD="your-secure-haz-password" \
+  -e CORS_ORIGIN="https://your-domain.com" \
+  -v cardinal-data:/app/data \
+  --restart unless-stopped \
+  cardinal-frame:latest
+
+# Health check
+curl -s http://localhost:8080/api/health | jq .payload.status
+# => "ok"
+```
+
+**Required env vars for production:**
+| Variable | Description | Generate with |
+|----------|-------------|---------------|
+| `JWT_SECRET` | Signs access tokens | `openssl rand -base64 48` |
+| `ENCRYPT_SECRET` | Derives AES-256-GCM key for secrets at rest | `openssl rand -base64 48` |
+| `NODE_ENV` | Must be `production` | — |
+| `ADMIN_PASSWORD` | Admin bootstrap password | your choice |
+| `HAZ_PASSWORD` | Haz user bootstrap password | your choice |
+| `CORS_ORIGIN` | Allowed origin for browser clients | `https://your-domain.com` |
+
+**Optional env vars:** `JWT_EXPIRES`, `JWT_REFRESH_EXPIRES`, `ADMIN_USERNAME`, `HAZ_USERNAME`, `PORT`, `DATA_DIR`, LLM provider keys (`NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, etc.)
+
+**Volume:** `cardinal-data:/app/data` persists SQLite (WAL mode) across restarts.
+
+**Non-root:** Container runs as user `cardinal` (UID 999) via `dumb-init` for proper signal handling.
 
 ## Documentation
 

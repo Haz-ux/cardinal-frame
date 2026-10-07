@@ -1,0 +1,68 @@
+version: 2
+updates:
+  # npm dependencies (server + client workspace)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "chore(deps):"
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    groups:
+      dev-dependencies:
+        patterns:
+          - "@types/*"
+          - "vitest*"
+          - "@playwright/*"
+          - "supertest*"
+        update-types:
+          - "minor"
+          - "patch"
+      production-dependencies:
+        patterns:
+          - "express*"
+          - "better-sqlite3*"
+          - "jsonwebtoken*"
+          - "bcryptjs*"
+          - "zod*"
+          - "ws*"
+          - "cors*"
+          - "compression*"
+          - "multer*"
+          - "morgan*"
+          - "pdf-parse*"
+          - "cron-parser*"
+          - "d3-force*"
+          - "dotenv*"
+          - "winston*"
+          - "@xenova/transformers*"
+        update-types:
+          - "patch"
+        # Major updates for production deps require manual review
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(deps):"
+    open-pull-requests-limit: 5
