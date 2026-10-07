@@ -1,10 +1,17 @@
 # ── Stage 1: Build client (Vite) ──────────────────────────────────────
 FROM node:22-slim AS client-builder
 
-WORKDIR /app/client
+WORKDIR /app
 
-COPY client/package.json client/package-lock.json ./
-RUN npm ci
+# Install root deps first (for vite.config.mjs which reads ../package.json)
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# Then install client deps
+COPY client/package.json ./client/
+RUN cd client && npm install
+
+WORKDIR /app/client
 
 COPY client/ ./
 RUN npm run build
