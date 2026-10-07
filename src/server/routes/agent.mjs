@@ -26,8 +26,9 @@ import { safeFetch } from '../safe-fetch.mjs';
 // Autopilot: server-side loop with native function calling
 // File scope: sandbox = /home/haz/ai-workspace/, home = /home/haz/
 
-const SANDBOX_DIR = '/home/haz/ai-workspace';
-const HOME_DIR = '/home/haz';
+// Configurable sandbox directory via env (for tests) or default
+const SANDBOX_DIR = process.env.AGENT_SANDBOX_DIR || '/home/haz/ai-workspace';
+const HOME_DIR = process.env.AGENT_HOME_DIR || '/home/haz';
 const CMD_BLOCKLIST = [
   'rm -rf', 'sudo', 'reboot', 'shutdown', 'mkfs', 'dd if=', 'kill -9',
   'systemctl stop', 'systemctl disable', 'chmod 777 /', 'chown root',

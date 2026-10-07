@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 
 // Set test env BEFORE importing the server module
 const TEST_JWT_SECRET = 'test-secret-do-not-use-in-prod';
+const TEST_SANDBOX_DIR = '/tmp/cf-test-sandbox';
 
 let _app = null;
 let _db = null;
@@ -23,6 +24,7 @@ export async function getTestServer() {
   process.env.JWT_SECRET = TEST_JWT_SECRET;
   process.env.NODE_ENV = 'test';
   process.env.PORT = process.env.PORT || '0'; // don't bind to a real port unless a test opts in
+  process.env.AGENT_SANDBOX_DIR = TEST_SANDBOX_DIR;
 
   // Import the server module (this runs all the schema setup)
   const serverModule = await import('../src/server/server.mjs');

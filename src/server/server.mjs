@@ -1749,6 +1749,10 @@ app.use((req, res, next) => {
 // Best-effort, async, no shell. Computed once at boot and merged into
 // live telemetry so the dashboard can show what kind of system runs it.
 let deviceInfo = null;
+
+// Core count (synchronous, one-time at boot)
+const _cores = parseInt(execSync('nproc').toString().trim()) || 4;
+
 async function detectDeviceInfo() {
   try {
     const { readFile, readdir, access } = await import('fs/promises');
@@ -1802,11 +1806,23 @@ async function detectDeviceInfo() {
     };
   } catch {}
 }
+
+// Synchronous fallback device info for immediate use (before async detection completes)
+const fallbackDeviceInfo = {
+  class: 'unknown',
+  label: 'Device',
+  model: process.platform,
+  arch: process.arch,
+  cores: _cores,
+  os: process.platform,
+  ram_mb: 0,
+};
+
+// Kick off async detection
 detectDeviceInfo();
 
 // ─── Live Telemetry (async — no execSync) ────────────────────────
-let telemetryCache = { cpu: 0, mem: 0, gpu: null, npu: null, temp: 0, uptime: 0, wsClients: 0, device: null, ts: Date.now() };
-const _cores = parseInt(execSync('nproc').toString().trim()) || 4; // one-time at boot
+let telemetryCache = { cpu: 0, mem: 0, gpu: null, npu: null, temp: 0, uptime: 0, wsClients: 0, device: fallbackDeviceInfo, ts: Date.now() };
 
 const { readFile: readFileMod } = await import('fs/promises');
 async function readFileSafe(p) { try { return (await readFileMod(p, 'utf-8')).trim(); } catch { return ''; } }
