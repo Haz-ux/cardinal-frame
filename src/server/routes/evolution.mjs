@@ -94,10 +94,10 @@ export default function evolutionRoutes(ctx) {
   // ─── Auto-Skill Authoring (Distill) ─────────────────────────────
   // ═════════════════════════════════════════════════════════════════
 
-  // POST /learn/distill — Aimi analyzes a source and auto-creates a skill
+  // POST /evolution/distill — Aimi analyzes a source and auto-creates a skill
   // Supports: conversation, directory, url, notes (defaults to conversation)
   // Admin-only: directory and url sources can access server filesystem/network
-  router.post('/learn/distill', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  async function handleDistill(req, res) {
     try {
       const source_type = req.body.source_type || 'conversation';
       let sourceRef = null;   // identifier for the evolution record (conversation_id, path, url, or 'notes')
@@ -188,21 +188,25 @@ export default function evolutionRoutes(ctx) {
         tokens: { prompt: result.promptTokens, completion: result.completionTokens },
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
-  });
+  }
+
+  router.post('/distill', authMiddleware, requireRole('admin'), apiLimiter, handleDistill);
+  // Backward compat: also mount at /learn/distill
+  router.post('/learn/distill', authMiddleware, requireRole('admin'), apiLimiter, handleDistill);
 
   // ═════════════════════════════════════════════════════════════════
   // ─── Skill Evolution (Chain Promotion) ──────────────────────────
   // ═════════════════════════════════════════════════════════════════
 
-  router.get('/evolution', authMiddleware, requireRole('admin'), (_req, res) => {
+  router.get('/', authMiddleware, requireRole('admin'), (_req, res) => {
     res.json(stmts.evolution.getAll.all());
   });
 
-  router.get('/evolution/skill/:id', authMiddleware, requireRole('admin'), (req, res) => {
+  router.get('/skill/:id', authMiddleware, requireRole('admin'), (req, res) => {
     res.json(stmts.evolution.getBySkill.all(req.params.id));
   });
 
-  router.get('/evolution/chain/:id/check', authMiddleware, (req, res) => {
+  router.get('/chain/:id/check', authMiddleware, (req, res) => {
     const chain = stmts.skillChains.getById.get(req.params.id);
     if (!chain) return res.status(404).json({ error: 'Chain not found' });
 
@@ -218,7 +222,7 @@ export default function evolutionRoutes(ctx) {
     res.json({ ...evaluation, run_count: runCount, success_count: successCount, executions: realHistory.length });
   });
 
-  router.post('/evolution/chain/:id/promote', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  router.post('/chain/:id/promote', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
     try {
       const chain = stmts.skillChains.getById.get(req.params.id);
       if (!chain) return res.status(404).json({ error: 'Chain not found' });

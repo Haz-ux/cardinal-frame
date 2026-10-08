@@ -56,7 +56,7 @@ async function llmSkillName(ctx, phrase) {
  * into an auto-learned skill and link them. Returns the promotion or null.
  */
 export async function runLearnLoop(ctx, opts = {}) {
-  const { stmts, logger, randomUUID, broadcast, audit } = ctx;
+  const { db, stmts, logger, randomUUID, broadcast, audit } = ctx;
   try {
     const candidate = findPromotionCandidates(stmts, opts)[0];
     if (!candidate) return null;
@@ -71,6 +71,7 @@ export async function runLearnLoop(ctx, opts = {}) {
       auto.handler, JSON.stringify(auto.parameters), 0, 0.3, 1
     );
     stmts.patterns.updateConfidence.run(candidate.confidence, id, candidate.id);
+    db.prepare('UPDATE learn_patterns SET auto_skill_id = ? WHERE id = ?').run(id, candidate.id);
     if (audit) audit('auto-promote', 'skill', id, null, {
       name, pattern_id: candidate.id, pattern_key: candidate.pattern_key, occurrences: candidate.occurrence_count,
     });

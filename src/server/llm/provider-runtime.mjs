@@ -93,7 +93,7 @@ export async function executeChat(provider, modelId, messages, opts = {}) {
 
   const {
     stream = false,
-    timeoutMs = 30_000,
+    timeoutMs = provider.type === 'nvidia' ? 150000 : 30_000,
     ...retryOpts
   } = opts;
 

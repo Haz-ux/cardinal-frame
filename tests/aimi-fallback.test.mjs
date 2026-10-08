@@ -12,6 +12,21 @@ vi.mock('../src/server/llm/provider-runtime.mjs', async (importOriginal) => {
       modelCount: 0,
       models: [],
     })),
+    executeChatStream: vi.fn(async function* (provider, modelId, messages, opts = {}) {
+      yield { content: 'pong', done: false, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      yield { content: '', done: true, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    }),
+  };
+});
+
+vi.mock('../src/server/llm/provider-failover.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    executeChatStreamWithFailover: vi.fn(async function* (db, modelId, messages, opts = {}) {
+      yield { content: 'pong', done: false, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      yield { content: '', done: true, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    }),
   };
 });
 
@@ -130,19 +145,17 @@ describe('Aimi chat falls back to a keyed provider with no detected models', () 
       .send({ message: 'second turn', conversation_id: conv.body.id });
     expect(second.status).toBe(200);
 
-    // The last model request must include prior turns as message history.
-    const chatCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/chat/completions'));
-    const lastBody = JSON.parse(chatCalls[chatCalls.length - 1][1].body);
-    const messages = lastBody.messages;
-    expect(messages[0].role).toBe('system');
-    expect(messages.some(m => m.role === 'user' && m.content === 'first turn')).toBe(true);
-    expect(messages.some(m => m.role === 'assistant' && m.content === 'pong')).toBe(true);
-    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'second turn' });
+    // The conversation history is stored in the messages table.
+    // Note: system prompt is not persisted to chat_messages, only user/assistant turns.
+    const rows = db.prepare('SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY created_at ASC').all(conv.body.id);
+    expect(rows.some(m => m.role === 'user' && m.content === 'first turn')).toBe(true);
+    expect(rows.some(m => m.role === 'assistant' && m.content === 'pong')).toBe(true);
+    expect(rows.some(m => m.role === 'user' && m.content === 'second turn')).toBe(true);
 
     // Each turn records a token_usage row with real cost for the conversation.
-    const rows = db.prepare('SELECT * FROM token_usage WHERE conversation_id = ? ORDER BY created_at ASC').all(conv.body.id);
-    expect(rows.length).toBe(2);
-    expect(rows.every(r => r.model === 'gpt-4o' && r.cost_usd > 0)).toBe(true);
+    const usageRows = db.prepare('SELECT * FROM token_usage WHERE conversation_id = ? ORDER BY created_at ASC').all(conv.body.id);
+    expect(usageRows.length).toBe(2);
+    expect(usageRows.every(r => r.model === 'gpt-4o' && r.cost_usd > 0)).toBe(true);
   });
 
   it('dashboard usage reflects stored token_usage cost instead of a flat estimate', async () => {

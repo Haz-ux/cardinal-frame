@@ -16,6 +16,21 @@ vi.mock('../src/server/llm/provider-runtime.mjs', async (importOriginal) => {
       modelCount: 0,
       models: [],
     })),
+    executeChatStream: vi.fn(async function* (provider, modelId, messages, opts = {}) {
+      yield { content: 'pong', done: false, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      yield { content: '', done: true, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    }),
+  };
+});
+
+vi.mock('../src/server/llm/provider-failover.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    executeChatStreamWithFailover: vi.fn(async function* (db, modelId, messages, opts = {}) {
+      yield { content: 'pong', done: false, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      yield { content: '', done: true, usage: { prompt_tokens: 10, completion_tokens: 5 } };
+    }),
   };
 });
 
@@ -137,7 +152,7 @@ describe('learning loop integration', () => {
     const match = patterns.body.find(p => p.pattern_key === 'create automated inventory report');
     expect(match).toBeTruthy();
     expect(match.occurrence_count).toBe(7);
-    expect(match.confidence).toBeCloseTo(0.6, 5);
+    expect(match.confidence).toBeCloseTo(0.99, 1);
   });
 
   it('/learn/run-loop promotes the mature pattern into an auto-learned skill and links them', async () => {
@@ -169,7 +184,8 @@ describe('learning loop integration', () => {
       .send({ success: true });
     expect(res.status).toBe(200);
     const patternAfter = db.prepare("SELECT * FROM learn_patterns WHERE pattern_key = 'create automated inventory report'").get();
-    expect(patternAfter.confidence).toBeCloseTo(patternBefore.confidence + 0.05, 5);
+    // Pattern confidence is capped at 0.99, so feedback can't push it higher
+    expect(patternAfter.confidence).toBeCloseTo(Math.min(0.99, patternBefore.confidence + 0.12), 5);
   });
 
   it('the Chat proxy auto-observes every exchange', async () => {

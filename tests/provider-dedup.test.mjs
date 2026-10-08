@@ -63,6 +63,37 @@ describe('Duplicate LLM providers', () => {
   });
 });
 
+describe('Seed adopts env-var API keys', () => {
+  it('POST /llm/seed enables a keyless provider when its *_API_KEY env var exists', async () => {
+    // Ensure a keyless anthropic provider exists
+    db.prepare("DELETE FROM llm_providers WHERE type = 'anthropic'").run();
+    const id = 'seed-adopt-test';
+    db.prepare("INSERT INTO llm_providers (id, name, type, api_key, base_url, enabled) VALUES (?, 'Anthropic', 'anthropic', '', 'https://api.anthropic.com/v1', 0)").run(id);
+
+    // Save the env key the way Settings does
+    const saved = await request(app)
+      .post('/api/settings/env')
+      .set(adminAuth())
+      .send({ key: 'ANTHROPIC_API_KEY', value: 'sk-ant-adopt-test-123', encrypted: 1, category: 'llm' });
+    expect(saved.status).toBe(200);
+
+    // Saving via settings syncs directly into the keyless provider
+    const synced = db.prepare('SELECT api_key, enabled, encrypted FROM llm_providers WHERE id = ?').get(id);
+    expect(synced.api_key.length).toBeGreaterThan(0);
+    expect(synced.enabled).toBe(1);
+    expect(synced.encrypted).toBe(1);
+
+    // Seed must not duplicate, and reports the adoption
+    const seeded = await request(app).post('/api/llm/seed').set(adminAuth());
+    expect(seeded.status).toBe(200);
+    const count = db.prepare("SELECT COUNT(*) n FROM llm_providers WHERE type = 'anthropic'").get();
+    expect(count.n).toBe(1);
+
+    db.prepare("DELETE FROM llm_providers WHERE id = ?").run(id);
+    db.prepare("DELETE FROM env_vars WHERE key = 'ANTHROPIC_API_KEY'").run();
+  });
+});
+
 describe('mergeDuplicateProviders', () => {
   it('merges duplicate providers by (type, base_url) and re-homes models + usage', async () => {
     const { mergeDuplicateProviders } = await import('../src/server/server.mjs');

@@ -135,6 +135,12 @@ app.use(helmet({
       formAction: ["'self'"],
       baseUri: ["'self'"],
       objectSrc: ["'none'"],
+      // Do NOT add upgrade-insecure-requests: the UI is served over plain
+      // HTTP on Tailscale/LAN (http://minerva:8080). With the upgrade
+      // directive, browsers rewrite every http:// subresource request to
+      // https:// — nothing listens on 443, so the JS bundles fail to load
+      // and the app renders a blank root div on every non-localhost device.
+      upgradeInsecureRequests: null,
     },
   },
   crossOriginEmbedderPolicy: false, // Allow embedding for dev
@@ -149,7 +155,7 @@ app.use(helmet({
 app.use((req, res, next) => {
   res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
 });
 
@@ -1603,9 +1609,15 @@ app.use('/api', skillHubRoutes(ctx));
 app.use('/api', pluginMarketRoutes(ctx));
 app.use('/api', wardenRoutes(ctx));
 app.use('/api', chainsRoutes(ctx));
-app.use('/api', evolutionRoutes(ctx));
+app.use('/api/evolution', evolutionRoutes(ctx));
 app.use('/api', heartbeatRulesRoutes(ctx));
 app.use('/api', toolsRoutes(ctx));
+
+// Backward compat: /api/learn/distill (legacy endpoint) — proxies to /api/evolution/distill
+app.post('/api/learn/distill', authMiddleware, requireRole('admin'), apiLimiter, async (req, res) => {
+  req.url = '/distill'; // rewrite for evolutionRoutes
+  return evolutionRoutes(ctx)(req, res);
+});
 app.use('/api', aimiRoutes(ctx));
 app.use('/api', llmRoutes(ctx));
 app.use('/api', agentRoutes(ctx));

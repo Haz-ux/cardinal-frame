@@ -69,7 +69,7 @@ export default function toolsRoutes(ctx) {
       const existing = stmts.patterns.getByKey.get(patternKey);
       if (existing) {
         const newCount = existing.occurrence_count + 1;
-        const newConfidence = Math.min(0.99, existing.confidence + 0.05);
+        const newConfidence = Math.min(0.99, existing.confidence + 0.12);
         stmts.patterns.increment.run(newConfidence, existing.id);
         broadcast('learn:pattern', { id: existing.id, pattern_key: patternKey, occurrence_count: newCount, confidence: newConfidence });
       } else {
@@ -146,6 +146,7 @@ export default function toolsRoutes(ctx) {
         const pattern = db.prepare('SELECT * FROM learn_patterns WHERE id = ?').get(pattern_id);
         if (pattern) {
           stmts.patterns.updateConfidence.run(pattern.confidence, id, pattern_id);
+          db.prepare('UPDATE learn_patterns SET auto_skill_id = ? WHERE id = ?').run(id, pattern_id);
         }
       }
       return res.status(201).json({ id, name, confidence: 0.3, auto_proposed: true });

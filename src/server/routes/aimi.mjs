@@ -6,6 +6,7 @@ import { autoObserve } from '../learn.mjs';
 import { PERSONAS, getPersona, renderPrompt, getActivePersonaId } from '../personas.mjs';
 import { compressContext } from '../compression.mjs';
 import { executeSkill } from './skills.mjs';
+import { executeChatWithFailover, executeChatStreamWithFailover } from '../llm/provider-failover.mjs';
 
 /**
  * Aimi routes: built-in system tools, system prompt builder, and the smart
@@ -392,6 +393,8 @@ export default function aimiRoutes(ctx) {
     // model is set (e.g. the user saved a key but never detected models).
     // Prefer one that already has models, then any keyed provider (we auto-
     // detect its models below), then local Ollama.
+    // FAILOVER CHAIN: NVIDIA (glm-5.3) → Nemotron-3-Ultra → Anthropic → Ollama
+    const failoverOrder = ['nvidia', 'anthropic', 'google', 'openai', 'ollama'];
     if (!provider) {
       const usable = stmts.providers.getAll.all()
         .filter(p => p.enabled && (p.type === 'ollama' || (p.api_key && p.api_key.length > 10 && !p.api_key.includes('*'))))
@@ -399,6 +402,12 @@ export default function aimiRoutes(ctx) {
         .filter(Boolean);
       const hasModels = p => db.prepare('SELECT COUNT(*) AS n FROM llm_models WHERE provider_id = ?').get(p.id).n > 0;
       const keyed = p => p.api_key && p.api_key.length > 10 && !p.api_key.includes('*');
+      // Sort by failover preference
+      usable.sort((a, b) => {
+        const ai = failoverOrder.indexOf(a.type);
+        const bi = failoverOrder.indexOf(b.type);
+        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+      });
       provider = usable.find(hasModels) || usable.find(keyed) || usable.find(p => p.type === 'ollama') || null;
     }
     if (!provider || !provider.api_key) {
@@ -449,150 +458,131 @@ export default function aimiRoutes(ctx) {
     };
 
     // Build message history (include system prompt + prior conversation + user message)
-    const chatMessages = [
-      { role: 'system', content: systemPrompt },
-      ...loadConversationHistory(),
-      { role: 'user', content: message },
-    ];
-
-    const modelId = modelRecord?.model_id || model || 'gpt-3.5-turbo';
-    const pType = provider.type;
-    const providerType = PROVIDER_TYPES[pType];
-    const baseUrl = provider.base_url || providerType?.baseUrl || '';
-    // Use buildChatUrl + buildProviderAuth for correct per-provider routing
-    const url = buildChatUrl(baseUrl, pType, modelId, true);
-
-    // Stream response
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-
-    try {
-      const fetch = globalThis.fetch;
-      const { headers, url: chatUrl } = buildProviderAuth(provider, url);
-
-      // Execute one tool call against its local API endpoint.
-      const executeToolCall = async (toolCall) => {
-        const toolDef = stmts.tools.getByName.get(toolCall.tool);
-        if (!toolDef) return null;
-        const toolUrl = `http://localhost:${PORT}${toolDef.endpoint.replace(':id', toolCall.arguments?.id || '')}`;
-        const toolResp = await fetch(toolUrl, {
-          method: toolDef.method,
-          headers: { 'Authorization': `Bearer ${req.headers.authorization?.replace('Bearer ', '')}`, 'Content-Type': 'application/json' },
-          body: toolDef.method !== 'GET' ? JSON.stringify(toolCall.arguments || {}) : undefined,
-        });
-        return { tool: toolCall.tool, result: await toolResp.json() };
-      };
-
-      // Relay one model turn to the client (SSE). Returns the full text and,
-      // if the model asked for a tool, the parsed tool call.
-      const relayTurn = async (messages) => {
-        const payload = buildChatPayload(pType, modelId, messages, true);
-        const resp = await fetch(chatUrl, { method: 'POST', headers, body: JSON.stringify(payload) });
-        if (!resp.ok) {
-          const errText = await resp.text();
-          res.write(`data: ${JSON.stringify({ error: { message: `LLM error (${resp.status}): ${errText.slice(0, 300)}` }})}\n\n`);
-          res.end();
-          return { ok: false };
-        }
-
-        // Node.js fetch returns a Web ReadableStream (not a Node stream).
-        // Use getReader() + async loop instead of .on('data')/.on('end').
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let fullContent = '';
-        let streamDone = false;
-        let usage = null;
-
-        while (!streamDone) {
-          const { done, value } = await reader.read();
-          if (done) { streamDone = true; break; }
-          res.write(Buffer.from(value));
-          const text = decoder.decode(value, { stream: true });
-          const lines = text.split('\n').filter(l => l.startsWith('data: '));
-          for (const line of lines) {
-            const data = line.slice(6).trim();
-            if (data === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(data);
-              const delta = parsed.choices?.[0]?.delta?.content;
-              if (delta) fullContent += delta;
-              if (parsed.usage) usage = parsed.usage;
-            } catch {}
-          }
-        }
-
-        // Detect a tool call by scanning the WHOLE turn's content. Streaming
-        // splits tokens across chunks ("```", "tool", "_call", ...), so any
-        // per-chunk "tool_call" match is unreliable — the model's call would
-        // be missed and the conversation would stop after the tool.
-        let toolCall = null;
-        try {
-          const match = fullContent.match(/```tool_call\s*\n?([\s\S]*?)\n?```/) ||
-                        fullContent.match(/\{"tool":\s*"[\s\S]*"\}/);
-          if (match) {
-            const parsed = JSON.parse(match[1] || match[0]);
-            if (parsed && typeof parsed.tool === 'string') toolCall = parsed;
-          }
-        } catch {}
-        return { ok: true, content: fullContent, toolCall, usage };
-      };
-
-      // Tool-calling loop: relay the model's turn; if it requests a tool,
-      // run it, hand the result back, and let the model continue — up to a
-      // capped number of turns so a tool-crazy model can't loop forever.
-      // Previously the conversation just ended after the tool result, which
-      // is why Aimi "stopped dead" after invoking a tool.
-      const MAX_TOOL_TURNS = 4;
-      let messages = chatMessages;
-      let fullContent = '';
-      let promptTokens = 0;
-      let completionTokens = 0;
-      for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-        const turnResult = await relayTurn(messages);
-        if (!turnResult.ok) return;
-        fullContent += turnResult.content;
-        promptTokens += turnResult.usage?.prompt_tokens || 0;
-        completionTokens += turnResult.usage?.completion_tokens || 0;
-        if (!turnResult.toolCall) break;
-        const toolResult = await executeToolCall(turnResult.toolCall);
-        if (!toolResult) break;
-        res.write(`data: ${JSON.stringify({ tool_result: { tool: turnResult.toolCall.tool, result: toolResult.result } })}\n\n`);
-        messages = [
-          ...messages,
-          { role: 'assistant', content: turnResult.content },
-          { role: 'system', content: `You invoked the tool "${toolResult.tool}" with arguments ${JSON.stringify(turnResult.toolCall.arguments || {})}. The tool returned:\n${JSON.stringify(toolResult.result)}` },
+        const chatMessages = [
+          { role: 'system', content: systemPrompt },
+          ...loadConversationHistory(),
+          { role: 'user', content: message },
         ];
-      }
 
-      // Track usage/cost. Prefer real usage from the provider stream; fall
-      // back to a character-based estimate so cost tracking works for any
-      // provider.
-      if (!promptTokens) promptTokens = Math.ceil(chatMessages.reduce((n, m) => n + (m.content?.length || 0), 0) / 4);
-      if (!completionTokens) completionTokens = Math.ceil((fullContent || '').length / 4);
-      const cost = getModelCost(modelId, promptTokens, completionTokens);
-      try {
-        stmts.tokenUsage.insert.run(conversation_id || null, modelId, provider.id, promptTokens, completionTokens, cost, 'inference');
-      } catch { /* best-effort */ }
+        const modelId = modelRecord?.model_id || model || 'gpt-3.5-turbo';
 
-      if (conversation_id) {
-        const userMsgId = randomUUID();
-        stmts.messages.insert.run(userMsgId, conversation_id, 'user', message, '[]', '[]', null, null, 0, 0);
-        const asstMsgId = randomUUID();
-        stmts.messages.insert.run(asstMsgId, conversation_id, 'assistant', fullContent, '[]', '[]', null, modelId, 0, completionTokens);
-        db.prepare("UPDATE chat_conversations SET updated_at = datetime('now') WHERE id = ?").run(conversation_id);
-        fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content: fullContent, model: modelId });
-      }
-      autoObserve(stmts, broadcast, logger, randomUUID, conversation_id, [{ role: 'user', content: message }], fullContent, modelId);
-      res.write(`data: ${JSON.stringify({ usage: { model: modelId, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, cost_usd: cost } })}\n\n`);
-      res.end();
-    } catch (err) {
-      logger.error('Aimi chat error:', err);
-      res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
-      res.end();
-    }
-  });
+        // Stream response with provider failover
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+
+        let fullContent = '';
+        let promptTokens = 0;
+        let completionTokens = 0;
+        let usedProvider = null;
+        let usedModel = null;
+
+        try {
+          // Execute tool call against its local API endpoint.
+          const executeToolCall = async (toolCall) => {
+            const toolDef = stmts.tools.getByName.get(toolCall.tool);
+            if (!toolDef) return null;
+            const toolUrl = `http://localhost:${PORT}${toolDef.endpoint.replace(':id', toolCall.arguments?.id || '')}`;
+            const toolResp = await fetch(toolUrl, {
+              method: toolDef.method,
+              headers: { 'Authorization': `Bearer ${req.headers.authorization?.replace('Bearer ', '')}`, 'Content-Type': 'application/json' },
+              body: toolDef.method !== 'GET' ? JSON.stringify(toolCall.arguments || {}) : undefined,
+            });
+            return { tool: toolCall.tool, result: await toolResp.json() };
+          };
+
+          // Tool-calling loop with failover support
+          const MAX_TOOL_TURNS = 4;
+          let messages = chatMessages;
+
+          for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+            // Use failover-enabled streaming
+            let turnContent = '';
+            let turnUsage = null;
+            let streamError = null;
+
+            for await (const chunk of executeChatStreamWithFailover(db, modelId, messages, {
+              stream: true,
+              max_tokens: 4096,
+              temperature: 0.7,
+              onFailover: async (info) => {
+                res.write(`data: ${JSON.stringify({ failover: { attempt: info.attempt, provider: info.provider, error: info.error } })}\n\n`);
+              }
+            })) {
+              if (chunk.content) {
+                turnContent += chunk.content;
+                res.write(Buffer.from(`data: ${JSON.stringify({ content: chunk.content })}\n\n`));
+              }
+              if (chunk.done) {
+                turnUsage = chunk.usage;
+                usedProvider = chunk.provider;
+                usedModel = chunk.model;
+                break;
+              }
+            }
+
+            if (!turnContent && !turnUsage) {
+              res.write(`data: ${JSON.stringify({ error: { message: 'No response from any provider' } })}\n\n`);
+              res.end();
+              return;
+            }
+
+            fullContent += turnContent;
+            promptTokens += turnUsage?.prompt_tokens || 0;
+            completionTokens += turnUsage?.completion_tokens || 0;
+
+            // Detect tool call in the complete turn content
+            let toolCall = null;
+            try {
+              const match = turnContent.match(/```tool_call\s*\n?([\s\S]*?)\n?```/) ||
+                            turnContent.match(/\{"tool":\s*"[\s\S]*"\}/);
+              if (match) {
+                const parsed = JSON.parse(match[1] || match[0]);
+                if (parsed && typeof parsed.tool === 'string') toolCall = parsed;
+              }
+            } catch {}
+
+            if (!toolCall) break;
+
+            // Execute tool and add result to messages
+            const toolResult = await executeToolCall(toolCall);
+            if (!toolResult) break;
+
+            res.write(`data: ${JSON.stringify({ tool_result: { tool: toolCall.tool, result: toolResult.result } })}\n\n`);
+
+            messages = [
+              ...messages,
+              { role: 'assistant', content: turnContent },
+              { role: 'system', content: `You invoked the tool "${toolResult.tool}" with arguments ${JSON.stringify(toolCall.arguments || {})}. The tool returned:\n${JSON.stringify(toolResult.result)}` },
+            ];
+          }
+
+          // Track usage/cost
+          if (!promptTokens) promptTokens = Math.ceil(chatMessages.reduce((n, m) => n + (m.content?.length || 0), 0) / 4);
+          if (!completionTokens) completionTokens = Math.ceil((fullContent || '').length / 4);
+          const cost = getModelCost(usedModel || modelId, promptTokens, completionTokens);
+          try {
+            stmts.tokenUsage.insert.run(conversation_id || null, usedModel || modelId, usedProvider || provider.id, promptTokens, completionTokens, cost, 'inference');
+          } catch { /* best-effort */ }
+
+          if (conversation_id) {
+            const userMsgId = randomUUID();
+            stmts.messages.insert.run(userMsgId, conversation_id, 'user', message, '[]', '[]', null, null, 0, 0);
+            const asstMsgId = randomUUID();
+            stmts.messages.insert.run(asstMsgId, conversation_id, 'assistant', fullContent, '[]', '[]', null, usedModel || modelId, 0, completionTokens);
+            db.prepare("UPDATE chat_conversations SET updated_at = datetime('now') WHERE id = ?").run(conversation_id);
+            fireHook('onChatMessage', { conversationId: conversation_id, role: 'assistant', content: fullContent, model: usedModel || modelId });
+          }
+          autoObserve(stmts, broadcast, logger, randomUUID, conversation_id, [{ role: 'user', content: message }], fullContent, usedModel || modelId);
+          res.write(`data: ${JSON.stringify({ usage: { model: usedModel || modelId, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, cost_usd: cost } })}\n\n`);
+          res.end();
+        } catch (err) {
+          logger.error('Aimi chat error:', err);
+          res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
+          res.end();
+        }
+      });
 
   return router;
 }

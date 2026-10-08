@@ -119,5 +119,32 @@ export async function detectModelsFromProvider(db, provider) {
       inserted++;
     } catch { /* skip duplicates */ }
   }
+
+  // Prune models the provider no longer offers. Providers rotate their
+  // catalogs (NVIDIA regularly drops/replaces model IDs); without pruning,
+  // a stale row stays selectable forever and 404s when used.
+  const liveIds = new Set(detected.map(m => m.id));
+  try {
+    const rows = db.prepare('SELECT id, model_id, is_default FROM llm_models WHERE provider_id = ?').all(provider.id);
+    let pruned = 0;
+    let defaultPruned = false;
+    for (const row of rows) {
+      if (liveIds.has(row.model_id)) continue;
+      if (row.is_default) defaultPruned = true;
+      try { db.prepare('DELETE FROM llm_models WHERE id = ?').run(row.id); pruned++; } catch {}
+    }
+    // If the pruned model was the default, promote the first live model.
+    if (defaultPruned && detected.length > 0) {
+      const nextId = `${provider.id}:${detected[0].id}`;
+      const next = db.prepare('SELECT id FROM llm_models WHERE id = ? OR (provider_id = ? AND model_id = ?)').get(nextId, provider.id, detected[0].id);
+      if (next) {
+        try {
+          db.prepare('UPDATE llm_models SET is_default = 0').run();
+          db.prepare('UPDATE llm_models SET is_default = 1 WHERE id = ?').run(next.id);
+        } catch {}
+      }
+    }
+  } catch { /* prune is best-effort */ }
+
   return { detected, inserted };
 }

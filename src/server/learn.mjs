@@ -10,8 +10,8 @@
 
 export const LEARN_MIN_OCCURRENCES = 3;
 export const LEARN_MIN_CONFIDENCE = 0.6;
-export const LEARN_CONFIDENCE_DELTA = 0.05;
-export const LEARN_CONFIDENCE_PENALTY = 0.08;
+export const LEARN_CONFIDENCE_DELTA = 0.12;
+export const LEARN_CONFIDENCE_PENALTY = 0.1;
 
 /** Classify an observation's intent from the raw user input. */
 export function detectIntent(inputLower) {

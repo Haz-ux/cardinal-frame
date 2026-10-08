@@ -1,7 +1,7 @@
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { PROVIDER_TYPES, buildProviderAuth, detectOllama, detectModelsFromProvider } from './llm-helpers.mjs';
-import { encryptSecret } from './settings.mjs';
+import { encryptSecret, decryptValue } from './settings.mjs';
 
 /**
  * LLM routes: provider CRUD, model CRUD, Ollama detection, seed defaults.
@@ -264,6 +264,9 @@ export default function llmRoutes(ctx) {
   });
 
   // ─── Seed default providers (no keys) ────────────────────────
+  // Seeded rows stay enabled=0 until a key arrives. If the matching *_API_KEY
+  // env var was already saved via Settings, adopt it immediately so
+  // seed → chat works without a second manual step.
   router.post('/llm/seed', authMiddleware, requireRole('admin'), apiLimiter, (_req, res) => {
     const seeds = Object.entries(PROVIDER_TYPES).map(([type, info]) => ({
       name: info.name,
@@ -271,6 +274,7 @@ export default function llmRoutes(ctx) {
       base_url: info.baseUrl,
     }));
     let created = 0;
+    let adopted = 0;
     for (const seed of seeds) {
       // A provider is identified by (type, base_url) — the same vendor must
       // not be seeded twice under a different display name (e.g. "Nvidia"
@@ -280,10 +284,29 @@ export default function llmRoutes(ctx) {
         const id = randomUUID();
         stmts.providers.insert.run(id, seed.name, seed.type, '', 0, seed.base_url, 0);
         created++;
+      } else if (syncKeyFromEnv(existing)) {
+        adopted++;
       }
     }
-    res.json({ seeded: created, total: seeds.length });
+    res.json({ seeded: created, adopted, total: seeds.length });
   });
+
+  // Adopt an env-var API key (saved via Settings → env_vars) into a provider
+  // row that has no key of its own. Idempotent: never overwrites a provider
+  // key that was set directly on the provider.
+  function syncKeyFromEnv(provider) {
+    if (!provider || (provider.api_key && provider.api_key.length > 0)) return false;
+    const envKey = `${provider.type.toUpperCase()}_API_KEY`;
+    let row = null;
+    try { row = db.prepare('SELECT value, encrypted FROM env_vars WHERE key = ?').get(envKey); } catch { /* table may not exist */ }
+    if (!row || !row.value) return false;
+    const val = row.encrypted ? decryptValue(row.value, row.encrypted) : row.value;
+    if (!val) return false;
+    stmts.providers.updateApiKey.run(encryptSecret(val), 1, provider.id);
+    stmts.providers.updateEnabled.run(1, provider.id);
+    logger?.info?.(`LLM provider "${provider.name}" adopted ${envKey} from env vars and enabled`);
+    return true;
+  }
 
   // ─── Provider Setup Wizard ─────────────────────────────────
   // One-shot endpoint: adds provider, tests API key, auto-detects models, sets default model

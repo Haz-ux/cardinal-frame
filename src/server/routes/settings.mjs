@@ -131,6 +131,22 @@ export default function settingsRoutes(ctx) {
         ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=excluded.encrypted, category=excluded.category, updated_at=datetime('now')`)
         .run(key, storedVal, encrypted ? 1 : 0, category);
       process.env[key] = String(value);
+
+      // LLM provider keys also live on llm_providers rows (what chat reads).
+      // Saving *_API_KEY here must sync through, or the LLM Models page shows
+      // "No key" even though Settings saved one.
+      if (/^[A-Z0-9]+_API_KEY$/.test(key) && String(value)) {
+        const providerType = key.replace('_API_KEY', '').toLowerCase();
+        try {
+          const provider = db.prepare('SELECT * FROM llm_providers WHERE type = ? ORDER BY created_at ASC').get(providerType);
+          if (provider && !provider.api_key) {
+            db.prepare('UPDATE llm_providers SET api_key = ?, encrypted = 1, enabled = 1 WHERE id = ?')
+              .run(encryptSecret(String(value)), provider.id);
+            logger?.info?.(`Settings saved ${key} — synced to LLM provider "${provider.name}" and enabled`);
+          }
+        } catch { /* llm_providers may not exist yet */ }
+      }
+
       res.json({ success: true, key });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
