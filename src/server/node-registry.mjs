@@ -55,7 +55,7 @@ export function initNodeRegistry(db) {
         updated_at = datetime('now')
     `),
     getById: db.prepare('SELECT * FROM nodes WHERE id = ?'),
-    getByName: db.prepare('SELECT * FROM nodes WHERE name = ?'),
+    getByName: db.prepare('SELECT * FROM nodes WHERE name = ? COLLATE NOCASE'),
     getAll: db.prepare('SELECT * FROM nodes ORDER BY name'),
     getByStatus: db.prepare('SELECT * FROM nodes WHERE status = ? ORDER BY name'),
     updateLastSeen: db.prepare(`
@@ -113,8 +113,11 @@ export function initNodeRegistry(db) {
    * @param {string} capability — e.g. 'code', 'analysis', 'docker'
    * @returns {object|null} node row or null if none qualify
    */
-  function getReachableNode(capability) {
-    const onlineNodes = stmts.getOnlineWithCapability.all();
+  function getReachableNode(capability, selfNodeId = null) {
+    // Exclude our own node — delegating to self is a loop; local execution
+    // is the correct path and happens without the registry.
+    const onlineNodes = stmts.getOnlineWithCapability.all()
+      .filter(n => !selfNodeId || n.id !== selfNodeId);
 
     if (!capability) {
       // No capability filter — return any online node

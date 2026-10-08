@@ -1601,6 +1601,23 @@ const nodeRegistry = initNodeRegistry(db);
 nodeRegistry.setBroadcast(broadcast);
 nodeRegistry.startHeartbeat(parseInt(process.env.NODE_HEARTBEAT_INTERVAL || '30') * 1000);
 globalThis._nodeRegistry = nodeRegistry;
+// Register this node's real cryptographic identity in the registry —
+// /delegate/receive looks up senders by node_id; without a self-row,
+// self-looped delegations (and peers that know us by our real id) 403.
+try {
+  const selfIdentity = getOrCreateNodeIdentity(db);
+  const existingSelf = nodeRegistry.getNode(selfIdentity.node_id);
+  if (!existingSelf) {
+    nodeRegistry.registerNode({
+      id: selfIdentity.node_id,
+      name: process.env.NODE_NAME || 'MINERVA',
+      base_url: `http://${process.env.HOST_IP || 'localhost'}:${PORT}`,
+      public_key_pem: selfIdentity.public_key_pem,
+      capabilities: ['self'],
+    });
+    logger.info(`Self node registered: ${selfIdentity.node_id.slice(0, 12)}...`);
+  }
+} catch (e) { logger.warn(`Self node registration failed: ${e.message}`); }
 logger.info('Node registry initialized — heartbeat loop started');
 
 // ─── Modularized Routes ─────────────────────────────────────────

@@ -33,7 +33,7 @@ import { scoreCommand } from '../warden.mjs';
  *   POST /api/delegate/receive       — receive a signed delegation from another node (node-side receipt)
  */
 export default function delegationRoutes(ctx) {
-  const { db, stmts, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, audit, logger, executeTask, sanitizeCommand } = ctx;
+  const { db, stmts, authMiddleware, optionalAuth, requireRole, apiLimiter, broadcast, audit, logger, executeTask, sanitizeCommand, PORT } = ctx;
   const router = express.Router();
 
   // ─── Schema ───────────────────────────────────────────────────────
@@ -230,7 +230,10 @@ export default function delegationRoutes(ctx) {
     const delegation = delStmts.getById.get(delegationId);
     if (!delegation || delegation.status !== 'pending') return null;
 
-    // Only sync local delegations — remote ones are updated via /report
+    // Sync delegations executing locally. A delegation targeting a remote
+    // node whose dispatch FAILED fell back to local execution (node flipped
+    // to 'local' at fallback) — those sync here too. Genuinely remote
+    // delegations (node still = remote name) are updated via /report only.
     if (delegation.node !== 'local') return null;
 
     const childTask = delStmts.getChildTask.get(delegation.child_task_id);
@@ -321,9 +324,11 @@ export default function delegationRoutes(ctx) {
     let dispatchMode = 'local';
 
     const registry = getRegistry();
+    const selfNodeId = getIdentity()?.node_id || null;
     if (registry && !requestedNode) {
       // Use the registry to find a reachable node with the required capability
-      targetNode = registry.getReachableNode(capability);
+      // (excludes our own node — delegating to self is a loop)
+      targetNode = registry.getReachableNode(capability, selfNodeId);
       if (targetNode) {
         dispatchMode = 'remote';
       } else {
@@ -331,10 +336,26 @@ export default function delegationRoutes(ctx) {
         dispatchMode = 'awaiting_node';
       }
     } else if (registry && requestedNode) {
-      // Explicit node requested by name
+      // Explicit node requested by name (case-insensitive). Requesting our
+      // own node = local execution — skip the registry entirely. Self-detect
+      // by crypto id OR by matching our own base_url (row may be seeded
+      // manually with the host IP).
       targetNode = registry.getNodeByName(requestedNode);
-      if (targetNode && targetNode.status === 'online') {
+      const selfBaseUrl = `http://${process.env.HOST_IP || '100.101.127.49'}:${PORT}`;
+      const isSelf = targetNode && (targetNode.id === selfNodeId
+        || (targetNode.base_url && targetNode.base_url === selfBaseUrl));
+      if (targetNode && !isSelf && targetNode.status === 'online') {
         dispatchMode = 'remote';
+      } else if (targetNode && isSelf) {
+        // Requesting ourselves — nodeValue stays 'local' so completion sync works
+        dispatchMode = 'local';
+        targetNode = null;
+      } else if (targetNode && !isSelf && targetNode.status !== 'online') {
+        // Explicit node requested but it's offline — execute locally now
+        // (the dispatch would fail anyway; local completion syncs properly).
+        // awaiting_node is only for "no node requested, none reachable".
+        dispatchMode = 'local';
+        targetNode = null;
       } else {
         dispatchMode = 'awaiting_node';
       }
@@ -369,11 +390,17 @@ export default function delegationRoutes(ctx) {
 
     // ─── Dispatch ───
     if (dispatchMode === 'remote' && targetNode) {
-      // ─── Governance check: is this agent allowed to delegate to this node? ───
+      // ─── Governance check: is this AGENT allowed to delegate to this node? ───
+      // Only agent-driven delegations are bound by persona node_permissions.
+      // A direct API delegation (no agent) is the OPERATOR acting — req.user
+      // already authenticated and authorized it. Governance exists to constrain
+      // what autonomous agents may do, not what the operator may do.
       const persona = agent?.id
         ? ctx.stmts.governance?.personas?.getByAgent?.get(agent.id)
         : null;
-      const govCheck = canDelegateToNode(persona, targetNode.name);
+      const govCheck = persona
+        ? canDelegateToNode(persona, targetNode.name)
+        : { allowed: true };
       if (!govCheck.allowed) {
         audit('delegation_denied', 'node', targetNode.name, req.user?.id, {
           delegation_id: delegationId,
@@ -407,8 +434,12 @@ export default function delegationRoutes(ctx) {
 
         if (!result.ok) {
           logger.warn(`Remote dispatch to ${targetNode.name} failed: ${result.error} — falling back to local`);
-          delStmts.updateStatus.run('pending', delegationId);
+          // Flip node to 'local' so completion sync (syncDelegationStatus)
+          // tracks the local child task — otherwise the row stays 'pending'
+          // forever waiting for a remote receipt that will never come.
+          db.prepare("UPDATE delegations SET node = 'local', status = 'pending' WHERE id = ?").run(delegationId);
           executeTask(childTaskId, command);
+          broadcast('delegation:fallback_local', { id: delegationId, target_node: targetNode.name, reason: result.error });
         } else {
           broadcast('delegation:created', { id: delegationId, childTaskId, agentId: agent?.id, capability, node: targetNode.name });
           audit('delegate', 'delegation', delegationId, req.user?.id, { name, command: command.slice(0, 100), agentId: agent?.id, node: targetNode.name });
@@ -430,11 +461,12 @@ export default function delegationRoutes(ctx) {
         }
       }
     } else if (dispatchMode === 'awaiting_node') {
-      // No reachable node — queue locally but mark as awaiting_node
-      delStmts.updateStatus.run('awaiting_node', delegationId);
-      // Still execute locally as fallback
+      // No reachable node — park the delegation as awaiting_node, but the
+      // local fallback DOES execute now. Flip to pending+local so
+      // syncDelegationStatus tracks the local task and wait-mode returns.
+      db.prepare("UPDATE delegations SET node = 'local', status = 'pending' WHERE id = ?").run(delegationId);
       executeTask(childTaskId, command);
-      broadcast('delegation:queued', { id: delegationId, childTaskId, capability, reason: 'No reachable remote node' });
+      broadcast('delegation:queued', { id: delegationId, childTaskId, capability, reason: 'No reachable remote node — executing locally' });
       logger.info(`Delegation queued (no reachable node): ${delegationId} → executing locally as fallback`);
     } else {
       // Local execution
