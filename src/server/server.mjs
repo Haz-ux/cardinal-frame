@@ -101,6 +101,10 @@ const corsOrigins = [
   'http://[::1]:5173',
   'http://192.168.1.127:8080',
   'http://192.168.1.127:5173',
+  // Tailscale LAN access (minerva host + its tailscale IP) — module requests
+  // are CORS-mode; a non-whitelisted origin makes cors() error → 500 → blank UI.
+  'http://minerva:8080',
+  'http://100.101.127.49:8080',
   ...(process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()) : []),
 ];
 app.use(cors({
