@@ -84,10 +84,22 @@ const JWT_EXPIRES = process.env.JWT_EXPIRES || '15m';
 const JWT_REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES || '7d';
 
 // ─── Logger ────────────────────────────────────────────────────────
+const LOG_DIR = path.join(DATA_DIR, 'logs');
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
-  transports: [new winston.transports.Console()],
+  transports: [
+    new winston.transports.Console(),
+    // Rotating file transport — structured JSON logs survive restarts,
+    // 5MB per file, keep 5 (25MB ceiling). Failures never crash the server.
+    new winston.transports.File({
+      filename: path.join(LOG_DIR, 'server.log'),
+      maxsize: 5 * 1024 * 1024,
+      maxFiles: 5,
+      tailable: true,
+    }),
+  ],
 });
 app.use(morgan('tiny', { skip: (req) => process.env.NODE_ENV === 'production' || req.url.startsWith('/ws') }));
 
