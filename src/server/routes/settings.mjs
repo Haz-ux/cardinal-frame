@@ -217,6 +217,10 @@ export default function settingsRoutes(ctx) {
         maxConcurrentAgents: settings.maxConcurrentAgents || '5',
         wsHeartbeatMs: settings.wsHeartbeatMs || '30000',
         embeddingModel: settings.embeddingModel || 'Xenova/all-MiniLM-L6-v2',
+        // Node identity — who this node is on the mesh. Env fallbacks keep
+        // headless/first-boot deployments working without the UI.
+        nodeName: settings.nodeName || process.env.NODE_NAME || 'MINERVA',
+        hostIp: settings.hostIp || process.env.HOST_IP || 'localhost',
         ...settings,
       };
       res.json(result);
@@ -244,6 +248,25 @@ export default function settingsRoutes(ctx) {
         if (isNaN(n) || n < 1 || n > 100) return res.status(400).json({ error: 'Max concurrent agents must be 1-100' });
         updates.maxConcurrentAgents = String(n);
       }
+      // Node identity validation. Name: 1-64 chars, no control chars — it is
+      // a display label AND the delegation target name. IP: IPv4, hostname,
+      // or 'localhost' — it forms the node's base_url for signed dispatch.
+      if (updates.nodeName !== undefined) {
+        const name = String(updates.nodeName).trim();
+        if (!name || name.length > 64 || /[\x00-\x1f]/.test(name)) {
+          return res.status(400).json({ error: 'Node name must be 1-64 characters, no control characters' });
+        }
+        updates.nodeName = name;
+      }
+      if (updates.hostIp !== undefined) {
+        const ip = String(updates.hostIp).trim();
+        const ipv4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+        const hostname = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
+        if (!ipv4.test(ip) && !hostname.test(ip)) {
+          return res.status(400).json({ error: 'Host IP must be a valid IPv4 address or hostname' });
+        }
+        updates.hostIp = ip;
+      }
 
       const upsert = db.prepare(`INSERT INTO dev_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')`);
@@ -259,6 +282,10 @@ export default function settingsRoutes(ctx) {
       }
       if (updates.logLevel) process.env.LOG_LEVEL = updates.logLevel;
       if (updates.embeddingModel) process.env.CF_EMBEDDING_MODEL = updates.embeddingModel;
+      // Node identity — sync to process.env so delegation self-detect and the
+      // self-row pick up the new values on next boot (they read env).
+      if (updates.nodeName) process.env.NODE_NAME = updates.nodeName;
+      if (updates.hostIp) process.env.HOST_IP = updates.hostIp;
 
       res.json({ success: true, updated });
     } catch (err) { res.status(500).json({ error: err.message }); }

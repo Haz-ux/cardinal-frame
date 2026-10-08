@@ -1601,22 +1601,43 @@ const nodeRegistry = initNodeRegistry(db);
 nodeRegistry.setBroadcast(broadcast);
 nodeRegistry.startHeartbeat(parseInt(process.env.NODE_HEARTBEAT_INTERVAL || '30') * 1000);
 globalThis._nodeRegistry = nodeRegistry;
+// Node identity: dev_settings (set via Settings UI) overrides env vars —
+// the DB is the source of truth a new user can edit from the dashboard.
+let selfNodeName = process.env.NODE_NAME || 'MINERVA';
+let selfHostIp = process.env.HOST_IP || 'localhost';
+try {
+  const savedName = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get('nodeName');
+  const savedIp = db.prepare('SELECT value FROM dev_settings WHERE key = ?').get('hostIp');
+  if (savedName) { selfNodeName = savedName.value; process.env.NODE_NAME = savedName.value; }
+  if (savedIp) { selfHostIp = savedIp.value; process.env.HOST_IP = savedIp.value; }
+} catch {}
 // Register this node's real cryptographic identity in the registry —
 // /delegate/receive looks up senders by node_id; without a self-row,
 // self-looped delegations (and peers that know us by our real id) 403.
+// Before registering: remove stale rows for our node name whose base_url
+// doesn't match the current config (leftovers from earlier boots / manual
+// seeds with a different IP) — node selection by name must resolve to ONE
+// live entry with the RIGHT address.
 try {
   const selfIdentity = getOrCreateNodeIdentity(db);
-  const existingSelf = nodeRegistry.getNode(selfIdentity.node_id);
-  if (!existingSelf) {
-    nodeRegistry.registerNode({
-      id: selfIdentity.node_id,
-      name: process.env.NODE_NAME || 'MINERVA',
-      base_url: `http://${process.env.HOST_IP || 'localhost'}:${PORT}`,
-      public_key_pem: selfIdentity.public_key_pem,
-      capabilities: ['self'],
-    });
-    logger.info(`Self node registered: ${selfIdentity.node_id.slice(0, 12)}...`);
+  const currentUrl = `http://${selfHostIp}:${PORT}`;
+  const stale = db.prepare(
+    'SELECT id, base_url FROM nodes WHERE name = ? COLLATE NOCASE AND (id != ? OR base_url != ?)'
+  ).all(selfNodeName, selfIdentity.node_id, currentUrl);
+  for (const row of stale) {
+    db.prepare('DELETE FROM nodes WHERE id = ?').run(row.id);
+    logger.info(`Removed stale self row "${selfNodeName}" (${row.base_url}) — replaced by ${currentUrl}`);
   }
+  // Preserve real capabilities from a manual seed if one existed
+  const capsSeed = stale.find(r => r.id === selfIdentity.node_id);
+  nodeRegistry.registerNode({
+    id: selfIdentity.node_id,
+    name: selfNodeName,
+    base_url: currentUrl,
+    public_key_pem: selfIdentity.public_key_pem,
+    capabilities: ['self'],
+  });
+  logger.info(`Self node registered: ${selfNodeName} (${selfIdentity.node_id.slice(0, 12)}...) @ ${currentUrl}`);
 } catch (e) { logger.warn(`Self node registration failed: ${e.message}`); }
 logger.info('Node registry initialized — heartbeat loop started');
 

@@ -214,6 +214,78 @@ const DevSettings = memo(function DevSettings({ showToast }) {
         </div>
       </div>
 
+      {/* Node Identity — Node Name */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.cyan}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.cyan}10`, border: `1px solid ${NEON.cyan}20` }}>
+          <Bot size={16} style={{ color: NEON.cyan }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Node Name</div>
+          <div className="text-xs text-gray-500 mt-0.5">This node's identity on the mesh — the name other nodes delegate to</div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.nodeName !== undefined ? (
+            <>
+              <input
+                type="text"
+                value={editing.nodeName}
+                onChange={e => setEditing(prev => ({ ...prev, nodeName: e.target.value }))}
+                maxLength="64"
+                className="w-36 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none"
+                style={{ border: `1px solid ${NEON.cyan}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ nodeName: editing.nodeName })} disabled={saving} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}>
+                <Save size={10} className="inline" />
+              </button>
+              <button onClick={() => cancelEdit('nodeName')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-sm font-mono font-bold" style={{ color: NEON.cyan }}>{settings.nodeName}</span>
+              <button onClick={() => startEdit('nodeName')} className="text-xs px-2 py-1 rounded hover:bg-white/5" style={{ color: NEON.cyan }}>Edit</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Node Identity — Host IP */}
+      <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.purple}15` }}>
+        <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.purple}10`, border: `1px solid ${NEON.purple}20` }}>
+          <Server size={16} style={{ color: NEON.purple }} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-white">Host IP</div>
+          <div className="text-xs text-gray-500 mt-0.5">
+            This node's address for cross-node dispatch ·
+            IPv4 or hostname (Tailscale FQDN works)
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing.hostIp !== undefined ? (
+            <>
+              <input
+                type="text"
+                value={editing.hostIp}
+                onChange={e => setEditing(prev => ({ ...prev, hostIp: e.target.value }))}
+                className="w-44 px-2.5 py-1.5 rounded-lg text-sm font-mono text-white bg-black/40 outline-none"
+                style={{ border: `1px solid ${NEON.purple}30` }}
+                autoFocus
+              />
+              <button onClick={() => handleSave({ hostIp: editing.hostIp })} disabled={saving} className="px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: `${NEON.green}15`, border: `1px solid ${NEON.green}30`, color: NEON.green }}>
+                <Save size={10} className="inline" />
+              </button>
+              <button onClick={() => cancelEdit('hostIp')} className="px-2 py-1.5 rounded-lg text-xs text-gray-500">✕</button>
+            </>
+          ) : (
+            <>
+              <span className="text-sm font-mono font-bold" style={{ color: NEON.purple }}>{settings.hostIp}</span>
+              <button onClick={() => startEdit('hostIp')} className="text-xs px-2 py-1 rounded hover:bg-white/5" style={{ color: NEON.cyan }}>Edit</button>
+            </>
+          )}
+        </div>
+      </div>
+
       {/* Log Level Setting */}
       <div className="rounded-xl p-4 flex items-center gap-4" style={{ background: 'rgba(10,10,20,0.95)', border: `1px solid ${NEON.purple}15` }}>
         <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${NEON.purple}10`, border: `1px solid ${NEON.purple}20` }}>

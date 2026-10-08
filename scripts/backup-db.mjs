@@ -3,6 +3,7 @@
  * Cardinal Frame — SQLite backup via VACUUM INTO (safe, online, WAL-safe).
  * Creates a timestamped snapshot in backups/ and prunes old ones (keep N).
  * Usage: node scripts/backup-db.mjs [--keep 7] [--dest backups]
+ * Server boots with HOST_IP + NODE_NAME env (minerva) — see server.mjs.
  */
 import Database from 'better-sqlite3';
 import { readdirSync, statSync, mkdirSync, unlinkSync } from 'fs';
