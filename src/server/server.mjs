@@ -130,8 +130,8 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"], // React dev server needs inline scripts
-      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'", (req) => req.headers['sec-fetch-dest'] === 'document' ? "'unsafe-inline'" : "'self'"], // prod build has zero inline scripts; dev server needs inline — allow only for document loads
+      styleSrc: ["'self'", "'unsafe-inline'"], // React sets style= at runtime (BigBangSplash etc.) — needed
       imgSrc: ["'self'", "data:", "blob:"],
       fontSrc: ["'self'", "data:"],
       connectSrc: ["'self'", "ws:", "wss:"],
@@ -148,7 +148,7 @@ app.use(helmet({
     },
   },
   crossOriginEmbedderPolicy: false, // Allow embedding for dev
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  hsts: { maxAge: 31536000, includeSubDomains: true },
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
   noSniff: true,
   xssFilter: true,
